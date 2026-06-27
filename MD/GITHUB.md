@@ -55,8 +55,8 @@ git push -u origin main
 ```bash
 cd /media/camp/EXT_DRIVE/rm75_control
 git status
-git add README.md MD/ tmp/tcp_z_spring.py
-git commit -m "Enable high-follow force scan and update GitHub notes."
+git add .
+git commit -m "参数识别和可视化"
 git push origin main
 ```
 

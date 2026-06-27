@@ -1,11 +1,41 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
 .eggs/
 dist/
 build/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
 .venv/
 venv/
+env/
+
+# Secrets / local env
+.env
+.env.*
+*.local.yaml
+
+# Logs & run artifacts
 *.log
+
+# Force ID: regenerated locally (re-run force_id_run_all.py)
+tmp/force_id/logs/*.npz
+tmp/force_id/logs/force_id_phi.json
+tmp/force_id_logs/
+
+# Legacy / local-only tmp outputs (keep scripts, ignore bulky captures)
+tmp/**/*.npz
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
