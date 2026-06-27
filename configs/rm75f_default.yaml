@@ -1,0 +1,43 @@
+robot:
+  ip: "192.168.1.18"
+  port: 8080
+  thread_mode: 2  # RM_TRIPLE_MODE_E
+
+timing:
+  canfd_period_ms: 10
+  force_scan_period_ms: 10
+
+motion:
+  default_velocity_percent: 20
+
+  # Cartesian pose CANFD (rm_movep_canfd) — native params + use_ruckig switch
+  cartesian_pose:
+    use_ruckig: false
+    period_ms: 10
+    follow: true
+    trajectory_mode: 0  # 0 passthrough, 1 curve fit, 2 filter
+    radio: 0
+    steps_per_segment: 50  # used only when use_ruckig=false
+    ruckig:
+      max_velocity: [0.05, 0.05, 0.05, 0.3, 0.3, 0.3]
+      max_acceleration: [0.5, 0.5, 0.5, 1.5, 1.5, 1.5]
+      max_jerk: [2.0, 2.0, 2.0, 5.0, 5.0, 5.0]
+
+force:
+  sensor: 1
+  coordinate_mode: 1
+  default_desired_force: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  default_control_mode: [3, 3, 4, 3, 3, 3]
+  scan:
+    flag: 0  # 0 joint (after IK), 1 pose
+    follow: true
+    trajectory_mode: 0
+    radio: 0
+    period_ms: 10
+    control_mode: [3, 3, 4, 3, 3, 3]
+    desired_force: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+    limit_vel: [0.05, 0.05, 0.25, 10.0, 10.0, 10.0]
+
+tool:
+  name: "scan_tool"
+  payload_kg: 0.5

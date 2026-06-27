@@ -1,0 +1,5 @@
+# RealMan SDK: add RM_API2/Python to PYTHONPATH, e.g.
+#   export PYTHONPATH=/media/camp/EXT_DRIVE/RM_API2/Python:$PYTHONPATH
+numpy
+pyyaml
+ruckig==0.17.3
