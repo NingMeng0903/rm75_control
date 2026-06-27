@@ -277,7 +277,7 @@ def main() -> int:
         print("start pose (tool, m rad):", [round(v, 6) for v in pose0_tool])
         print(
             f"stream: flag=1 pose control_mode={STREAM_CONTROL_MODE} "
-            f"desired_force={desired_force} mode={args.tool_mode} follow=False "
+            f"desired_force={desired_force} mode={args.tool_mode} follow=True "
             f"limit_vel={limit_vel}",
             flush=True,
         )
@@ -311,7 +311,7 @@ def main() -> int:
             control_mode=STREAM_CONTROL_MODE,
             desired_force=desired_force,
             limit_vel=limit_vel,
-            follow=False,
+            follow=True,
             trajectory_mode=0,
             radio=0,
         )
