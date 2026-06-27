@@ -1,0 +1,15 @@
+# RealMan RM75 raw force_data — dynamic ID / compensation (verified 2026-06-27)
+# Run: python tmp/force_id/force_id_comp_demo.py --apply-yaml --live
+
+force_sign: [-1, -1, -1, 1, 1, 1]   # flip Fx,Fy,Fz only; moments unchanged
+euler_order: xyz
+sensor_offset_euler_xyz_rad: [0.0, 0.0, 0.0]
+gravity_base: [0.0, 0.0, -9.80665]
+
+filtfilt_cutoff_hz: 2.5
+identify_mass_bias_only: true
+
+# Verified on force_id_cartesian.npz (601 samples) + live static:
+#   m_fit = +0.997 kg,  live m = +1.10 kg,  Fz_raw ≈ +10.5 N
+#   hold-out compensation RMS: force 0.219 N, moment 0.015 Nm
+# Equivalent combos (same RMS): flip all 6, or Rz180 offset — not needed if using above.

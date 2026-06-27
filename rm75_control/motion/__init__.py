@@ -1,5 +1,5 @@
 """Planned motion and CANFD streaming."""
 
-from rm75_control.motion.canfd import send_pose_canfd
+from rm75_control.motion.canfd import send_pose_canfd, send_velocity_canfd
 
-__all__ = ["send_pose_canfd"]
+__all__ = ["send_pose_canfd", "send_velocity_canfd"]
