@@ -1,14 +1,7 @@
-#!/usr/bin/env python3
 """
-Merge multi-pose ID logs and run staged OLS.
+Merge multi-pose ID logs → staged OLS φ.
 
-  Stage-1: 10p (m, mc, bias) on all samples
-  Stage-2: 16p joint OLS (baseline)
-  Stage-3: 10p fixed + I fitted on pose-d burst rows (phase==1) only  ← recommended φ
-
-Run:
-  source env.sh
-  python tmp/force_id/force_id_fit.py
+Called by force_calibrate.py; not intended as a top-level entry point.
 """
 
 from __future__ import annotations
@@ -21,25 +14,15 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
-from _paths import CONFIG_FORCE, LOG_DIR, PHI_JSON  # noqa: E402
-
-DEFAULT_NPZS = [
-    LOG_DIR / "force_id_pose_a.npz",
-    LOG_DIR / "force_id_pose_b.npz",
-    LOG_DIR / "force_id_pose_c.npz",
-    LOG_DIR / "force_id_pose_d.npz",
-]
-OUT_JSON = PHI_JSON
+from . import regressor as fid
+from .id_config import load_config
+from .paths import CONFIG_ID
 
 PHI_NAMES = [
     "m", "mc_x", "mc_y", "mc_z",
     "Ixx", "Iyy", "Izz", "Ixy", "Ixz", "Iyz",
     "Fx0", "Fy0", "Fz0", "Mx0", "My0", "Mz0",
 ]
-
-import force_id_comp_demo as fid  # noqa: E402
 
 COLS10 = [0, 1, 2, 3] + list(range(10, 16))
 COLS_I = list(range(4, 10))
@@ -113,7 +96,7 @@ def eval_phi(W: np.ndarray, Y: np.ndarray, phi: np.ndarray, mask: np.ndarray | N
     }
 
 
-def constrain_inertia(phi: np.ndarray, *, r_max: float = 0.12) -> np.ndarray:
+def constrain_inertia(phi: np.ndarray, *, r_max: float) -> np.ndarray:
     out = phi.copy()
     m = max(float(out[0]), 0.05)
     cap_diag = m * r_max * r_max
@@ -133,6 +116,7 @@ def fit_i_on_mask(
     row_mask: np.ndarray,
     *,
     min_rows: int,
+    r_max: float,
     moments_only: bool = True,
 ) -> tuple[np.ndarray, dict]:
     use = row_mask
@@ -145,7 +129,7 @@ def fit_i_on_mask(
     phi_i, *_ = np.linalg.lstsq(W16[use][:, COLS_I], Yres, rcond=None)
     phi = phi10.copy()
     phi[COLS_I] = phi_i
-    phi = constrain_inertia(phi)
+    phi = constrain_inertia(phi, r_max=r_max)
     stats = eval_phi(W16, Y, phi, row_mask)
     stats["n_rows"] = n
     stats["skipped"] = False
@@ -183,48 +167,52 @@ def holdout_by_pose(
     return out
 
 
-def print_phi(phi: np.ndarray, title: str) -> None:
-    print(f"\n=== {title} ===")
+def print_summary(
+    phi: np.ndarray,
+    *,
+    rms_all: float,
+    per_pose: dict,
+    out_json: Path,
+) -> None:
+    print("\nIdentify done")
     print(f"  m     = {phi[0]:+.4f} kg")
     print(f"  mc    = [{phi[1]:+.4f}, {phi[2]:+.4f}, {phi[3]:+.4f}] kg·m")
-    print(f"  I     = [{phi[4]:+.5f}, {phi[5]:+.5f}, {phi[6]:+.5f}, "
-          f"{phi[7]:+.5f}, {phi[8]:+.5f}, {phi[9]:+.5f}] kg·m²")
     print(f"  biasF = [{phi[10]:+.3f}, {phi[11]:+.3f}, {phi[12]:+.3f}] N")
     print(f"  biasM = [{phi[13]:+.4f}, {phi[14]:+.4f}, {phi[15]:+.4f}] N·m")
+    print(f"  RMS   = {rms_all:.4f}")
+    for slot, st in per_pose.items():
+        print(f"  {slot}: F={st['rms_force']:.3f} N  M={st['rms_moment']:.4f} N·m")
+    print(f"  {out_json}")
 
 
 def phi_dict(phi: np.ndarray) -> dict[str, float]:
     return {PHI_NAMES[i]: float(phi[i]) for i in range(16)}
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Merge pose logs → staged OLS φ")
+    parser.add_argument("--id-config", type=Path, default=CONFIG_ID)
     parser.add_argument("--npz", type=Path, action="append", default=None)
-    parser.add_argument("--config", type=Path, default=CONFIG_FORCE)
     parser.add_argument("--fc", type=float, default=None)
-    parser.add_argument("--holdout-frac", type=float, default=0.2)
-    parser.add_argument("--alpha-percentile", type=float, default=70.0,
-                        help="also fit I on burst samples with |alpha| above this percentile")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    paths = args.npz if args.npz else DEFAULT_NPZS
+    id_cfg = load_config(args.id_config)
+    fcfg = id_cfg.fit
+    paths = args.npz if args.npz else fcfg.npz_paths
     for p in paths:
         if not p.exists():
             print(f"Missing {p}", file=sys.stderr)
             return 1
 
-    cfg = fid.FrameConfig.from_yaml(args.config)
+    cfg = fid.FrameConfig.from_yaml(fcfg.force_sensor)
     fc = args.fc
     if fc is None:
-        fc = float(yaml.safe_load(args.config.read_text()).get("filtfilt_cutoff_hz", 2.5))
+        fc = float(yaml.safe_load(fcfg.force_sensor.read_text()).get("filtfilt_cutoff_hz", 2.5))
 
-    print("Merged ID fit (10p → 16p → burst-I)")
-    print(f"  config: {args.config.name} → {cfg.label()}")
-    print(f"  files ({len(paths)}):")
-    for p in paths:
-        d = np.load(p, allow_pickle=True)
-        n_burst = int(np.sum(d["phase"] == 1)) if "phase" in d.files else 0
-        print(f"    {p.name}: N={len(d['t'])} slot={d.get('pose_slot','?')} burst={n_burst}")
+    r_max = fcfg.inertia_r_max_m
+    holdout_frac = fcfg.holdout_frac
+    alpha_pct = fcfg.alpha_percentile
+    out_json = fcfg.phi_output
 
     W10, Y, tags, burst_rows, alpha_rows = build_merged(paths, cfg, fc, use_inertia=False)
     W16, Y16, _, burst_rows, alpha_rows = build_merged(paths, cfg, fc, use_inertia=True)
@@ -235,17 +223,18 @@ def main() -> int:
 
     Yres_all = Y16 - W16[:, COLS10] @ phi10[COLS10]
     phi_i_all, *_ = np.linalg.lstsq(W16[:, COLS_I], Yres_all, rcond=None)
-    phi_seq = phi10.copy()
+    phi_seq = constrain_inertia(phi10.copy(), r_max=r_max)
     phi_seq[COLS_I] = phi_i_all
-    phi_seq = constrain_inertia(phi_seq)
+    phi_seq = constrain_inertia(phi_seq, r_max=r_max)
     rms_seq = eval_phi(W16, Y16, phi_seq)["rms_all"]
 
-    phi_burst, burst_fit = fit_i_on_mask(W16, Y16, phi10, burst_rows, min_rows=300)
+    phi_burst, burst_fit = fit_i_on_mask(
+        W16, Y16, phi10, burst_rows, min_rows=fcfg.min_burst_rows, r_max=r_max,
+    )
     rms_burst_all = eval_phi(W16, Y16, phi_burst)["rms_all"]
     rms_burst_on_burst = eval_phi(W16, Y16, phi_burst, burst_rows)
     rms10_on_burst = eval_phi(W16, Y16, phi10, burst_rows)
 
-    # high-|alpha| within burst rows
     alpha_vals = np.zeros(len(Y16) // 6)
     idx = 0
     for p in paths:
@@ -255,11 +244,13 @@ def main() -> int:
         idx += len(t)
     burst_samples = burst_rows.reshape(-1, 6)[:, 0]
     if np.any(burst_samples):
-        thr = float(np.percentile(alpha_vals[burst_samples], args.alpha_percentile))
+        thr = float(np.percentile(alpha_vals[burst_samples], alpha_pct))
         high_a_rows = sample_row_mask(
             len(alpha_vals), burst_samples & (alpha_vals >= thr)
         )
-        phi_ha, ha_fit = fit_i_on_mask(W16, Y16, phi10, high_a_rows, min_rows=150)
+        phi_ha, ha_fit = fit_i_on_mask(
+            W16, Y16, phi10, high_a_rows, min_rows=fcfg.min_high_alpha_rows, r_max=r_max,
+        )
     else:
         phi_ha, ha_fit = phi_burst.copy(), {"skipped": True, "n_rows": 0}
 
@@ -271,7 +262,7 @@ def main() -> int:
         rec_label = "phi_burst (10p + I@burst moments)"
 
     n = len(Y) // 6
-    split = int((1.0 - args.holdout_frac) * n)
+    split = int((1.0 - holdout_frac) * n)
     row_tr = np.repeat(np.arange(n) < split, 6)
     row_te = ~row_tr
     phi16_tr, _ = fit_cols(W16[row_tr], Y16[row_tr], COLS16)
@@ -279,42 +270,11 @@ def main() -> int:
     rms16_te = float(np.sqrt(np.mean((Y16[row_te] - Yhat_te) ** 2)))
 
     per_pose = holdout_by_pose(paths, cfg, fc, phi_rec)
-
-    print_phi(phi10, "Stage-1: m + mc + bias (10p, all data)")
-    print(f"  RMS fit = {rms10:.4f}")
-    print_phi(phi16, "Stage-2: full 16p joint OLS (all data)")
-    print(f"  RMS fit = {rms16:.4f}")
-    print_phi(phi_seq, "Stage-2b: sequential I on all data residual")
-    print(f"  RMS fit = {rms_seq:.4f}")
-    print_phi(phi_burst, "Stage-3: 10p + I on pose-d burst rows only (recommended I)")
-    print(f"  RMS all = {rms_burst_all:.4f}")
-    print(
-        f"  on burst rows: M RMS {rms10_on_burst['rms_moment']:.4f} (10p) → "
-        f"{rms_burst_on_burst['rms_moment']:.4f} (burst-I)  "
-        f"F {rms10_on_burst['rms_force']:.3f} → {rms_burst_on_burst['rms_force']:.3f} N"
-    )
-    if not ha_fit.get("skipped"):
-        ha_on = eval_phi(W16, Y16, phi_ha, high_a_rows)
-        print_phi(phi_ha, f"Stage-3alt: I on burst & |α|≥p{args.alpha_percentile:.0f}")
-        print(f"  on high-α burst: M RMS={ha_on['rms_moment']:.4f}  n={ha_fit['n_rows']}")
-
-    print(f"\nRecommended φ: {rec_label}")
-    print_phi(phi_rec, "φ_recommended")
-    print(f"\nHold-out last {args.holdout_frac*100:.0f}% timeline (16p): test RMS={rms16_te:.4f}")
-
-    print("\nPer-pose residual (φ_recommended):")
-    for slot, st in per_pose.items():
-        line = (
-            f"  pose {slot}: RMS F={st['rms_force']:.3f} N  M={st['rms_moment']:.4f} N·m"
-        )
-        if "burst_rms_moment" in st:
-            line += (
-                f"  | burst M={st['burst_rms_moment']:.4f} F={st['burst_rms_force']:.3f} N"
-            )
-        print(line)
+    rms_rec = eval_phi(W16, Y16, phi_rec)["rms_all"]
 
     result = {
         "config": cfg.label(),
+        "id_config": str(args.id_config),
         "files": [str(p) for p in paths],
         "n_samples": int(n),
         "recommended": rec_label,
@@ -330,9 +290,9 @@ def main() -> int:
         "burst_i_fit": burst_fit,
         "per_pose_residual": per_pose,
     }
-    OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
-    OUT_JSON.write_text(json.dumps(result, indent=2))
-    print(f"\nSaved φ → {OUT_JSON}  (validate uses phi_recommended)")
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps(result, indent=2))
+    print_summary(phi_rec, rms_all=rms_rec, per_pose=per_pose, out_json=out_json)
     return 0
 
 

@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Live 6D force compensation monitor — drag the arm manually, watch raw vs F_ext.
+Live 6D force compensation monitor — drag arm manually, watch raw vs F_ext.
 
-Uses φ from force_id_phi.json (phi_recommended by default) and the same
-regressor as force_id_fit.py. Keeps a rolling pose/force buffer for ω/α.
-
-Run:
   source env.sh
-  python tmp/force_id/force_id_comp_monitor.py
-  python tmp/force_id/force_id_comp_monitor.py --window-s 30 --poll-ms 50
+  python tmp/force_compensation/force_monitor.py
+
+Config: config/force_id.yaml (monitor section), logs/force_id_phi.json
 """
 
 from __future__ import annotations
@@ -25,20 +22,21 @@ from threading import Lock
 import numpy as np
 import yaml
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
-import force_id_comp_demo as fid  # noqa: E402
-from _paths import CONFIG_FORCE, CONFIG_ROBOT, PHI_JSON  # noqa: E402
+PKG = Path(__file__).resolve().parent
+if str(PKG) not in sys.path:
+    sys.path.insert(0, str(PKG))
+
+from utils import regressor as fid  # noqa: E402
+from utils.id_config import load_config  # noqa: E402
+from utils.paths import CONFIG_ID, CONFIG_ROBOT  # noqa: E402
 
 AXIS_LABELS = ["Fx", "Fy", "Fz", "Mx", "My", "Mz"]
 FORCE_IDX = (0, 1, 2)
 MOM_IDX = (3, 4, 5)
 
 
-def load_phi(path: Path, source: str | None) -> tuple[np.ndarray, str]:
+def load_phi(path: Path, source: str) -> tuple[np.ndarray, str]:
     data = json.loads(path.read_text())
-    if source is None:
-        source = "phi_recommended" if "phi_recommended" in data else "phi_16"
     if source not in data:
         raise SystemExit(f"Key '{source}' not in {path}. Keys: {list(data.keys())}")
     phi = np.array([data[source][k] for k in fid.PHI_NAMES])
@@ -81,14 +79,10 @@ def compensate_latest(
     W, Y = fid.build_dataset(pose, force, t, cfg, fc=fc, use_inertia=use_inertia)
     k = len(t) - 1
     sl = slice(6 * k, 6 * k + 6)
-    f_model_in = Y[sl].copy()
-    f_ext = (Y[sl] - W[sl] @ phi).reshape(6)
-    return f_model_in, f_ext
+    return Y[sl].copy(), (Y[sl] - W[sl] @ phi).reshape(6)
 
 
 class CompMonitor:
-    """Rolling plot: signed raw (filtered, model input) vs compensated F_ext."""
-
     def __init__(self, *, window_s: float, refresh_hz: float = 12.0) -> None:
         import matplotlib.pyplot as plt
 
@@ -104,7 +98,7 @@ class CompMonitor:
 
         plt.ion()
         self._fig, axes = plt.subplots(2, 3, figsize=(12, 6), sharex=True)
-        self._fig.suptitle("6D force: model input (raw signed, filtered) vs compensated F_ext")
+        self._fig.suptitle("6D force: raw (signed, filtered) vs compensated F_ext")
         self._axes = axes.ravel()
         self._line_raw: list = []
         self._line_ext: list = []
@@ -169,13 +163,9 @@ class CompMonitor:
             self._axes[i].set_xlim(t_start, max(t_end, t_start + 1.0))
 
         if len(xs) >= 5:
-            rf = float(
-                np.sqrt(
-                    np.nanmean(
-                        np.sum(np.stack([raw_pts[j] for j in FORCE_IDX], axis=1) ** 2, axis=1)
-                    )
-                )
-            )
+            rf = float(np.sqrt(np.nanmean(
+                np.sum(np.stack([raw_pts[j] for j in FORCE_IDX], axis=1) ** 2, axis=1)
+            )))
             ef = np.stack([ext_pts[j] for j in FORCE_IDX], axis=1)
             ef_ok = np.isfinite(ef).all(axis=1)
             if np.any(ef_ok):
@@ -183,60 +173,55 @@ class CompMonitor:
                 em = np.stack([ext_pts[j] for j in MOM_IDX], axis=1)
                 em_ok = np.isfinite(em).all(axis=1)
                 rm = float(np.sqrt(np.mean(np.sum(em[em_ok] ** 2, axis=1)))) if np.any(em_ok) else float("nan")
-                status = (
-                    f"{status}  |  window |F| raw={rf:.2f}N ext={re:.2f}N  |M| ext={rm:.3f}N·m"
-                )
+                status = f"{status}  |  |F| raw={rf:.2f}N ext={re:.2f}N  |M| ext={rm:.3f}N·m"
             else:
-                status = f"{status}  |  window |F| raw={rf:.2f}N  (F_ext warming up)"
+                status = f"{status}  |  |F| raw={rf:.2f}N  (F_ext warming up)"
         self._text.set_text(status)
         self._fig.canvas.draw_idle()
         self._fig.canvas.flush_events()
 
     def close(self) -> None:
         import matplotlib.pyplot as plt
-
         plt.close(self._fig)
         plt.ioff()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Live 6D compensated force plot (manual motion)")
-    parser.add_argument("--phi", type=Path, default=PHI_JSON)
+    parser = argparse.ArgumentParser(description="Live 6D compensated force plot")
+    parser.add_argument("--id-config", type=Path, default=CONFIG_ID)
+    parser.add_argument("--phi", type=Path, default=None)
     parser.add_argument("--phi-source", type=str, default=None)
-    parser.add_argument("--config", type=Path, default=CONFIG_FORCE)
-    parser.add_argument("--fc", type=float, default=None)
-    parser.add_argument("--poll-ms", type=float, default=50.0, help="robot poll period")
-    parser.add_argument("--window-s", type=float, default=25.0, help="plot time window")
-    parser.add_argument("--buffer-s", type=float, default=4.0, help="kinematics history for ω/α")
-    parser.add_argument("--min-samples", type=int, default=35, help="min buffer before F_ext")
-    parser.add_argument("--10p-only", dest="only_10p", action="store_true", help="zero I terms in φ")
-    parser.add_argument("--refresh-hz", type=float, default=12.0)
+    parser.add_argument("--10p-only", dest="only_10p", action="store_true")
     args = parser.parse_args()
 
-    phi, src = load_phi(args.phi, args.phi_source)
+    id_cfg = load_config(args.id_config)
+    mc = id_cfg.monitor
+    fc_cfg = id_cfg.fit
+    phi_path = args.phi or fc_cfg.phi_output
+    phi_src = args.phi_source or mc.phi_source
+
+    phi, src = load_phi(phi_path, phi_src)
     if args.only_10p:
         phi = phi.copy()
         phi[4:10] = 0.0
         src = f"{src} (I=0)"
 
-    cfg = fid.FrameConfig.from_yaml(args.config)
-    fc = args.fc
-    if fc is None:
-        fc = float(yaml.safe_load(args.config.read_text()).get("filtfilt_cutoff_hz", 2.5))
+    frame = fid.FrameConfig.from_yaml(fc_cfg.force_sensor)
+    fc = float(yaml.safe_load(fc_cfg.force_sensor.read_text()).get("filtfilt_cutoff_hz", 2.5))
+    use_inertia = mc.use_inertia and float(np.max(np.abs(phi[4:10]))) > 1e-9
 
-    max_buf = max(args.min_samples + 10, int(args.buffer_s * 1000 / args.poll_ms) + 5)
+    max_buf = max(mc.min_samples + 10, int(mc.buffer_s * 1000 / mc.poll_ms) + 5)
     buf = SampleBuffer(max_len=max_buf)
-    use_inertia = float(np.max(np.abs(phi[4:10]))) > 1e-9
+    sign = np.array(frame.force_sign, dtype=float)
 
-    print(f"φ source: {src}  m={phi[0]:.3f} kg  inertia={'yes' if use_inertia else 'no'}")
-    print(f"poll={args.poll_ms}ms  buffer≈{args.buffer_s}s  plot window={args.window_s}s")
-    print("Drag the arm in FREE SPACE. Close plot window or Ctrl+C to stop.")
+    print(f"φ ({src}) from {phi_path}  m={phi[0]:.3f} kg")
+    print(f"poll={mc.poll_ms}ms  window={mc.window_s}s  buffer≈{mc.buffer_s}s")
+    print("Drag arm in FREE SPACE. Close plot or Ctrl+C to stop.")
 
     from rm75_control import RobotSession
 
-    monitor = CompMonitor(window_s=args.window_s, refresh_hz=args.refresh_hz)
-    dt_s = args.poll_ms / 1000.0
-    sign = np.array(cfg.force_sign, dtype=float)
+    monitor = CompMonitor(window_s=mc.window_s, refresh_hz=mc.refresh_hz)
+    dt_s = mc.poll_ms / 1000.0
 
     try:
         with RobotSession(config=CONFIG_ROBOT) as bot:
@@ -244,7 +229,6 @@ def main() -> int:
             next_poll = t0
             while True:
                 import matplotlib.pyplot as plt
-
                 if not plt.fignum_exists(monitor._fig.number):
                     print("Plot closed — exiting.")
                     break
@@ -258,7 +242,7 @@ def main() -> int:
                 ret_s, st = bot.robot.rm_get_current_arm_state()
                 ret_f, fd = bot.robot.rm_get_force_data()
                 if ret_s != 0 or ret_f != 0:
-                    monitor.set_status(f"API error state={ret_s} force={ret_f}")
+                    monitor.set_status(f"API err s={ret_s} f={ret_f}")
                     monitor.refresh(now)
                     continue
 
@@ -267,12 +251,12 @@ def main() -> int:
                 buf.append(t_s, pose, force)
 
                 comp = compensate_latest(
-                    buf, phi, cfg, fc, use_inertia=use_inertia, min_samples=args.min_samples
+                    buf, phi, frame, fc,
+                    use_inertia=use_inertia, min_samples=mc.min_samples,
                 )
                 if comp is None:
-                    raw_show = force * sign
-                    monitor.set_status(f"buffer {len(buf.t)}/{args.min_samples}")
-                    monitor.append(t_s, raw_show, None)
+                    monitor.set_status(f"buffer {len(buf.t)}/{mc.min_samples}")
+                    monitor.append(t_s, force * sign, None)
                 else:
                     raw_show, ext_show = comp
                     monitor.set_status(f"OK n={len(buf.t)}")

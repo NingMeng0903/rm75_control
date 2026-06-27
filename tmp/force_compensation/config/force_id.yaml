@@ -1,0 +1,73 @@
+# Force compensation pipeline — config/force_id.yaml, config/poses.yaml
+# Entry: force_calibrate.py (collect+identify), force_monitor.py (live plot)
+
+poses_yaml: poses.yaml
+
+sequence: [a, b, c, d]
+return_home: a
+
+collect:
+  move_speed: 15
+  settle_timeout_s: 15.0
+  dt_ms: 10.0
+  log_every: 10
+  scale: 1.0
+  warmup_s: 3.0
+  follow: false
+
+  cartesian:
+    duration_s: 30.0
+    max_delta_mm: 5.0
+    max_orient_deg:
+      a: 18.0
+      b: 28.0
+      c: 28.0
+    amp_mm: [3.0, 4.0, 2.0]
+    amp_rot_deg: [12.0, 15.0, 12.0]
+    freqs_hz:
+      - [0.12, 0.18]
+      - [0.13, 0.19]
+      - [0.11, 0.16]
+      - [0.22, 0.33]
+      - [0.25, 0.37]
+      - [0.24, 0.31]
+
+  pose_d:
+    joint_duration_s: 30.0
+    burst_duration_s: 45.0
+    joint_amp_deg: [10.0, 8.0, 8.0, 14.0, 16.0, 14.0, 32.0]
+    joint_max_delta_deg: [12.0, 12.0, 12.0, 18.0, 20.0, 18.0, 35.0]
+    joint_freqs_hz:
+      - [0.14, 0.21]
+      - [0.13, 0.19]
+      - [0.12, 0.18]
+      - [0.22, 0.31]
+      - [0.24, 0.33]
+      - [0.23, 0.30]
+      - [0.20, 0.29]
+    burst:
+      segment_s: 15.0
+      amp_rot_deg: 18.0
+      max_rot_deg: 25.0
+      freqs_hz: [1.1, 1.55]
+      ramp_s: 3.0
+
+fit:
+  force_sensor: configs/force_sensor.yaml
+  holdout_frac: 0.2
+  alpha_percentile: 70.0
+  min_burst_rows: 300
+  min_high_alpha_rows: 150
+  inertia_r_max_m: 0.12
+  npz_slots: [a, b, c, d]
+  phi_output: force_id_phi.json
+  phi_recommended_key: phi_burst
+
+monitor:
+  poll_ms: 50.0
+  window_s: 25.0
+  buffer_s: 4.0
+  min_samples: 35
+  refresh_hz: 12.0
+  phi_source: phi_recommended
+  use_inertia: true

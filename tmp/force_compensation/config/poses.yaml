@@ -1,7 +1,7 @@
 poses:
   a:
-    label: scan_mid_current
-    note: 2026-06-27 verified force_sign; first ID capture pose
+    label: pose_a
+    note: 2026-06-27 verified
     pose_base:
     - 0.284324
     - -0.002917
@@ -54,7 +54,7 @@ poses:
     - 85.76
     - 6.911
   d:
-    label: pose_d_large
+    label: pose_d
     note: saved 2026-06-27 13:02 UTC
     pose_base:
     - 0.210513

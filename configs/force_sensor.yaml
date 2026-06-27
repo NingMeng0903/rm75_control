@@ -1,5 +1,5 @@
 # RealMan RM75 raw force_data — dynamic ID / compensation (verified 2026-06-27)
-# Run: python tmp/force_id/force_id_comp_demo.py --apply-yaml --live
+# Verified force_sign / euler — used by tmp/force_compensation/regressor.py
 
 force_sign: [-1, -1, -1, 1, 1, 1]   # flip Fx,Fy,Fz only; moments unchanged
 euler_order: xyz

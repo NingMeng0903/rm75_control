@@ -25,10 +25,10 @@ env/
 # Logs & run artifacts
 *.log
 
-# Force ID: regenerated locally (re-run force_id_run_all.py)
-tmp/force_id/logs/*.npz
-tmp/force_id/logs/force_id_phi.json
-tmp/force_id_logs/
+# Force compensation: regenerated locally (force_collection / force_identification)
+tmp/force_compensation/logs/*.npz
+tmp/force_compensation/logs/force_id_phi.json
+tmp/force_compensation_logs/
 
 # Legacy / local-only tmp outputs (keep scripts, ignore bulky captures)
 tmp/**/*.npz
