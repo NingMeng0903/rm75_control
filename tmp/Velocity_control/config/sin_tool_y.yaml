@@ -1,25 +1,8 @@
-# Tool Y sin — ±15 cm peak, 1.5 cm/s max (see sin_period auto).
-# movev init frame_type=0: velocity in Tool frame (RM API rm_interface.h)
-
-timing:
-  dt_ms: 10.0
-  settle_frames: 20
-  hold_s: 1.0
-  fb_every: 10
-
-trajectory:
-  amplitude_mm: 150.0      # ±15 cm symmetric scan (sin, slew-limiter handles startup)
-  y_max_vel_cm_s: 1.5
-  period_s: null
-
-velocity_canfd:
-  frame_type: 0            # 0=Tool velocity, 1=Work velocity (API)
-  avoid_singularity: 0
-  follow: true
-  trajectory_mode: 1       # 1=curve smooth, 0=passthrough
-  radio: 40
-
-control:
-  pos_kp_y: 0.8
-  pos_ki_y: 0.0
-  # hold_kp: disabled — Tool X/Z ≈ -Work X/Z, hold correction in tool frame is destabilizing
+# 参数已移到 run_sin_tool_y.py 命令行；此处仅作说明备份。
+#
+# 官方接口 (RM_API2 rm_interface.h):
+#   rm_set_movev_canfd_init(avoid, frame_type, dt)  — 一次
+#   rm_movev_canfd([vx,vy,vz,wx,wy,wz], follow, trajectory_mode, radio)  — 循环
+#
+# frame_type=0 → TCP/gripper 坐标系速度
+# 推荐: follow=True, trajectory_mode=0, radio=0（完全透传；mode1/2 扫 sin 实测更差）

@@ -1,61 +1,63 @@
-# Tool-Y sin scan: ±75 mm, ~2 cm/s peak, Fz=2 N after contact.
+# pose D → world-Y sin + tool-Z Fz=3N (fast admittance, anti-overshoot)
 # Run: python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
-#
-# RealMan 力位混合对照 (rm_force_position_move control_mode):
-#   3 = 运动轴 (XY 轨迹)    →  contact 前: 全轴位置保持; contact 后: Y sin 扫描
-#   4 = 力控轴 (Z 恒力)     →  contact 后: Fz_ext 跟踪 desired_z_n
-# 接触前不启力控、不自动下压 — 需手动压到台面，Fz_ext 达标后 latch。
 
 timing:
   dt_ms: 10.0
+  feedback_every: 2       # 20ms 力反馈（再快易拖慢 10ms 环）
 
 startup:
+  pose_slot: d
   settle_frames: 10
   hold_s: 1.0
   wait_contact: true
-  contact_fz_n: 1.0        # ≥ 此值 (N) 连续 contact_samples 帧 → 开始扫描+力控
+  contact_fz_n: 1.0
   contact_samples: 30
 
 frames:
   euler_order: xyz
+  motion_frame: base
+  control_frame: tool
 
 velocity_canfd:
-  frame_type: 1
-  avoid_singularity: 0   # 1 injects extra joint motion / TCP twist near singularities
+  frame_type: 0
+  avoid_singularity: 0
   follow: true
   trajectory_mode: 0
   radio: 0
 
 force:
   phi_source: phi_recommended
-  buffer_s: 4.0
-  min_samples: 35
+  buffer_s: 2.0          # 缩短 F_ext 滞后（原 4s）
+  min_samples: 22
+  fc_hz: 4.0             # 略快滤波（原 2.5Hz）
   use_inertia: false
-  desired_z_n: 2.0
+  desired_z_n: 3.0
 
 trajectory:
-  type: sin_tool_y
+  type: sin_base_y
   amplitude_mm: 75.0
   y_max_vel_cm_s: 2.0
   period_s: null
   soft_start: true
+  ramp_s: 2.0
 
 controller:
-  # RealMan control_mode analogue: [3,3,4,3,3,3] — only tool-Z force; tool-Y motion; rest locked
   force_axes: [0, 0, 1, 0, 0, 0]
-  motion_axes: [0, 1, 0, 0, 0, 0]   # tool-frame: Y sin only
+  motion_axes: [0, 1, 0, 0, 0, 0]
   lock_orientation: true
-  enable_normal_tracking: false       # was twisting TCP rx/ry to "align" with Fx/Fy
-  kp_pos: [6.0, 6.0, 0.0, 10.0, 10.0, 10.0]
-  k_fp_press: 0.012
-  k_fp_release: 0.004
-  k_fi: 0.006
-  integral_limit: 0.04
+  enable_normal_tracking: false
+  kp_pos: [2.0, 2.0, 2.0, 0.0, 0.0, 0.0]
+  system_delay_s: 0.015
+  # f_err=f_des-F_ext | f_err>0 下压(k_fp_release) | f_err<0 超力快退(k_fp_press)
+  k_fp_press: 0.045      # F>3N 快退，抑超调
+  k_fp_release: 0.030    # F<3N 下压
+  k_fi: 0.001            # 极小积分，避免顶过 3N
+  integral_limit: 0.015
   k_align: 0.0
   contact_threshold_n: 0.5
-  deadband_n: 0.2
-  max_vz_tool_m_s: 0.05               # ±5 cm/s TCP normal
-  max_velocity: [0.2, 0.04, 0.05, 0.08, 0.08, 0.08]
-  max_acceleration: [1.0, 0.5, 0.05, 0.15, 0.15, 0.15]
-  release_vz_up_m_s: 0.05
-  release_vz_down_m_s: 0.05
+  deadband_n: 0.05
+  max_vz_tool_m_s: 0.15  # 15 cm/s tool-Z 顶
+  max_velocity: [0.04, 0.04, 0.15, 0.0, 0.0, 0.0]
+  max_acceleration: [0.5, 0.5, 1.5, 0.0, 0.0, 0.0]
+  release_vz_up_m_s: 0.15
+  release_vz_down_m_s: 0.15

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Demo: tool-frame Y sin (±75 mm) + constant 2 N Z force.
+Demo: world-Y sin (±7.5 cm) + 3 N tool-Z force (fast, anti-overshoot).
 
   source env.sh
   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
@@ -17,7 +17,7 @@ from rm75_control.control.velocity_admittance.paths import CONFIG_SIN_TOOL_Y_Z2N
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Tool-Y sin scan (±7.5 cm) with 2 N Z contact force",
+        description="World-Y sin scan (±7.5 cm) with 3 N tool-Z force",
     )
     parser.add_argument("--config", type=Path, default=CONFIG_SIN_TOOL_Y_Z2N)
     parser.add_argument("--desired-z", type=float, default=None, help="Fz target (N)")
@@ -30,7 +30,7 @@ def main() -> int:
 
     return run_velocity_admittance(
         raw,
-        title="Demo sin_tool_y + Fz=2N",
+        title="Demo sin_tool_y + Fz=3N",
         duration_s=args.duration,
     )
 

@@ -4,6 +4,10 @@
 
 timing:
   dt_ms: 10.0
+  feedback_every: 3
+
+startup:
+  pose_slot: d
 
 frames:
   euler_order: xyz   # rm_get_current_arm_state pose; match configs/force_sensor.yaml
@@ -33,7 +37,8 @@ controller:
   motion_axes: [0, 1, 0, 0, 0, 0]
   lock_orientation: true
   enable_normal_tracking: false
-  kp_pos: [8.0, 8.0, 0.0, 10.0, 10.0, 10.0]
+  kp_pos: [2.0, 2.0, 0.0, 1.5, 1.5, 1.5]
+  system_delay_s: 0.015
   k_fp_press: 0.015
   k_fp_release: 0.005
   k_fi: 0.008

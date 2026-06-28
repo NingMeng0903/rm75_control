@@ -29,16 +29,22 @@ class TrajectoryConfig:
     period_s: float | None = None
     y_max_vel_cm_s: float = 1.0
     soft_start: bool = False
+    ramp_s: float = 2.0
 
 
-def sin_y_motion(t_s: float, amplitude_m: float, omega: float, *, soft_start: bool) -> tuple[float, float]:
-    """Tool-frame Y offset (m) and velocity (m/s). soft_start: dy(0)=vy(0)=0."""
-    if soft_start:
-        dy = amplitude_m * (1.0 - math.cos(omega * t_s))
-        vy = amplitude_m * omega * math.sin(omega * t_s)
-        return dy, vy
+def sin_y_motion(
+    t_s: float,
+    amplitude_m: float,
+    omega: float,
+    *,
+    soft_start: bool,
+    ramp_s: float = 2.0,
+) -> tuple[float, float]:
+    """Tool-frame Y offset (m) and velocity (m/s). soft_start ramps vy from 0 (±sin ref)."""
     dy = amplitude_m * math.sin(omega * t_s)
     vy = amplitude_m * omega * math.cos(omega * t_s)
+    if soft_start and ramp_s > 0.0 and t_s < ramp_s:
+        vy *= math.sin(0.5 * math.pi * t_s / ramp_s)
     return dy, vy
 
 
@@ -56,7 +62,31 @@ class TrajectoryGenerator:
         self.amplitude_m = amp_m
         self._y0_tool = float(end2tool_pose(robot, list(pose0))[1])
 
+    def set_origin(self, pose0: np.ndarray) -> None:
+        """Reset sin centre to contact pose (e.g. pose D at latch)."""
+        self.pose0 = np.asarray(pose0, dtype=float).copy()
+        self._y0_tool = float(end2tool_pose(self.robot, list(self.pose0))[1])
+
     @staticmethod
+    def world_scan_reference(
+        pose_d: np.ndarray,
+        vel_ff: np.ndarray,
+        pose_anchor: np.ndarray,
+        motion_axes: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Base/world sin on motion_axes; lock all other pose dof to anchor."""
+        pose_d = np.asarray(pose_d, dtype=float).copy()
+        vel_ff = np.asarray(vel_ff, dtype=float).copy()
+        anchor = np.asarray(pose_anchor, dtype=float)
+        for i in range(3):
+            if motion_axes[i] < 0.5:
+                pose_d[i] = anchor[i]
+                vel_ff[i] = 0.0
+            else:
+                vel_ff[i] = float(vel_ff[i])
+        pose_d[3:6] = anchor[3:6]
+        vel_ff[3:6] = 0.0
+        return pose_d, vel_ff
     def blend_tool_pose(
         robot,
         pose_d: np.ndarray,
@@ -104,7 +134,8 @@ class TrajectoryGenerator:
 
         if kind == "sin_base_y":
             dy, vy = sin_y_motion(
-                t_s, self.amplitude_m, self.omega, soft_start=self.cfg.soft_start
+                t_s, self.amplitude_m, self.omega,
+                soft_start=self.cfg.soft_start, ramp_s=self.cfg.ramp_s,
             )
             pose = self.pose0.copy()
             pose[1] += dy
@@ -114,7 +145,8 @@ class TrajectoryGenerator:
 
         if kind == "sin_tool_y":
             dy, vy = sin_y_motion(
-                t_s, self.amplitude_m, self.omega, soft_start=self.cfg.soft_start
+                t_s, self.amplitude_m, self.omega,
+                soft_start=self.cfg.soft_start, ramp_s=self.cfg.ramp_s,
             )
             pose = np.asarray(
                 tool_offset_pose(self.robot, list(self.pose0), 0.0, dy, 0.0), dtype=float
@@ -141,6 +173,7 @@ class TrajectoryGenerator:
                 period_s=float(ps) if ps is not None else None,
                 y_max_vel_cm_s=float(t.get("y_max_vel_cm_s", 1.0)),
                 soft_start=bool(t.get("soft_start", False)),
+                ramp_s=float(t.get("ramp_s", 2.0)),
             ),
             pose0,
             robot,

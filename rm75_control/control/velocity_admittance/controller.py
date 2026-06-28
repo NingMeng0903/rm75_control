@@ -29,10 +29,13 @@ class AdmittanceConfig:
     motion_axes: np.ndarray = field(
         default_factory=lambda: np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
     )
+    motion_frame: str = "base"
+    control_frame: str = "tool"
     lock_orientation: bool = True
     kp_pos: np.ndarray = field(
-        default_factory=lambda: np.array([8.0, 8.0, 0.0, 5.0, 5.0, 5.0])
+        default_factory=lambda: np.array([2.0, 2.0, 0.0, 1.5, 1.5, 1.5])
     )
+    system_delay_s: float = 0.015
     k_fp_press: float = 0.015
     k_fp_release: float = 0.005
     k_fi: float = 0.008
@@ -59,16 +62,19 @@ class AdmittanceConfig:
         ma = np.asarray(c.get("motion_axes", [0, 1, 0, 0, 0, 0]), dtype=float)
         return cls(
             euler_order=str(frames.get("euler_order", "xyz")),
+            motion_frame=str(frames.get("motion_frame", c.get("motion_frame", "base"))),
+            control_frame=str(frames.get("control_frame", c.get("control_frame", "tool"))),
             force_axes=fa,
             motion_axes=ma,
             lock_orientation=bool(c.get("lock_orientation", True)),
-            kp_pos=np.asarray(c.get("kp_pos", [8, 8, 0, 5, 5, 5]), dtype=float),
+            kp_pos=np.asarray(c.get("kp_pos", [2, 2, 0, 1.5, 1.5, 1.5]), dtype=float),
+            system_delay_s=float(c.get("system_delay_s", 0.015)),
             k_fp_press=float(c.get("k_fp_press", 0.015)),
             k_fp_release=float(c.get("k_fp_release", 0.005)),
             k_fi=float(c.get("k_fi", 0.008)),
             integral_limit=float(c.get("integral_limit", 0.05)),
             k_align=float(c.get("k_align", 0.02)),
-            enable_normal_tracking=bool(c.get("enable_normal_tracking", True)),
+            enable_normal_tracking=bool(c.get("enable_normal_tracking", False)),
             contact_threshold_n=float(c.get("contact_threshold_n", 0.5)),
             deadband_n=float(c.get("deadband_n", 0.3)),
             max_velocity=np.asarray(
@@ -87,9 +93,8 @@ class AdmittanceController:
     """
     Hybrid admittance-position controller (PBAC-style, Keemink et al.).
 
-    Position loop + feedforward run in base frame; force admittance in sensor/tool
-    frame. Commands are merged in tool frame, then rotated back to base for
-    rm_movev_canfd (frame_type=1).
+    Feedforward-heavy position loop with delay-compensated feedback; force
+    admittance in tool frame. Output frame is cfg.control_frame (tool or base).
     """
 
     def __init__(self, dt: float, config: AdmittanceConfig | None = None) -> None:
@@ -125,18 +130,33 @@ class AdmittanceController:
     ) -> np.ndarray:
         cfg = self.cfg
         desired_pose = np.asarray(desired_pose, dtype=float).copy()
-        if pose_anchor is not None and cfg.lock_orientation:
-            desired_pose[3:6] = np.asarray(pose_anchor, dtype=float)[3:6]
-
-        err_pose = pose_error(desired_pose, current_pose)
-        vel_ff = np.asarray(desired_vel_ff, dtype=float).copy()
-        if cfg.lock_orientation:
-            vel_ff[3:6] = 0.0
-        v_pos_base = vel_ff + cfg.kp_pos * err_pose
+        anchor = np.asarray(pose_anchor, dtype=float) if pose_anchor is not None else None
+        if anchor is not None and cfg.lock_orientation:
+            desired_pose[3:6] = anchor[3:6]
+        if anchor is not None and cfg.motion_frame == "base":
+            for i in range(3):
+                if cfg.motion_axes[i] < 0.5:
+                    desired_pose[i] = anchor[i]
 
         r_mat = Rsc.from_euler(
             cfg.euler_order, current_pose[3:6], degrees=False
         ).as_matrix()
+
+        pose_predicted = np.asarray(current_pose, dtype=float).copy()
+        if cfg.system_delay_s > 0.0:
+            if cfg.control_frame == "tool":
+                pose_predicted[:3] += r_mat @ self.last_v_cmd[:3] * cfg.system_delay_s
+            else:
+                pose_predicted[:3] += self.last_v_cmd[:3] * cfg.system_delay_s
+
+        err_pose = pose_error(desired_pose, pose_predicted)
+        vel_ff = np.asarray(desired_vel_ff, dtype=float).copy()
+        if cfg.lock_orientation:
+            vel_ff[3:6] = 0.0
+            err_pose[3:6] = 0.0
+        v_pos_base = vel_ff + cfg.kp_pos * err_pose
+        if cfg.lock_orientation:
+            v_pos_base[3:6] = 0.0
 
         v_pos_tool = np.zeros(6, dtype=float)
         v_pos_tool[:3] = r_mat.T @ v_pos_base[:3]
@@ -161,14 +181,28 @@ class AdmittanceController:
 
         s_p, s_f = self._selection(normal_track=normal_track)
         v_cmd_tool = s_p @ v_pos_tool + s_f @ v_force_tool
-        v_cmd_tool[3:6] = (s_p @ v_pos_tool)[3:6]
+        if cfg.lock_orientation:
+            v_cmd_tool[3:6] = 0.0
+        else:
+            v_cmd_tool[3:6] = (s_p @ v_pos_tool)[3:6]
         vz_cap = cfg.max_vz_tool_m_s
         if vz_cap > 0.0:
             v_cmd_tool[2] = float(np.clip(v_cmd_tool[2], -vz_cap, vz_cap))
 
+        if cfg.control_frame == "tool":
+            v_clamp = np.clip(v_cmd_tool, -cfg.max_velocity, cfg.max_velocity)
+            dv_max = cfg.max_acceleration * self.dt
+            v_final = np.clip(v_clamp, self.last_v_cmd - dv_max, self.last_v_cmd + dv_max)
+            if cfg.lock_orientation:
+                v_final[3:6] = 0.0
+            self.last_v_cmd = v_final.copy()
+            return v_final
+
         v_cmd_base = np.zeros(6, dtype=float)
         v_cmd_base[:3] = r_mat @ v_cmd_tool[:3]
         v_cmd_base[3:] = r_mat @ v_cmd_tool[3:]
+        if cfg.lock_orientation:
+            v_cmd_base[3:6] = 0.0
 
         v_clamp = np.clip(v_cmd_base, -cfg.max_velocity, cfg.max_velocity)
         dv_max = cfg.max_acceleration * self.dt
@@ -190,6 +224,15 @@ class AdmittanceController:
         if abs(f_err) > cfg.deadband_n:
             eff = f_err - math.copysign(cfg.deadband_n, f_err)
             self.force_error_integral[axis] += eff * self.dt
+            if axis == 2:
+                if f_err < 0:
+                    self.force_error_integral[axis] = min(
+                        0.0, float(self.force_error_integral[axis]),
+                    )
+                else:
+                    self.force_error_integral[axis] = max(
+                        0.0, float(self.force_error_integral[axis]),
+                    )
             self.force_error_integral[axis] = float(
                 np.clip(self.force_error_integral[axis], -cfg.integral_limit, cfg.integral_limit)
             )

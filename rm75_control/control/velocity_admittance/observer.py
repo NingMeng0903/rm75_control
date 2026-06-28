@@ -88,14 +88,15 @@ class CompensatedForceObserver:
     @classmethod
     def from_yaml(cls, raw: dict) -> CompensatedForceObserver:
         f = raw.get("force", {})
-        fc = float(yaml.safe_load(CONFIG_FORCE.read_text()).get("filtfilt_cutoff_hz", 2.5))
+        fc_cfg = float(yaml.safe_load(CONFIG_FORCE.read_text()).get("filtfilt_cutoff_hz", 2.5))
+        fc_hz = float(f.get("fc_hz", fc_cfg))
         timing = raw.get("timing", {})
         dt_ms = float(timing.get("dt_ms", 10.0))
         return cls(
             ForceObserverConfig(
                 phi_path=PHI_JSON,
                 phi_source=str(f.get("phi_source", "phi_recommended")),
-                fc_hz=fc,
+                fc_hz=fc_hz,
                 buffer_s=float(f.get("buffer_s", 4.0)),
                 min_samples=int(f.get("min_samples", 35)),
                 use_inertia=bool(f.get("use_inertia", False)),
