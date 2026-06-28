@@ -10,20 +10,19 @@ from __future__ import annotations
 
 import argparse
 import math
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-PKG = Path(__file__).resolve().parent
-if str(PKG) not in sys.path:
-    sys.path.insert(0, str(PKG))
-
-from utils import excitation as ex  # noqa: E402
-from utils.collection import move_j, wait_settle  # noqa: E402
-from utils.id_config import BURST_PROFILES, DEFAULT_BURST_PROFILE, load_velocity_burst  # noqa: E402
-from utils.paths import CONFIG_ROBOT, LOG_DIR, POSES_YAML  # noqa: E402
+from rm75_control.force.compensation import excitation as ex
+from rm75_control.force.compensation.collection import move_j, wait_settle
+from rm75_control.force.compensation.id_config import (
+    BURST_PROFILES,
+    DEFAULT_BURST_PROFILE,
+    load_velocity_burst,
+)
+from rm75_control.force.compensation.paths import CONFIG_FORCE, CONFIG_ROBOT, LOG_DIR, POSES_YAML
 
 from rm75_control.core.exceptions import MotionError  # noqa: E402
 from rm75_control.motion.canfd import send_velocity_canfd  # noqa: E402
@@ -632,12 +631,12 @@ def print_kinematics_summary(out: Path) -> None:
     """Quick regressor-relevant stats from saved NPZ."""
     if not out.exists():
         return
-    from utils import regressor as fid
+    from rm75_control.force.compensation import regressor as fid
 
     d = np.load(out, allow_pickle=True)
     pose, t, seg = d["pose"], d["t"], d["segment"]
     pose0 = d["pose0"]
-    cfg = fid.FrameConfig.from_yaml(PKG.parents[1] / "configs" / "force_sensor.yaml")
+    cfg = fid.FrameConfig.from_yaml(CONFIG_FORCE)
     omega_s, alpha_s, _, _ = fid.kinematics_sensor(pose, t, cfg, fc=2.0)
     an = np.linalg.norm(alpha_s, axis=1) * RAD2DEG
     dp = pose[:, :3] - pose0[:3]

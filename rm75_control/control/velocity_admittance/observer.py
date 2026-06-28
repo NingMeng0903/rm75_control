@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,16 +10,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from paths import CONFIG_FORCE, FORCE_COMP_UTILS, PHI_JSON
-
-
-def _import_regressor():
-    p = str(FORCE_COMP_UTILS)
-    if p not in sys.path:
-        sys.path.insert(0, p)
-    from utils import regressor as fid  # noqa: WPS433
-
-    return fid
+from rm75_control.force.compensation import regressor as fid
+from rm75_control.force.compensation.paths import CONFIG_FORCE, PHI_JSON
 
 
 @dataclass
@@ -58,7 +49,6 @@ class ForceSampleBuffer:
 
 class CompensatedForceObserver:
     def __init__(self, cfg: ForceObserverConfig) -> None:
-        fid = _import_regressor()
         self._fid = fid
         self.cfg = cfg
         self.phi = self._load_phi(cfg.phi_path, cfg.phi_source)
@@ -69,7 +59,6 @@ class CompensatedForceObserver:
     @staticmethod
     def _load_phi(path: Path, source: str) -> np.ndarray:
         data = json.loads(path.read_text())
-        fid = _import_regressor()
         if source not in data:
             raise SystemExit(f"Key '{source}' not in {path}")
         return np.array([data[source][k] for k in fid.PHI_NAMES])

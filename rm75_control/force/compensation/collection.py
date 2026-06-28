@@ -2,32 +2,22 @@
 Multi-pose force-ID data collection: A → B → C → D → return A.
 
   source env.sh
-  python tmp/force_compensation/utils/collection.py
-  python tmp/force_compensation/utils/collection.py --dry-run
+  python -m rm75_control.force.compensation.collection
+  python tmp/force_compensation/force_calibrate.py
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-if __name__ == "__main__" and __package__ is None:
-    _pkg_root = Path(__file__).resolve().parents[1]
-    if str(_pkg_root) not in sys.path:
-        sys.path.insert(0, str(_pkg_root))
-    from utils import excitation as ex
-    from utils.id_config import ForceIdConfig, load_config
-    from utils.paths import CONFIG_ID, CONFIG_ROBOT, npz_for_slot
-    from utils.progress import stage_progress
-else:
-    from . import excitation as ex
-    from .id_config import ForceIdConfig, load_config
-    from .paths import CONFIG_ID, CONFIG_ROBOT, npz_for_slot
-    from .progress import stage_progress
+from . import excitation as ex
+from .id_config import ForceIdConfig, load_config
+from .paths import CONFIG_ID, CONFIG_ROBOT, npz_for_slot
+from .progress import stage_progress
 
 
 def load_slot(cfg: ForceIdConfig, slot: str) -> tuple[np.ndarray, np.ndarray, dict]:

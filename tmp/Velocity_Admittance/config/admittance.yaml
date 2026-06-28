@@ -1,0 +1,53 @@
+# Velocity admittance — library: rm75_control.control.velocity_admittance
+# Generic: python tmp/Velocity_Admittance/run_admittance.py
+# Demo:    python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
+
+timing:
+  dt_ms: 10.0
+
+frames:
+  euler_order: xyz   # rm_get_current_arm_state pose; match configs/force_sensor.yaml
+
+velocity_canfd:
+  frame_type: 1          # 0 tool, 1 work/base — v_cmd output is base frame
+  avoid_singularity: 0
+  follow: true
+  trajectory_mode: 0     # 0 passthrough — smoothing in controller only
+  radio: 0
+
+force:
+  phi_source: phi_recommended
+  buffer_s: 4.0
+  min_samples: 35
+  use_inertia: false     # no virtual mass — PI admittance only (Keemink §5.4)
+  desired_z_n: 3.0
+
+trajectory:
+  type: sin_tool_y       # hold | sin_tool_y | sin_base_y
+  amplitude_mm: 5.0
+  period_s: null         # auto from y_max_vel_cm_s if null
+  y_max_vel_cm_s: 1.0
+
+controller:
+  force_axes: [0, 0, 1, 0, 0, 0]   # 1 = admittance on axis (sensor frame)
+  motion_axes: [0, 1, 0, 0, 0, 0]
+  lock_orientation: true
+  enable_normal_tracking: false
+  kp_pos: [8.0, 8.0, 0.0, 10.0, 10.0, 10.0]
+  k_fp_press: 0.015
+  k_fp_release: 0.005
+  k_fi: 0.008
+  integral_limit: 0.05
+  k_align: 0.0
+  contact_threshold_n: 0.5
+  deadband_n: 0.3
+  max_vz_tool_m_s: 0.05
+  max_velocity: [0.2, 0.2, 0.05, 0.08, 0.08, 0.08]
+  max_acceleration: [1.0, 1.0, 0.05, 0.15, 0.15, 0.15]
+  release_vz_up_m_s: 0.05
+  release_vz_down_m_s: 0.05
+
+monitor:
+  enabled: false
+  window_s: 25.0
+  refresh_hz: 12.0

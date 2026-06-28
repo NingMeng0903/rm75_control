@@ -1,13 +1,13 @@
-"""Shared paths for tmp/force_compensation."""
+"""Shared paths for force-ID data and configs (under tmp/force_compensation)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-PKG = Path(__file__).resolve().parent.parent
-REPO = PKG.parent.parent
-CONFIG_DIR = PKG / "config"
-LOG_DIR = PKG / "logs"
+REPO = Path(__file__).resolve().parents[3]
+DATA_DIR = REPO / "tmp" / "force_compensation"
+CONFIG_DIR = DATA_DIR / "config"
+LOG_DIR = DATA_DIR / "logs"
 CONFIG_ROBOT = REPO / "configs" / "rm75f_default.yaml"
 CONFIG_FORCE = REPO / "configs" / "force_sensor.yaml"
 CONFIG_ID = CONFIG_DIR / "force_id.yaml"

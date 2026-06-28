@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -22,13 +21,9 @@ from threading import Lock
 import numpy as np
 import yaml
 
-PKG = Path(__file__).resolve().parent
-if str(PKG) not in sys.path:
-    sys.path.insert(0, str(PKG))
-
-from utils import regressor as fid  # noqa: E402
-from utils.id_config import load_config  # noqa: E402
-from utils.paths import CONFIG_ID, CONFIG_ROBOT  # noqa: E402
+from rm75_control.force.compensation import regressor as fid
+from rm75_control.force.compensation.id_config import load_config
+from rm75_control.force.compensation.paths import CONFIG_ID, CONFIG_ROBOT
 
 AXIS_LABELS = ["Fx", "Fy", "Fz", "Mx", "My", "Mz"]
 FORCE_IDX = (0, 1, 2)

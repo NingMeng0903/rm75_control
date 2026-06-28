@@ -1,5 +1,6 @@
 # Force compensation pipeline — config/force_id.yaml, config/poses.yaml
-# Entry: utils/collection.py (采集), force_calibrate.py (采集+辨识), force_monitor.py
+# Library: rm75_control.force.compensation
+# Entry: tmp/force_compensation/force_calibrate.py, force_monitor.py
 
 poses_yaml: poses.yaml
 

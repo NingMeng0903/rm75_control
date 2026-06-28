@@ -1,9 +1,11 @@
 # RealMan RM75 raw force_data — dynamic ID / compensation (verified 2026-06-27)
-# Verified force_sign / euler — used by tmp/force_compensation/regressor.py
+# Verified force_sign / euler — used by rm75_control.force.compensation.regressor
 
 force_sign: [-1, -1, -1, 1, 1, 1]   # flip Fx,Fy,Fz only; moments unchanged
 euler_order: xyz
 sensor_offset_euler_xyz_rad: [0.0, 0.0, 0.0]
+# Sensor origin position in link7 frame (m). Default 0 = co-located with link7 origin.
+sensor_origin_in_link7_m: [0.0, 0.0, 0.0]
 gravity_base: [0.0, 0.0, -9.80665]
 
 filtfilt_cutoff_hz: 2.5

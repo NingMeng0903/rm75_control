@@ -5,29 +5,16 @@ One-shot force compensation calibration: collect A→B→C→D→A, then identif
   source env.sh
   python tmp/force_compensation/force_calibrate.py
   python tmp/force_compensation/force_calibrate.py --dry-run
-  python tmp/force_compensation/force_calibrate.py --save-pose d --pose-label pose_d_large
   python tmp/force_compensation/force_calibrate.py --identify-only
-
-Collect only (no identify):
-
-  python tmp/force_compensation/utils/collection.py
-
-Config: tmp/force_compensation/config/force_id.yaml, config/poses.yaml
-Output: logs/force_id_pose_{a,b,c,d}.npz, logs/force_id_phi.json (overwrite each run)
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
-PKG = Path(__file__).resolve().parent
-if str(PKG) not in sys.path:
-    sys.path.insert(0, str(PKG))
-
-from utils import collection, identification  # noqa: E402
-from utils.paths import CONFIG_ID  # noqa: E402
+from rm75_control.force.compensation import collection, identification
+from rm75_control.force.compensation.paths import CONFIG_ID
 
 
 def _collect_argv(args: argparse.Namespace) -> list[str]:

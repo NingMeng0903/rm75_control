@@ -167,16 +167,34 @@ def holdout_by_pose(
     return out
 
 
+def com_report(phi: np.ndarray, cfg: fid.FrameConfig) -> dict:
+    r_sensor, r_link7 = fid.com_from_phi(phi, cfg)
+    return {
+        "sensor_mm": fid.com_dict_mm(r_sensor),
+        "link7_mm": fid.com_dict_mm(r_link7),
+    }
+
+
 def print_summary(
     phi: np.ndarray,
+    cfg: fid.FrameConfig,
     *,
     rms_all: float,
     per_pose: dict,
     out_json: Path,
 ) -> None:
+    com = com_report(phi, cfg)
+    c_s = com["sensor_mm"]
+    c_l = com["link7_mm"]
     print("\nIdentify done")
     print(f"  m     = {phi[0]:+.4f} kg")
     print(f"  mc    = [{phi[1]:+.4f}, {phi[2]:+.4f}, {phi[3]:+.4f}] kg·m")
+    print(
+        f"  CoM sensor  Cx,Cy,Cz = [{c_s['Cx']:+.2f}, {c_s['Cy']:+.2f}, {c_s['Cz']:+.2f}] mm"
+    )
+    print(
+        f"  CoM link7   Cx,Cy,Cz = [{c_l['Cx']:+.2f}, {c_l['Cy']:+.2f}, {c_l['Cz']:+.2f}] mm"
+    )
     print(f"  biasF = [{phi[10]:+.3f}, {phi[11]:+.3f}, {phi[12]:+.3f}] N")
     print(f"  biasM = [{phi[13]:+.4f}, {phi[14]:+.4f}, {phi[15]:+.4f}] N·m")
     print(f"  RMS   = {rms_all:.4f}")
@@ -283,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         "phi_sequential": phi_dict(phi_seq),
         "phi_burst": phi_dict(phi_burst),
         "phi_recommended": phi_dict(phi_rec),
+        "com_recommended": com_report(phi_rec, cfg),
         "rms_10": rms10,
         "rms_16": rms16,
         "rms_16_test": rms16_te,
@@ -292,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(result, indent=2))
-    print_summary(phi_rec, rms_all=rms_rec, per_pose=per_pose, out_json=out_json)
+    print_summary(phi_rec, cfg, rms_all=rms_rec, per_pose=per_pose, out_json=out_json)
     return 0
 
 

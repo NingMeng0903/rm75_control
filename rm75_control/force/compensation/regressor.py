@@ -35,6 +35,7 @@ class FrameConfig:
     force_sign: tuple[int, ...]
     euler_order: str
     offset_rad: tuple[float, float, float]
+    origin_in_link7_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
     gravity_base: tuple[float, float, float] = (0.0, 0.0, -9.80665)
 
     def label(self) -> str:
@@ -51,8 +52,42 @@ class FrameConfig:
             force_sign=tuple(int(x) for x in data["force_sign"]),
             euler_order=str(data["euler_order"]),
             offset_rad=tuple(float(x) for x in data["sensor_offset_euler_xyz_rad"]),
+            origin_in_link7_m=tuple(
+                float(x) for x in data.get("sensor_origin_in_link7_m", [0.0, 0.0, 0.0])
+            ),
             gravity_base=tuple(float(x) for x in data["gravity_base"]),
         )
+
+
+def com_from_phi(phi: np.ndarray, cfg: FrameConfig) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Center of mass position (m) from identified phi.
+
+    mc is the first mass moment in the **sensor** frame: mc = m * r_com_sensor.
+    link7 frame: R_link7_sensor @ r_com_sensor + sensor origin in link7,
+    with R_link7_sensor = R_off from sensor_offset_euler (same as regressor).
+    """
+    m = float(phi[0])
+    if m <= 1e-9:
+        z = np.zeros(3, dtype=float)
+        return z, z
+    r_sensor = np.asarray(phi[1:4], dtype=float) / m
+    if cfg.offset_rad != (0.0, 0.0, 0.0):
+        r_off = Rsc.from_euler("xyz", cfg.offset_rad, degrees=False).as_matrix()
+        r_link7 = r_off @ r_sensor
+    else:
+        r_link7 = r_sensor.copy()
+    r_link7 = r_link7 + np.asarray(cfg.origin_in_link7_m, dtype=float)
+    return r_sensor, r_link7
+
+
+def com_dict_mm(r_m: np.ndarray) -> dict[str, float]:
+    r_mm = np.asarray(r_m, dtype=float) * 1000.0
+    return {
+        "Cx": float(r_mm[0]),
+        "Cy": float(r_mm[1]),
+        "Cz": float(r_mm[2]),
+    }
 
 
 def skew(v: np.ndarray) -> np.ndarray:

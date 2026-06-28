@@ -1,0 +1,61 @@
+# Tool-Y sin scan: ±75 mm, ~2 cm/s peak, Fz=2 N after contact.
+# Run: python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
+#
+# RealMan 力位混合对照 (rm_force_position_move control_mode):
+#   3 = 运动轴 (XY 轨迹)    →  contact 前: 全轴位置保持; contact 后: Y sin 扫描
+#   4 = 力控轴 (Z 恒力)     →  contact 后: Fz_ext 跟踪 desired_z_n
+# 接触前不启力控、不自动下压 — 需手动压到台面，Fz_ext 达标后 latch。
+
+timing:
+  dt_ms: 10.0
+
+startup:
+  settle_frames: 10
+  hold_s: 1.0
+  wait_contact: true
+  contact_fz_n: 1.0        # ≥ 此值 (N) 连续 contact_samples 帧 → 开始扫描+力控
+  contact_samples: 30
+
+frames:
+  euler_order: xyz
+
+velocity_canfd:
+  frame_type: 1
+  avoid_singularity: 0   # 1 injects extra joint motion / TCP twist near singularities
+  follow: true
+  trajectory_mode: 0
+  radio: 0
+
+force:
+  phi_source: phi_recommended
+  buffer_s: 4.0
+  min_samples: 35
+  use_inertia: false
+  desired_z_n: 2.0
+
+trajectory:
+  type: sin_tool_y
+  amplitude_mm: 75.0
+  y_max_vel_cm_s: 2.0
+  period_s: null
+  soft_start: true
+
+controller:
+  # RealMan control_mode analogue: [3,3,4,3,3,3] — only tool-Z force; tool-Y motion; rest locked
+  force_axes: [0, 0, 1, 0, 0, 0]
+  motion_axes: [0, 1, 0, 0, 0, 0]   # tool-frame: Y sin only
+  lock_orientation: true
+  enable_normal_tracking: false       # was twisting TCP rx/ry to "align" with Fx/Fy
+  kp_pos: [6.0, 6.0, 0.0, 10.0, 10.0, 10.0]
+  k_fp_press: 0.012
+  k_fp_release: 0.004
+  k_fi: 0.006
+  integral_limit: 0.04
+  k_align: 0.0
+  contact_threshold_n: 0.5
+  deadband_n: 0.2
+  max_vz_tool_m_s: 0.05               # ±5 cm/s TCP normal
+  max_velocity: [0.2, 0.04, 0.05, 0.08, 0.08, 0.08]
+  max_acceleration: [1.0, 0.5, 0.05, 0.15, 0.15, 0.15]
+  release_vz_up_m_s: 0.05
+  release_vz_down_m_s: 0.05

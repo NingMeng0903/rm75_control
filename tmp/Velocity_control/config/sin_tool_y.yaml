@@ -1,0 +1,25 @@
+# Tool Y sin — ±15 cm peak, 1.5 cm/s max (see sin_period auto).
+# movev init frame_type=0: velocity in Tool frame (RM API rm_interface.h)
+
+timing:
+  dt_ms: 10.0
+  settle_frames: 20
+  hold_s: 1.0
+  fb_every: 10
+
+trajectory:
+  amplitude_mm: 150.0      # peak ±15 cm
+  y_max_vel_cm_s: 1.5
+  period_s: null
+  soft_start: true
+
+velocity_canfd:
+  frame_type: 0            # 0=Tool velocity, 1=Work velocity (API)
+  avoid_singularity: 0
+  follow: true
+  trajectory_mode: 1       # 1=curve smooth, 0=passthrough
+  radio: 40
+
+control:
+  pos_kp_y: 0.8
+  pos_ki_y: 0.0

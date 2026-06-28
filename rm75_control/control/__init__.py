@@ -13,7 +13,16 @@ from rm75_control.control.cartesian_velocity import (
     CartesianVelocityTrackerConfig,
 )
 
+from rm75_control.control.velocity_admittance import (
+    AdmittanceConfig,
+    AdmittanceController,
+    CompensatedForceObserver,
+    run_velocity_admittance,
+)
+
 __all__ = [
+    "AdmittanceConfig",
+    "AdmittanceController",
     "AxisVelocityGains",
     "CartesianLimits",
     "CartesianPoseController",
@@ -22,4 +31,6 @@ __all__ = [
     "CartesianVelocityStreamConfig",
     "CartesianVelocityTracker",
     "CartesianVelocityTrackerConfig",
+    "CompensatedForceObserver",
+    "run_velocity_admittance",
 ]

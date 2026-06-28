@@ -39,5 +39,5 @@ force:
     limit_vel: [0.05, 0.05, 0.25, 10.0, 10.0, 10.0]
 
 tool:
-  name: "scan_tool"
-  payload_kg: 0.5
+  name: "gripper"
+  payload_kg: 0.982
