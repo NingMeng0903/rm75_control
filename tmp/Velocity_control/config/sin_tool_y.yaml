@@ -8,10 +8,9 @@ timing:
   fb_every: 10
 
 trajectory:
-  amplitude_mm: 150.0      # peak ±15 cm
+  amplitude_mm: 150.0      # ±15 cm symmetric scan (sin, slew-limiter handles startup)
   y_max_vel_cm_s: 1.5
   period_s: null
-  soft_start: true
 
 velocity_canfd:
   frame_type: 0            # 0=Tool velocity, 1=Work velocity (API)
@@ -23,3 +22,4 @@ velocity_canfd:
 control:
   pos_kp_y: 0.8
   pos_ki_y: 0.0
+  # hold_kp: disabled — Tool X/Z ≈ -Work X/Z, hold correction in tool frame is destabilizing

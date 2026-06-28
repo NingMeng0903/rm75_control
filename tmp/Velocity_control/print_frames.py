@@ -103,6 +103,16 @@ def main() -> int:
         default=0.0,
         help="apply +dy in Tool frame via rm_algo_pose_move (no motion, math only)",
     )
+    p.add_argument(
+        "--vel-probe",
+        choices=["ft0", "ft1", "none"],
+        default="none",
+        help=(
+            "physically move: ft0=frame_type=0 [0,vy,0..], ft1=frame_type=1 [0,vy,0..]. "
+            "Sends 2 cm/s for 0.3 s (~6 mm), measures actual work-frame TCP displacement "
+            "and compares with tool-Y direction."
+        ),
+    )
     args = p.parse_args()
 
     from rm75_control import RobotSession
@@ -155,7 +165,81 @@ def main() -> int:
         print("  ref pose for P loop: end2tool()[1] vs y0 + dy  (same as sin_y_movev_canfd.py)")
         print("  geometric ref: tool_offset_pose(base, 0, dy, 0) for base target pose")
 
+        if args.vel_probe != "none":
+            ft = 0 if args.vel_probe == "ft0" else 1
+            _vel_probe(bot.robot, frame_type=ft, col_y=col_y, dt_ms=10, vy_m_s=0.02, n_cycles=30)
+
     return 0
+
+
+def _vel_probe(robot, *, frame_type: int, col_y, dt_ms: float, vy_m_s: float, n_cycles: int) -> None:
+    """Send [0, vy, 0, 0, 0, 0] for n_cycles at dt_ms, measure actual TCP displacement."""
+    import time
+    from rm75_control.motion.canfd import send_velocity_canfd
+
+    print(f"\n=== vel_probe: frame_type={frame_type}  [0, {vy_m_s:.3f}, 0, 0, 0, 0] ===")
+    print(f"  Moving {n_cycles * dt_ms:.0f} ms at {vy_m_s*100:.1f} cm/s → expected ~{n_cycles*dt_ms/1000*vy_m_s*1000:.1f} mm")
+    print("  KEEP CLEAR — robot will move ~6 mm")
+
+    ret0, st0 = robot.rm_get_current_arm_state()
+    if ret0 != 0:
+        print(f"  get_state failed: {ret0}")
+        return
+    pose_before = list(st0["pose"][:3])
+
+    ret_init = robot.rm_set_movev_canfd_init(0, frame_type, int(dt_ms))
+    if ret_init != 0:
+        print(f"  rm_set_movev_canfd_init failed: {ret_init}")
+        return
+
+    # settle
+    for _ in range(5):
+        send_velocity_canfd(robot, [0.0]*6, follow=True, trajectory_mode=0, radio=0)
+        time.sleep(dt_ms / 1000.0)
+
+    vel_cmd = [0.0, vy_m_s, 0.0, 0.0, 0.0, 0.0]
+    t0 = time.monotonic()
+    for i in range(n_cycles):
+        tick = t0 + i * dt_ms / 1000.0
+        now = time.monotonic()
+        if now < tick:
+            time.sleep(tick - now)
+        send_velocity_canfd(robot, vel_cmd, follow=True, trajectory_mode=0, radio=0)
+
+    # stop
+    for _ in range(5):
+        send_velocity_canfd(robot, [0.0]*6, follow=True, trajectory_mode=0, radio=0)
+        time.sleep(dt_ms / 1000.0)
+    time.sleep(0.1)
+    robot.rm_set_arm_slow_stop()
+    time.sleep(0.3)
+
+    ret1, st1 = robot.rm_get_current_arm_state()
+    if ret1 != 0:
+        print(f"  get_state after failed: {ret1}")
+        return
+    pose_after = list(st1["pose"][:3])
+
+    delta = np.array(pose_after) - np.array(pose_before)
+    dist_mm = np.linalg.norm(delta) * 1000.0
+    if dist_mm < 0.1:
+        print("  TCP did not move — check robot is not in E-stop or paused")
+        return
+
+    delta_unit = delta / np.linalg.norm(delta)
+    proj_tool_y = float(np.dot(delta_unit, col_y))
+    angle_deg = math.degrees(math.acos(max(-1.0, min(1.0, proj_tool_y))))
+
+    print(f"  actual displacement (work xyz mm): {delta * 1000}")
+    print(f"  displacement magnitude: {dist_mm:.2f} mm")
+    print(f"  tool Y unit vec (work): {np.round(col_y, 4)}")
+    print(f"  cos(angle to tool Y): {proj_tool_y:.4f}  → angle = {angle_deg:.1f} deg")
+    if angle_deg < 10.0:
+        print("  ✓ motion IS along tool Y  →  frame_type works as expected")
+    elif angle_deg > 70.0:
+        print("  ✗ motion is nearly PERPENDICULAR to tool Y  →  frame_type meaning reversed?")
+    else:
+        print(f"  ? motion has {angle_deg:.1f}° offset from tool Y  →  partial mismatch")
 
 
 if __name__ == "__main__":
