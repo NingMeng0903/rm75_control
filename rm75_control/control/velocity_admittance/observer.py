@@ -70,7 +70,13 @@ class CompensatedForceObserver:
         return len(self.buf) >= self.cfg.min_samples
 
     def latest_wrench(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """Return (signed_filtered_raw, f_ext) in sensor frame, or None while warming up."""
+        """
+        Return (signed_filtered_raw, f_ext).
+
+        f_ext is computed in the sensor frame (phi regressor). With
+        sensor_offset_euler=0 and TCP offset a pure translation, linear
+        f_ext[0:3] matches tool-frame force components — use f_ext[2] as tool-Z.
+        """
         if not self.ready():
             return None
         t = np.asarray(self.buf.t)

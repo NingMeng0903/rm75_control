@@ -24,8 +24,9 @@ def pose_error(desired: np.ndarray, current: np.ndarray) -> np.ndarray:
 class AdmittanceConfig:
     """
     force_axes: tool-frame mask for admittance (typ. [0,0,1,0,0,0] = TCP normal).
-    All other tool DOFs follow trajectory via S_p = I - S_f.
-    Trajectory pose_d / vel_ff are always base-frame 6D from a Trajectory6D producer.
+    f_ext from phi is in sensor frame; with sensor_offset=0 and TCP pure translation,
+    f_ext[2] is used as tool-Z force (see observer docstring).
+    Trajectory pose_d / vel_ff are base-frame 6D from a Trajectory6D producer.
     """
 
     euler_order: str = "xyz"
@@ -94,11 +95,10 @@ class AdmittanceConfig:
 
 class AdmittanceController:
     """
-    Pipeline (base trajectory → tool decouple → movev):
-      1. v_pos_base = vel_ff + kp * (pose_d - pose)     [base 6D from trajectory]
-      2. v_pos_tool = R^T v_pos_base
-      3. v_cmd_tool = S_p v_pos_tool + S_f v_force_tool
-      4. output v_cmd_tool or R v_cmd_tool per control_frame
+    Pipeline (base trajectory → constrained fusion → movev):
+      1. v_pos_base = vel_ff + kp * (pose_d - pose)
+      2. fuse_constrained_xy: Tool-Z = force admittance; Tool-X/Y lstsq → Base-X/Y
+      3. output v_cmd_tool (frame_type=0) or v_cmd_base
     """
 
     def __init__(self, dt: float, config: AdmittanceConfig | None = None) -> None:
@@ -111,29 +111,33 @@ class AdmittanceController:
         self.force_error_integral.fill(0.0)
         self.last_v_cmd.fill(0.0)
 
-    def _selection(self, *, normal_track: bool) -> tuple[np.ndarray, np.ndarray]:
-        s_f = np.diag(self.cfg.force_axes.copy())
-        if normal_track and self.cfg.enable_normal_tracking:
-            s_f[3, 3] = 1.0
-            s_f[4, 4] = 1.0
-        s_p = np.eye(6) - s_f
-        return s_p, s_f
-
     @staticmethod
-    def fuse_tool_decoupled(
+    def fuse_constrained_xy(
         v_pos_base: np.ndarray,
         v_force_tool: np.ndarray,
         r_mat: np.ndarray,
-        s_p: np.ndarray,
-        s_f: np.ndarray,
+        *,
+        normal_track: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
-        v_pos_tool = np.zeros(6, dtype=float)
-        v_pos_tool[:3] = r_mat.T @ v_pos_base[:3]
-        v_pos_tool[3:] = r_mat.T @ v_pos_base[3:]
-        v_cmd_tool = s_p @ v_pos_tool + s_f @ v_force_tool
+        """
+        2×2 constrained projection: match Base-X/Y while Tool-Z is force-controlled.
+
+        Replaces S_p @ (R^T v_base) which zeroed tool-Z trajectory rate and shrank
+        world-Y stroke when the TCP is tilted.
+        """
+        v_cmd_tool = np.zeros(6, dtype=float)
+        a_mat = r_mat[0:2, 0:2]
+        b_vec = np.asarray(v_pos_base[0:2], dtype=float) - r_mat[0:2, 2] * float(v_force_tool[2])
+        v_xy, _, _, _ = np.linalg.lstsq(a_mat, b_vec, rcond=None)
+        v_cmd_tool[0:2] = v_xy
+        v_cmd_tool[2] = float(v_force_tool[2])
+        v_cmd_tool[3:6] = r_mat.T @ np.asarray(v_pos_base[3:6], dtype=float)
+        if normal_track:
+            v_cmd_tool[3:6] += np.asarray(v_force_tool[3:6], dtype=float)
+
         v_cmd_base = np.zeros(6, dtype=float)
         v_cmd_base[:3] = r_mat @ v_cmd_tool[:3]
-        v_cmd_base[3:] = r_mat @ v_cmd_tool[3:]
+        v_cmd_base[3:] = r_mat @ v_cmd_tool[3:6]
         return v_cmd_tool, v_cmd_base
 
     def compute_velocity_command(
@@ -185,9 +189,8 @@ class AdmittanceController:
             v_force_tool[3] = -cfg.k_align * f_ext[1]
             v_force_tool[4] = cfg.k_align * f_ext[0]
 
-        s_p, s_f = self._selection(normal_track=normal_track)
-        v_cmd_tool, v_cmd_base = self.fuse_tool_decoupled(
-            v_pos_base, v_force_tool, r_mat, s_p, s_f,
+        v_cmd_tool, v_cmd_base = self.fuse_constrained_xy(
+            v_pos_base, v_force_tool, r_mat, normal_track=normal_track,
         )
         if cfg.max_vz_tool_m_s > 0.0:
             v_cmd_tool[2] = float(np.clip(v_cmd_tool[2], -cfg.max_vz_tool_m_s, cfg.max_vz_tool_m_s))

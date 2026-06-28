@@ -13,6 +13,7 @@ from rm75_control.force.compensation.id_config import load_config
 from rm75_control.force.compensation.paths import CONFIG_ID
 from rm75_control.motion.canfd import send_velocity_canfd
 
+from .async_state import AsyncStateObserver
 from .controller import AdmittanceConfig, AdmittanceController
 from .observer import CompensatedForceObserver
 from .paths import CONFIG_ROBOT, PHI_JSON
@@ -108,7 +109,7 @@ def run_velocity_admittance(
     timing = raw.get("timing", {})
     dt_ms = float(timing.get("dt_ms", 10.0))
     dt_s = dt_ms / 1000.0
-    feedback_every = max(1, int(timing.get("feedback_every", 3)))
+    async_poll_ms = float(timing.get("async_poll_ms", 2.0))
     vc = raw.get("velocity_canfd", {})
     follow = bool(vc.get("follow", True))
     traj_mode = int(vc.get("trajectory_mode", 0))
@@ -159,15 +160,17 @@ def run_velocity_admittance(
         f"follow={follow} traj={traj_mode} radio={radio}",
     )
     print(
-        f"  kp_pos={ctrl_cfg.kp_pos.tolist()}  delay={ctrl_cfg.system_delay_s * 1000:.0f}ms  "
-        f"feedback every {feedback_every} cycles (~{feedback_every * dt_ms:.0f}ms)",
+        f"  kp_pos={ctrl_cfg.kp_pos.tolist()}  track_axes={ctrl_cfg.track_axes.tolist()}  "
+        f"delay={ctrl_cfg.system_delay_s * 1000:.0f}ms  "
+        f"async feedback ~{async_poll_ms:.0f}ms",
     )
     print(f"  phi: {PHI_JSON.name}  Fz_des={desired_z:.2f} N")
     print(f"  vz cap (tool TCP): ±{ctrl_cfg.max_vz_tool_m_s * 100:.1f} cm/s")
     print(f"  trajectory: {trajectory_summary(raw)}  kind={traj_kind}")
     scan_mode = "open-loop ff" if ctrl_cfg.open_loop else "closed-loop track"
     print(
-        f"  hybrid: traj=6D base  decouple=tool S_f={ctrl_cfg.force_axes.tolist()}  "
+        f"  hybrid: traj=6D base  fuse=2x2 lstsq + tool-Z force "
+        f"S_f={ctrl_cfg.force_axes.tolist()}  "
         f"movev={control_frame} frame_type={frame_type}  scan={scan_mode}",
         flush=True,
     )
@@ -251,6 +254,7 @@ def run_velocity_admittance(
             trajectory_mode=traj_mode, radio=radio, n_frames=max(settle_frames, 30),
         )
         ret_post, st_post = bot.robot.rm_get_current_arm_state()
+        snap_detected = False
         if ret_post == 0:
             pose_post = np.asarray(st_post["pose"][:6], dtype=float)
             deuler = np.degrees(pose_post[3:6] - pose_pre[3:6])
@@ -262,12 +266,38 @@ def run_velocity_admittance(
                 f"Δeuler_deg=[{deuler[0]:+.2f},{deuler[1]:+.2f},{deuler[2]:+.2f}]",
                 flush=True,
             )
-            if float(np.max(np.abs(deuler))) > 0.5 or float(np.linalg.norm(dpos_mm)) > 2.0:
+            snap_detected = (
+                float(np.max(np.abs(deuler))) > 0.5
+                or float(np.linalg.norm(dpos_mm)) > 2.0
+            )
+            if snap_detected:
                 print(
-                    "  WARN: init snap detected — last run may leave force/CANFD mode; "
-                    "retry or run tmp/recover_force_stream.py",
+                    "  WARN: init snap detected — extra zero-velocity settle",
                     flush=True,
                 )
+                settle_movev_after_init(
+                    bot.robot, dt_ms=dt_ms, follow=follow,
+                    trajectory_mode=traj_mode, radio=radio, n_frames=50,
+                )
+                ret_post2, st_post2 = bot.robot.rm_get_current_arm_state()
+                if ret_post2 == 0:
+                    pose_post = np.asarray(st_post2["pose"][:6], dtype=float)
+            pose0 = pose_post.copy()
+            traj_origin = pose0.copy()
+            traj.set_origin(pose0)
+            print(
+                f"  anchored pose0 (post-init): "
+                f"xyz=[{pose0[0]:.3f},{pose0[1]:.3f},{pose0[2]:.3f}] m",
+                flush=True,
+            )
+
+        async_obs = AsyncStateObserver(bot.robot, poll_s=async_poll_ms / 1000.0)
+        async_obs.start()
+        try:
+            pose_fb = async_obs.wait_first_pose(timeout_s=5.0)
+        except TimeoutError:
+            async_obs.stop()
+            raise SystemExit("AsyncStateObserver: no pose after CANFD init")
 
         controller.reset()
         print("Velocity CANFD initialized. Ctrl+C to stop.", flush=True)
@@ -278,8 +308,6 @@ def run_velocity_admittance(
         scan_started = not wait_contact
         start_streak = 0
         t_scan0: float | None = None if wait_contact else t0
-        cycle = 0
-        pose_fb = pose0.copy()
         f_ext = f_zero.copy()
         last_wait_msg = 0.0
         fz_buf: list[float] = []
@@ -301,20 +329,16 @@ def run_velocity_admittance(
                 next_tick += dt_s
                 t_s = now - t0
 
-                if cycle % feedback_every == 0:
-                    ret_s, st = bot.robot.rm_get_current_arm_state()
-                    ret_f, fd = bot.robot.rm_get_force_data()
-                    if ret_s == 0 and ret_f == 0:
-                        pose_fb = np.asarray(st["pose"][:6], dtype=float)
-                        force_raw = np.asarray(fd["force_data"][:6], dtype=float)
-                        observer.append(t_s, pose_fb, force_raw)
-                        wrench = observer.latest_wrench()
-                        if wrench is not None:
-                            f_ext = wrench[1]
-                            fz_buf.append(float(f_ext[2]))
-                            if len(fz_buf) > 7:
-                                fz_buf.pop(0)
-                cycle += 1
+                snap = async_obs.read()
+                if snap.pose is not None:
+                    pose_fb = snap.pose
+                    observer.append(t_s, pose_fb, snap.force_raw)
+                    wrench = observer.latest_wrench()
+                    if wrench is not None:
+                        f_ext = wrench[1]
+                        fz_buf.append(float(f_ext[2]))
+                        if len(fz_buf) > 7:
+                            fz_buf.pop(0)
                 pose = pose_fb
 
                 if not scan_started and wait_contact and t_s >= hold_s:
@@ -338,8 +362,7 @@ def run_velocity_admittance(
                             t_scan0 = now
                             traj_origin = pose.copy()
                             traj.set_origin(traj_origin)
-                            controller.force_error_integral.fill(0.0)
-                            controller.last_v_cmd.fill(0.0)
+                            controller.reset()
                             print(
                                 f"  scan ON @ t={t_s:.1f}s  Fz={f_ext[2]:+.2f}N  traj={traj_kind}",
                                 flush=True,
@@ -393,6 +416,7 @@ def run_velocity_admittance(
         except KeyboardInterrupt:
             print("\nStopped.", flush=True)
         finally:
+            async_obs.stop()
             try:
                 settle_movev_after_init(
                     bot.robot, dt_ms=dt_ms, follow=follow,

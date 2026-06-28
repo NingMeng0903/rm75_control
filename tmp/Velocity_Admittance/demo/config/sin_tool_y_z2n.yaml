@@ -1,15 +1,18 @@
 # Demo trajectory plugin + tool-Z force hybrid.
 # Architecture:
-#   trajectory → 6D (pose_d, vel_ff) in base frame  [you may zero tool-Z in vel_ff]
-#   controller → S_f on tool force_axes; all other DOFs follow trajectory (S_p = I - S_f)
+#   trajectory → 6D (pose_d, vel_ff) in base frame
+#   controller → 2×2 lstsq (Base-X/Y track) + tool-Z force admittance
+#
+# Phase 1 (validate 16 cm stroke): open_loop: true, kp_pos all zero
+# Phase 2 (weak PBAC Y drift): open_loop: false, uncomment phase2 block below
 #
 # Run:
 #   source env.sh && cd /media/camp/EXT_DRIVE/rm75_control
-#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
+#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_base_y
 
 timing:
   dt_ms: 10.0
-  feedback_every: 2
+  async_poll_ms: 2.0
 
 startup:
   pose_slot: d
@@ -50,9 +53,14 @@ trajectory:
   open_loop: true
 
 controller:
-  force_axes: [0, 0, 1, 0, 0, 0]   # tool TCP-Z → force; other 5 DOF → trajectory
+  force_axes: [0, 0, 1, 0, 0, 0]   # tool TCP-Z → force (f_ext[2] ≡ tool-Z when sensor∥flange)
   open_loop: true
+  track_axes: [0, 1, 0, 0, 0, 0]   # Phase 1: Y only when closed-loop enabled
   kp_pos: [0, 0, 0, 0, 0, 0]
+  # --- Phase 2 weak PBAC (after open-loop stroke OK) ---
+  # open_loop: false
+  # track_axes: [0, 1, 0, 1, 1, 1]   # Y + euler (pose_d includes spin)
+  # kp_pos: [0, 1.0, 0, 0.3, 0.3, 0.3]
   system_delay_s: 0.015
   k_fp_press: 0.045
   k_fp_release: 0.025

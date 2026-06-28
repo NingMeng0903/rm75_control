@@ -71,6 +71,31 @@ def sin_y_motion(
     return dy, vy
 
 
+def tool_z_spin_angle_rad(
+    t_s: float, *, rz_amp_deg: float, omega: float, soft_start: bool, ramp_s: float,
+) -> float:
+    if rz_amp_deg <= 0.0:
+        return 0.0
+    ramp = 1.0
+    if soft_start and ramp_s > 0.0 and t_s < ramp_s:
+        ramp = math.sin(0.5 * math.pi * t_s / ramp_s)
+    return math.radians(rz_amp_deg) * math.sin(omega * t_s) * ramp
+
+
+def apply_tool_z_spin_pose(pose_ref: np.ndarray, phi_rad: float) -> np.ndarray:
+    """Rotate pose_ref orientation by phi about tool +Z (base-frame axis)."""
+    from scipy.spatial.transform import Rotation as Rsc
+
+    pose = np.asarray(pose_ref, dtype=float).copy()
+    if abs(phi_rad) < 1e-12:
+        return pose
+    r0 = Rsc.from_euler("xyz", pose_ref[3:6], degrees=False).as_matrix()
+    axis = r0[:, 2]
+    r_d = Rsc.from_rotvec(axis * phi_rad).as_matrix() @ r0
+    pose[3:6] = Rsc.from_matrix(r_d).as_euler("xyz", degrees=False)
+    return pose
+
+
 def tool_z_spin_vel_base(pose_ref: np.ndarray, t_s: float, *, rz_amp_deg: float, omega: float,
                          soft_start: bool, ramp_s: float) -> np.ndarray:
     """Sinusoidal spin about tool +Z → base-frame angular velocity (small-angle)."""
@@ -128,6 +153,15 @@ class TrajectoryGenerator:
         )
         pose = self.pose0.copy()
         pose[1] += dy
+        if spin:
+            phi = tool_z_spin_angle_rad(
+                t_s,
+                rz_amp_deg=self.cfg.rz_amplitude_deg,
+                omega=self.omega,
+                soft_start=self.cfg.soft_start,
+                ramp_s=self.cfg.ramp_s,
+            )
+            pose = apply_tool_z_spin_pose(pose, phi)
         vel = np.zeros(6, dtype=float)
         vel[1] = vy
         if spin:
