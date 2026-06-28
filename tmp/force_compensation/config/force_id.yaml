@@ -1,5 +1,5 @@
 # Force compensation pipeline — config/force_id.yaml, config/poses.yaml
-# Entry: force_calibrate.py (collect+identify), force_monitor.py (live plot)
+# Entry: utils/collection.py (采集), force_calibrate.py (采集+辨识), force_monitor.py
 
 poses_yaml: poses.yaml
 
@@ -20,10 +20,13 @@ collect:
     max_delta_mm: 5.0
     max_orient_deg:
       a: 18.0
-      b: 28.0
-      c: 28.0
+      b: 32.0
+      c: 32.0
     amp_mm: [3.0, 4.0, 2.0]
     amp_rot_deg: [12.0, 15.0, 12.0]
+    amp_rot_deg_slots:
+      b: [16.0, 20.0, 16.0]
+      c: [16.0, 20.0, 16.0]
     freqs_hz:
       - [0.12, 0.18]
       - [0.13, 0.19]
@@ -33,7 +36,8 @@ collect:
       - [0.24, 0.31]
 
   pose_d:
-    joint_duration_s: 30.0
+    # Phase 0: joint 45s. Phase 1: pose_d_vel_burst 45s (resync to q0 before burst).
+    joint_duration_s: 45.0
     burst_duration_s: 45.0
     joint_amp_deg: [10.0, 8.0, 8.0, 14.0, 16.0, 14.0, 32.0]
     joint_max_delta_deg: [12.0, 12.0, 12.0, 18.0, 20.0, 18.0, 35.0]
@@ -45,12 +49,10 @@ collect:
       - [0.24, 0.33]
       - [0.23, 0.30]
       - [0.20, 0.29]
-    burst:
-      segment_s: 15.0
-      amp_rot_deg: 18.0
-      max_rot_deg: 25.0
-      freqs_hz: [1.1, 1.55]
-      ramp_s: 3.0
+    velocity_burst:
+      profile: pose_d_vel_burst
+      # base wx→wy→wz 12°/s 0.28Hz traj=0; init settle 100ms (see excitation.settle_movev_after_init)
+      ramp_down_s: 4.0
 
 fit:
   force_sensor: configs/force_sensor.yaml

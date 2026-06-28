@@ -7,7 +7,10 @@ One-shot force compensation calibration: collect A→B→C→D→A, then identif
   python tmp/force_compensation/force_calibrate.py --dry-run
   python tmp/force_compensation/force_calibrate.py --save-pose d --pose-label pose_d_large
   python tmp/force_compensation/force_calibrate.py --identify-only
-  python tmp/force_compensation/force_calibrate.py --collect-only
+
+Collect only (no identify):
+
+  python tmp/force_compensation/utils/collection.py
 
 Config: tmp/force_compensation/config/force_id.yaml, config/poses.yaml
 Output: logs/force_id_pose_{a,b,c,d}.npz, logs/force_id_phi.json (overwrite each run)
@@ -53,12 +56,11 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="preview collection only")
     parser.add_argument("--save-pose", type=str, default=None, metavar="SLOT")
     parser.add_argument("--pose-label", type=str, default=None)
-    parser.add_argument("--collect-only", action="store_true", help="skip identification")
     parser.add_argument("--identify-only", action="store_true", help="skip collection, fit existing npz")
     args = parser.parse_args()
 
-    if args.identify_only and (args.collect_only or args.dry_run or args.save_pose):
-        parser.error("--identify-only cannot combine with --collect-only, --dry-run, or --save-pose")
+    if args.identify_only and (args.dry_run or args.save_pose):
+        parser.error("--identify-only cannot combine with --dry-run or --save-pose")
 
     collect_argv = _collect_argv(args)
 
@@ -76,7 +78,7 @@ def main() -> int:
         return 0
 
     rc = collection.main(collect_argv)
-    if rc != 0 or args.collect_only:
+    if rc != 0:
         return rc
 
     return identification.main(_identify_argv(args))
