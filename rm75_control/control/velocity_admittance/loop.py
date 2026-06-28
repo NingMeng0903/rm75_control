@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +21,20 @@ from .trajectory import TrajectoryGenerator, sin_period_for_peak_vel
 
 def load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text()) or {}
+
+
+def prepare_canfd_velocity_session(
+    bot,
+    *,
+    settle_s: float = 0.5,
+    clear_errors: bool = False,
+) -> dict:
+    """Re-sync planner idle immediately before rm_set_movev_canfd_init."""
+    return bot.recover_controller(
+        settle_s=settle_s,
+        clear_errors=clear_errors,
+        probe_force_stream=False,
+    )
 
 
 def init_velocity_canfd(robot, vc: dict, dt_ms: float) -> None:
@@ -61,45 +74,25 @@ def settle_movev_after_init(
 def trajectory_summary(raw: dict) -> str:
     t = raw.get("trajectory", {})
     kind = str(t.get("type", "sin_tool_y"))
-    amp_mm = float(t.get("amplitude_mm", 5.0))
+    y_pp = t.get("y_peak_to_peak_cm")
+    if y_pp is not None:
+        pp_mm = float(y_pp) * 10.0
+        amp_label = f"Y p-p={float(y_pp):.1f}cm ({pp_mm:.0f}mm)"
+    else:
+        amp_mm = float(t.get("amplitude_mm", 5.0))
+        amp_label = f"amp=±{amp_mm:.1f}mm ({2 * amp_mm:.0f}mm p-p)"
     vmax = float(t.get("y_max_vel_cm_s", 1.0))
     ps = t.get("period_s")
+    half_m = float(y_pp) * 0.01 / 2.0 if y_pp is not None else float(t.get("amplitude_mm", 5.0)) / 1000.0
     if ps is None:
-        period = sin_period_for_peak_vel(amp_mm / 1000.0, vmax / 100.0)
+        period = sin_period_for_peak_vel(half_m, vmax / 100.0)
         period_s = f"{period:.1f}s (auto)"
     else:
         period_s = f"{float(ps):.1f}s"
     soft = " soft_start" if t.get("soft_start") else ""
-    return (
-        f"{kind}{soft}  amp=±{amp_mm:.1f}mm ({2 * amp_mm:.0f}mm p-p)  "
-        f"v_peak≈{vmax:.1f}cm/s  period={period_s}"
-    )
-
-
-def _hold_controller_config(cfg: AdmittanceConfig) -> AdmittanceConfig:
-    """All position hold — no force axis until contact latched."""
-    fa = np.zeros(6, dtype=float)
-    kp = cfg.kp_pos.copy()
-    kp[0:2] = np.minimum(kp[0:2], 2.5)
-    kp[2] = max(float(kp[2]), 2.0)
-    kp[3:6] = 0.0
-    mv = cfg.max_velocity.copy()
-    vz_cap = cfg.max_vz_tool_m_s
-    mv[2] = min(float(mv[2]), vz_cap)
-    mv[3:6] = np.minimum(mv[3:6], 0.08)
-    ma = cfg.max_acceleration.copy()
-    ma[2] = min(float(ma[2]), 0.05)
-    ma[3:6] = np.minimum(ma[3:6], 0.15)
-    return replace(
-        cfg,
-        force_axes=fa,
-        motion_axes=np.zeros(6),
-        lock_orientation=True,
-        enable_normal_tracking=False,
-        kp_pos=kp,
-        max_velocity=mv,
-        max_acceleration=ma,
-    )
+    rz = float(t.get("rz_amplitude_deg", 0.0))
+    spin = f"  tool-Rz±{rz:.1f}°" if rz > 0 else ""
+    return f"{kind}{soft}  {amp_label}{spin}  v_peak≈{vmax:.1f}cm/s  period={period_s}"
 
 
 def run_velocity_admittance(
@@ -124,9 +117,12 @@ def run_velocity_admittance(
     startup = raw.get("startup", {})
     settle_frames = int(startup.get("settle_frames", 10))
     hold_s = float(startup.get("hold_s", 0.0))
-    wait_contact = bool(startup.get("wait_contact", False))
-    contact_fz_n = float(startup.get("contact_fz_n", 1.0))
-    contact_samples = int(startup.get("contact_samples", 30))
+    wait_contact = bool(startup.get("wait_contact", True))
+    auto_start_under_n = float(startup.get("auto_start_under_n", 0.5))
+    auto_start_hold_s = float(startup.get("auto_start_hold_s", 0.5))
+    auto_start_samples = max(1, int(round(auto_start_hold_s / dt_s)))
+    approach_ramp_s = float(startup.get("approach_ramp_s", 1.0))
+    require_observer = bool(startup.get("require_observer_ready", True))
     pose_slot_raw = startup.get("pose_slot", "d")
     pose_slot = (
         None
@@ -136,7 +132,6 @@ def run_velocity_admittance(
     move_speed = startup.get("move_speed")
 
     ctrl_cfg = AdmittanceConfig.from_dict(raw)
-    hold_cfg = _hold_controller_config(ctrl_cfg)
     control_frame = ctrl_cfg.control_frame
     frame_type = int(vc.get("frame_type", 0 if control_frame == "tool" else 1))
     if control_frame == "tool" and frame_type != 0:
@@ -146,17 +141,18 @@ def run_velocity_admittance(
         print("  NOTE: control_frame=base → forcing frame_type=1 (world movev)", flush=True)
         frame_type = 1
     vc_run = {**vc, "frame_type": frame_type}
-    traj_kind = str(raw.get("trajectory", {}).get("type", "sin_tool_y"))
-    base_world_scan = ctrl_cfg.motion_frame == "base" or traj_kind == "sin_base_y"
+    traj_kind = str(raw.get("trajectory", {}).get("type", "hold"))
     observer = CompensatedForceObserver.from_yaml(raw)
     controller = AdmittanceController(dt_s, ctrl_cfg)
-    hold_ctrl = AdmittanceController(dt_s, hold_cfg)
 
     f_cfg = raw.get("force", {})
     desired_z = float(f_cfg.get("desired_z_n", 3.0))
     f_des = np.zeros(6)
     f_des[2] = desired_z
     f_zero = np.zeros(6)
+    auto_start_fz_n = float(startup.get("auto_start_fz_n", desired_z - auto_start_under_n))
+    auto_recover = bool(startup.get("auto_recover", True))
+    recover_probe_force = bool(startup.get("recover_probe_force_stream", False))
 
     print(
         f"{title} | rm_movev_canfd frame_type={frame_type} "
@@ -168,16 +164,17 @@ def run_velocity_admittance(
     )
     print(f"  phi: {PHI_JSON.name}  Fz_des={desired_z:.2f} N")
     print(f"  vz cap (tool TCP): ±{ctrl_cfg.max_vz_tool_m_s * 100:.1f} cm/s")
-    print(f"  trajectory: {trajectory_summary(raw)}")
+    print(f"  trajectory: {trajectory_summary(raw)}  kind={traj_kind}")
+    scan_mode = "open-loop ff" if ctrl_cfg.open_loop else "closed-loop track"
     print(
-        f"  plan=world ({traj_kind})  control/output={control_frame}  "
-        f"force=tool-Z  orient=locked",
+        f"  hybrid: traj=6D base  decouple=tool S_f={ctrl_cfg.force_axes.tolist()}  "
+        f"movev={control_frame} frame_type={frame_type}  scan={scan_mode}",
         flush=True,
     )
     if wait_contact:
         print(
-            f"  startup: settle={settle_frames}f hold={hold_s:.1f}s  "
-            f"position hold until Fz_ext≥{contact_fz_n:.1f}N (no auto descent)",
+            f"  auto-start: Fz≥{auto_start_fz_n:.1f}N for {auto_start_hold_s:.1f}s "
+            f"→ scan; approach Fz ramp {approach_ramp_s:.1f}s (no step at hold end)",
             flush=True,
         )
     if pose_slot:
@@ -188,6 +185,22 @@ def run_velocity_admittance(
     from rm75_control import RobotSession
 
     with RobotSession(config=CONFIG_ROBOT) as bot:
+        if auto_recover:
+            rec = bot.recover_controller(
+                settle_s=1.0,
+                clear_errors=True,
+                probe_force_stream=recover_probe_force,
+            )
+            err = rec.get("system_err") or []
+            print(
+                f"  auto-recover: idle={rec.get('planning_idle')}  "
+                f"traj={rec.get('trajectory_type_final')}  "
+                f"sys_err={err or 'none'}",
+                flush=True,
+            )
+            if err:
+                print("  (cleared latched controller errors on connect)", flush=True)
+
         if pose_slot:
             fid = load_config(CONFIG_ID)
             spd = int(move_speed) if move_speed is not None else fid.collect.move_speed
@@ -209,8 +222,7 @@ def run_velocity_admittance(
         if ret != 0:
             raise SystemExit(f"get state failed: {ret}")
         pose0 = np.asarray(state["pose"][:6], dtype=float)
-        pose_anchor = pose0.copy()
-        motion_axes = ctrl_cfg.motion_axes.copy()
+        traj_origin = pose0.copy()
         print(
             f"  start TCP pose (base): "
             f"xyz=[{pose0[0]:.3f},{pose0[1]:.3f},{pose0[2]:.3f}] m",
@@ -218,32 +230,64 @@ def run_velocity_admittance(
         )
         traj = TrajectoryGenerator.from_dict(raw, pose0, bot.robot)
 
-        bot.robot.rm_set_arm_slow_stop()
-        time.sleep(0.3)
-        try:
-            bot.robot.rm_set_arm_delete_trajectory()
-        except Exception:
-            pass
-        time.sleep(0.2)
+        prep = prepare_canfd_velocity_session(bot, settle_s=0.5)
+        print(
+            f"  CANFD prep: idle={prep.get('planning_idle')}  "
+            f"traj={prep.get('trajectory_type_final')}  "
+            f"euler_deg={prep.get('pose_euler_deg', [])}",
+            flush=True,
+        )
+        if not prep.get("planning_idle", False):
+            print("  WARN: planner not idle before movev init — snap more likely", flush=True)
+
+        pose_pre = pose0.copy()
+        ret_pre, st_pre = bot.robot.rm_get_current_arm_state()
+        if ret_pre == 0:
+            pose_pre = np.asarray(st_pre["pose"][:6], dtype=float)
 
         init_velocity_canfd(bot.robot, vc_run, dt_ms)
         settle_movev_after_init(
             bot.robot, dt_ms=dt_ms, follow=follow,
-            trajectory_mode=traj_mode, radio=radio, n_frames=settle_frames,
+            trajectory_mode=traj_mode, radio=radio, n_frames=max(settle_frames, 30),
         )
-        hold_ctrl.reset()
+        ret_post, st_post = bot.robot.rm_get_current_arm_state()
+        if ret_post == 0:
+            pose_post = np.asarray(st_post["pose"][:6], dtype=float)
+            deuler = np.degrees(pose_post[3:6] - pose_pre[3:6])
+            deuler = (deuler + 180.0) % 360.0 - 180.0
+            dpos_mm = (pose_post[:3] - pose_pre[:3]) * 1000.0
+            print(
+                f"  post-init settle Δpos_mm="
+                f"[{dpos_mm[0]:+.2f},{dpos_mm[1]:+.2f},{dpos_mm[2]:+.2f}]  "
+                f"Δeuler_deg=[{deuler[0]:+.2f},{deuler[1]:+.2f},{deuler[2]:+.2f}]",
+                flush=True,
+            )
+            if float(np.max(np.abs(deuler))) > 0.5 or float(np.linalg.norm(dpos_mm)) > 2.0:
+                print(
+                    "  WARN: init snap detected — last run may leave force/CANFD mode; "
+                    "retry or run tmp/recover_force_stream.py",
+                    flush=True,
+                )
+
         controller.reset()
         print("Velocity CANFD initialized. Ctrl+C to stop.", flush=True)
 
         t0 = time.monotonic()
         next_tick = t0
         last_log = t0
-        contact_latched = not wait_contact
-        contact_streak = 0
-        t_scan0: float | None = None
+        scan_started = not wait_contact
+        start_streak = 0
+        t_scan0: float | None = None if wait_contact else t0
         cycle = 0
         pose_fb = pose0.copy()
         f_ext = f_zero.copy()
+        last_wait_msg = 0.0
+        fz_buf: list[float] = []
+
+        def _fz_smooth() -> float:
+            if not fz_buf:
+                return float(f_ext[2])
+            return float(np.median(fz_buf))
 
         try:
             while True:
@@ -267,79 +311,92 @@ def run_velocity_admittance(
                         wrench = observer.latest_wrench()
                         if wrench is not None:
                             f_ext = wrench[1]
+                            fz_buf.append(float(f_ext[2]))
+                            if len(fz_buf) > 7:
+                                fz_buf.pop(0)
                 cycle += 1
                 pose = pose_fb
 
-                if t_s < hold_s or not contact_latched:
-                    v_cmd = hold_ctrl.compute_velocity_command(
-                        pose, pose_anchor, np.zeros(6), f_ext, f_zero,
-                        pose_anchor=pose_anchor,
-                    )
+                if not scan_started and wait_contact and t_s >= hold_s:
+                    if require_observer and not observer.ready():
+                        if t_s - last_wait_msg >= 2.0:
+                            print(
+                                f"  waiting phi observer ({len(observer.buf)}/"
+                                f"{observer.cfg.min_samples})…",
+                                flush=True,
+                            )
+                            last_wait_msg = t_s
+                        start_streak = 0
+                    else:
+                        fz_s = _fz_smooth()
+                        if fz_s >= auto_start_fz_n:
+                            start_streak += 1
+                        else:
+                            start_streak = 0
+                        if start_streak >= auto_start_samples:
+                            scan_started = True
+                            t_scan0 = now
+                            traj_origin = pose.copy()
+                            traj.set_origin(traj_origin)
+                            controller.force_error_integral.fill(0.0)
+                            controller.last_v_cmd.fill(0.0)
+                            print(
+                                f"  scan ON @ t={t_s:.1f}s  Fz={f_ext[2]:+.2f}N  traj={traj_kind}",
+                                flush=True,
+                            )
+
+                if not scan_started:
+                    if t_s < hold_s or (require_observer and not observer.ready()):
+                        v_cmd = [0.0] * 6
+                    else:
+                        since_approach = max(0.0, t_s - hold_s)
+                        f_scale = (
+                            min(1.0, since_approach / approach_ramp_s)
+                            if approach_ramp_s > 0
+                            else 1.0
+                        )
+                        v_cmd = controller.compute_velocity_command(
+                            pose, pose0, np.zeros(6), f_ext, f_des * f_scale,
+                            in_contact=False,
+                        )
                     send_velocity_canfd(
-                        bot.robot, v_cmd.tolist(),
+                        bot.robot, np.asarray(v_cmd, dtype=float).tolist(),
                         follow=follow, trajectory_mode=traj_mode, radio=radio,
                     )
-                    if t_s < hold_s:
-                        continue
+                    continue
 
-                if not contact_latched:
-                    if f_ext[2] >= contact_fz_n:
-                        contact_streak += 1
-                    else:
-                        contact_streak = 0
-                    if contact_streak >= contact_samples:
-                        contact_latched = True
-                        t_scan0 = now
-                        pose_anchor = pose.copy()
-                        traj.set_origin(pose_anchor)
-                        controller.force_error_integral.fill(0.0)
-                        controller.last_v_cmd = hold_ctrl.last_v_cmd.copy()
-                        print(
-                            f"  contact latched @ t={t_s:.1f}s  Fz_ext={f_ext[2]:+.2f}N  "
-                            "— world-Y sin + tool-Z force (pose D locked)",
-                            flush=True,
-                        )
-                    else:
-                        continue
-
-                t_scan = (now - t_scan0) if t_scan0 is not None else t_s
-                pose_d, vel_ff = traj.sample(t_scan)
-                if base_world_scan:
-                    pose_d, vel_ff = TrajectoryGenerator.world_scan_reference(
-                        pose_d, vel_ff, pose_anchor, motion_axes,
-                    )
-                else:
-                    pose_d = TrajectoryGenerator.blend_tool_pose(
-                        bot.robot, pose_d, pose_anchor, motion_axes,
-                    )
-                    vel_ff = TrajectoryGenerator.project_tool_motion_ff(
-                        bot.robot, pose_anchor, vel_ff, motion_axes,
-                    )
+                t_scan = now - t_scan0 if t_scan0 is not None else 0.0
+                sample = traj.sample(t_scan)
                 v_cmd = controller.compute_velocity_command(
-                    pose, pose_d, vel_ff, f_ext, f_des, pose_anchor=pose_anchor,
+                    pose, sample.pose_d, sample.vel_ff, f_ext, f_des,
                 )
                 send_velocity_canfd(
-                    bot.robot, v_cmd.tolist(),
+                    bot.robot, np.asarray(v_cmd, dtype=float).tolist(),
                     follow=follow, trajectory_mode=traj_mode, radio=radio,
                 )
 
                 if now - last_log >= 1.0:
                     last_log = now
-                    dy_mm = float(pose[1] - pose_anchor[1]) * 1000.0
-                    deuler = np.degrees(pose[3:6] - pose_anchor[3:6])
+                    from .controller import wrap_pi
+
+                    dy_mm = float(pose[1] - traj_origin[1]) * 1000.0
+                    deuler = np.degrees([
+                        wrap_pi(float(pose[i] - traj_origin[i])) for i in range(3, 6)
+                    ])
                     print(
                         f"  t={t_s:.1f}s  ΔY_world={dy_mm:+.1f}mm  "
                         f"Δeuler_deg=[{deuler[0]:+.2f},{deuler[1]:+.2f},{deuler[2]:+.2f}]  "
-                        f"Fz_ext={f_ext[2]:+.2f}N  vz={v_cmd[2]:+.4f} vy={v_cmd[1]:+.4f}",
+                        f"Fz_ext={f_ext[2]:+.2f}N  "
+                        f"vy={v_cmd[1]:+.4f} ({control_frame} movev)",
                         flush=True,
                     )
         except KeyboardInterrupt:
             print("\nStopped.", flush=True)
         finally:
             try:
-                send_velocity_canfd(
-                    bot.robot, [0.0] * 6,
-                    follow=follow, trajectory_mode=traj_mode, radio=radio,
+                settle_movev_after_init(
+                    bot.robot, dt_ms=dt_ms, follow=follow,
+                    trajectory_mode=traj_mode, radio=radio, n_frames=15,
                 )
                 bot.robot.rm_set_arm_slow_stop()
             except Exception:

@@ -138,6 +138,64 @@ class RobotSession:
             time.sleep(settle_s)
         return diag
 
+    def recover_controller(
+        self,
+        *,
+        settle_s: float = 1.0,
+        clear_errors: bool = True,
+        probe_force_stream: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Full controller cleanup before velocity CANFD (run every session start).
+
+        Clears latched errors, exits force/plan modes, waits for planner idle.
+        Optional force-stream probe unsticks rm_set_force_position conflicts.
+        """
+        diag: dict[str, Any] = {}
+        if clear_errors:
+            try:
+                diag["clear_system_err"] = self.robot.rm_clear_system_err()
+            except Exception:
+                diag["clear_system_err"] = -999
+            time.sleep(0.3)
+            ret, st = self.robot.rm_get_current_arm_state()
+            if ret == 0:
+                err = st.get("err", {})
+                diag["system_err"] = list(err.get("err", []))[: int(err.get("err_len", 0))]
+
+        if not self.dry_run and self._backend is not None:
+            self.stop_all(hard=False)
+        diag.update(self.prepare_for_force_stream(settle_s=0.0))
+        try:
+            diag["delete_traj"] = self.robot.rm_set_arm_delete_trajectory()
+        except Exception:
+            diag["delete_traj"] = -999
+        diag["slow_stop"] = self.robot.rm_set_arm_slow_stop()
+        diag["planning_idle"] = self._wait_planning_idle(timeout_s=8.0)
+
+        if probe_force_stream and not self.dry_run:
+            try:
+                ret = self.robot.rm_start_force_position_move()
+                diag["force_stream_probe"] = ret
+                if ret == 0:
+                    self.robot.rm_stop_force_position_move()
+                    time.sleep(0.3)
+            except Exception:
+                diag["force_stream_probe"] = -999
+
+        if settle_s > 0.0:
+            time.sleep(settle_s)
+
+        traj = self.robot.rm_get_arm_current_trajectory()
+        diag["trajectory_type_final"] = traj.get("trajectory_type", -1)
+        ret, st = self.robot.rm_get_current_arm_state()
+        if ret == 0:
+            diag["pose_euler_deg"] = [
+                round(float(v) * 180.0 / 3.141592653589793, 3) for v in st["pose"][3:6]
+            ]
+        self.mode = ControlMode.IDLE
+        return diag
+
     def start_force_scan(self, **overrides: Any) -> ForceScanController:
         self.stop_force_scan()
         if self._backend is not None and not self.dry_run and self.mode != ControlMode.IDLE:

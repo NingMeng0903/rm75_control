@@ -1,21 +1,28 @@
-# pose D → world-Y sin + tool-Z Fz=3N (fast admittance, anti-overshoot)
-# Run: python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
+# Demo trajectory plugin + tool-Z force hybrid.
+# Architecture:
+#   trajectory → 6D (pose_d, vel_ff) in base frame  [you may zero tool-Z in vel_ff]
+#   controller → S_f on tool force_axes; all other DOFs follow trajectory (S_p = I - S_f)
+#
+# Run:
+#   source env.sh && cd /media/camp/EXT_DRIVE/rm75_control
+#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
 
 timing:
   dt_ms: 10.0
-  feedback_every: 2       # 20ms 力反馈（再快易拖慢 10ms 环）
+  feedback_every: 2
 
 startup:
   pose_slot: d
-  settle_frames: 10
+  settle_frames: 25
   hold_s: 1.0
+  auto_recover: true
   wait_contact: true
-  contact_fz_n: 1.0
-  contact_samples: 30
+  auto_start_under_n: 0.5
+  auto_start_hold_s: 0.5
+  approach_ramp_s: 1.5
 
 frames:
   euler_order: xyz
-  motion_frame: base
   control_frame: tool
 
 velocity_canfd:
@@ -27,37 +34,31 @@ velocity_canfd:
 
 force:
   phi_source: phi_recommended
-  buffer_s: 2.0          # 缩短 F_ext 滞后（原 4s）
+  buffer_s: 2.0
   min_samples: 22
-  fc_hz: 4.0             # 略快滤波（原 2.5Hz）
+  fc_hz: 4.0
   use_inertia: false
   desired_z_n: 3.0
 
 trajectory:
-  type: sin_base_y
-  amplitude_mm: 75.0
-  y_max_vel_cm_s: 2.0
-  period_s: null
+  type: sin_base_y_tool_rz    # demo plugin; replace with any Trajectory6D
+  y_peak_to_peak_cm: 16.0
+  rz_amplitude_deg: 12.0
+  y_max_vel_cm_s: 3.0
   soft_start: true
   ramp_s: 2.0
+  open_loop: true
 
 controller:
-  force_axes: [0, 0, 1, 0, 0, 0]
-  motion_axes: [0, 1, 0, 0, 0, 0]
-  lock_orientation: true
-  enable_normal_tracking: false
-  kp_pos: [2.0, 2.0, 2.0, 0.0, 0.0, 0.0]
+  force_axes: [0, 0, 1, 0, 0, 0]   # tool TCP-Z → force; other 5 DOF → trajectory
+  open_loop: true
+  kp_pos: [0, 0, 0, 0, 0, 0]
   system_delay_s: 0.015
-  # f_err=f_des-F_ext | f_err>0 下压(k_fp_release) | f_err<0 超力快退(k_fp_press)
-  k_fp_press: 0.045      # F>3N 快退，抑超调
-  k_fp_release: 0.030    # F<3N 下压
-  k_fi: 0.001            # 极小积分，避免顶过 3N
+  k_fp_press: 0.045
+  k_fp_release: 0.025
+  k_fi: 0.001
   integral_limit: 0.015
-  k_align: 0.0
-  contact_threshold_n: 0.5
-  deadband_n: 0.05
-  max_vz_tool_m_s: 0.15  # 15 cm/s tool-Z 顶
-  max_velocity: [0.04, 0.04, 0.15, 0.0, 0.0, 0.0]
-  max_acceleration: [0.5, 0.5, 1.5, 0.0, 0.0, 0.0]
-  release_vz_up_m_s: 0.15
-  release_vz_down_m_s: 0.15
+  max_vz_tool_m_s: 0.15
+  approach_vz_tool_m_s: 0.03
+  max_velocity: [0.03, 0.10, 0.15, 0.15, 0.15, 0.35]
+  max_acceleration: [0.5, 1.0, 0.5, 1.0, 1.0, 1.5]

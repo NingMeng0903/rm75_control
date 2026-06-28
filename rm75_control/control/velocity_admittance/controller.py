@@ -1,4 +1,4 @@
-"""Decoupled first-order admittance + position closed-loop (velocity output)."""
+"""Tool-frame force/motion decoupling + base-frame 6D trajectory tracking."""
 
 from __future__ import annotations
 
@@ -22,19 +22,19 @@ def pose_error(desired: np.ndarray, current: np.ndarray) -> np.ndarray:
 
 @dataclass
 class AdmittanceConfig:
+    """
+    force_axes: tool-frame mask for admittance (typ. [0,0,1,0,0,0] = TCP normal).
+    All other tool DOFs follow trajectory via S_p = I - S_f.
+    Trajectory pose_d / vel_ff are always base-frame 6D from a Trajectory6D producer.
+    """
+
     euler_order: str = "xyz"
     force_axes: np.ndarray = field(
         default_factory=lambda: np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
     )
-    motion_axes: np.ndarray = field(
-        default_factory=lambda: np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
-    )
-    motion_frame: str = "base"
     control_frame: str = "tool"
-    lock_orientation: bool = True
-    kp_pos: np.ndarray = field(
-        default_factory=lambda: np.array([2.0, 2.0, 0.0, 1.5, 1.5, 1.5])
-    )
+    kp_pos: np.ndarray = field(default_factory=lambda: np.zeros(6))
+    track_axes: np.ndarray = field(default_factory=lambda: np.ones(6))
     system_delay_s: float = 0.015
     k_fp_press: float = 0.015
     k_fp_release: float = 0.005
@@ -52,22 +52,23 @@ class AdmittanceConfig:
     )
     release_vz_up_m_s: float = 0.02
     release_vz_down_m_s: float = 0.02
-    max_vz_tool_m_s: float = 0.05  # hard cap on tool-frame linear Z (TCP normal)
+    approach_vz_tool_m_s: float = 0.03
+    max_vz_tool_m_s: float = 0.05
+    open_loop: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict) -> AdmittanceConfig:
         c = raw.get("controller", raw)
         frames = raw.get("frames", {})
+        traj = raw.get("trajectory", {})
         fa = np.asarray(c.get("force_axes", [0, 0, 1, 0, 0, 0]), dtype=float)
-        ma = np.asarray(c.get("motion_axes", [0, 1, 0, 0, 0, 0]), dtype=float)
+        open_loop = bool(c.get("open_loop", c.get("open_loop_scan", traj.get("open_loop", False))))
         return cls(
             euler_order=str(frames.get("euler_order", "xyz")),
-            motion_frame=str(frames.get("motion_frame", c.get("motion_frame", "base"))),
             control_frame=str(frames.get("control_frame", c.get("control_frame", "tool"))),
             force_axes=fa,
-            motion_axes=ma,
-            lock_orientation=bool(c.get("lock_orientation", True)),
-            kp_pos=np.asarray(c.get("kp_pos", [2, 2, 0, 1.5, 1.5, 1.5]), dtype=float),
+            kp_pos=np.asarray(c.get("kp_pos", [0, 0, 0, 0, 0, 0]), dtype=float),
+            track_axes=np.asarray(c.get("track_axes", [1, 1, 1, 1, 1, 1]), dtype=float),
             system_delay_s=float(c.get("system_delay_s", 0.015)),
             k_fp_press=float(c.get("k_fp_press", 0.015)),
             k_fp_release=float(c.get("k_fp_release", 0.005)),
@@ -85,16 +86,19 @@ class AdmittanceConfig:
             ),
             release_vz_up_m_s=float(c.get("release_vz_up_m_s", 0.05)),
             release_vz_down_m_s=float(c.get("release_vz_down_m_s", 0.05)),
+            approach_vz_tool_m_s=float(c.get("approach_vz_tool_m_s", 0.03)),
             max_vz_tool_m_s=float(c.get("max_vz_tool_m_s", 0.05)),
+            open_loop=open_loop,
         )
 
 
 class AdmittanceController:
     """
-    Hybrid admittance-position controller (PBAC-style, Keemink et al.).
-
-    Feedforward-heavy position loop with delay-compensated feedback; force
-    admittance in tool frame. Output frame is cfg.control_frame (tool or base).
+    Pipeline (base trajectory → tool decouple → movev):
+      1. v_pos_base = vel_ff + kp * (pose_d - pose)     [base 6D from trajectory]
+      2. v_pos_tool = R^T v_pos_base
+      3. v_cmd_tool = S_p v_pos_tool + S_f v_force_tool
+      4. output v_cmd_tool or R v_cmd_tool per control_frame
     """
 
     def __init__(self, dt: float, config: AdmittanceConfig | None = None) -> None:
@@ -109,15 +113,28 @@ class AdmittanceController:
 
     def _selection(self, *, normal_track: bool) -> tuple[np.ndarray, np.ndarray]:
         s_f = np.diag(self.cfg.force_axes.copy())
-        if (
-            normal_track
-            and self.cfg.enable_normal_tracking
-            and not self.cfg.lock_orientation
-        ):
+        if normal_track and self.cfg.enable_normal_tracking:
             s_f[3, 3] = 1.0
             s_f[4, 4] = 1.0
         s_p = np.eye(6) - s_f
         return s_p, s_f
+
+    @staticmethod
+    def fuse_tool_decoupled(
+        v_pos_base: np.ndarray,
+        v_force_tool: np.ndarray,
+        r_mat: np.ndarray,
+        s_p: np.ndarray,
+        s_f: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        v_pos_tool = np.zeros(6, dtype=float)
+        v_pos_tool[:3] = r_mat.T @ v_pos_base[:3]
+        v_pos_tool[3:] = r_mat.T @ v_pos_base[3:]
+        v_cmd_tool = s_p @ v_pos_tool + s_f @ v_force_tool
+        v_cmd_base = np.zeros(6, dtype=float)
+        v_cmd_base[:3] = r_mat @ v_cmd_tool[:3]
+        v_cmd_base[3:] = r_mat @ v_cmd_tool[3:]
+        return v_cmd_tool, v_cmd_base
 
     def compute_velocity_command(
         self,
@@ -126,18 +143,10 @@ class AdmittanceController:
         desired_vel_ff: np.ndarray,
         f_ext: np.ndarray,
         desired_force: np.ndarray,
-        pose_anchor: np.ndarray | None = None,
+        *,
+        in_contact: bool | None = None,
     ) -> np.ndarray:
         cfg = self.cfg
-        desired_pose = np.asarray(desired_pose, dtype=float).copy()
-        anchor = np.asarray(pose_anchor, dtype=float) if pose_anchor is not None else None
-        if anchor is not None and cfg.lock_orientation:
-            desired_pose[3:6] = anchor[3:6]
-        if anchor is not None and cfg.motion_frame == "base":
-            for i in range(3):
-                if cfg.motion_axes[i] < 0.5:
-                    desired_pose[i] = anchor[i]
-
         r_mat = Rsc.from_euler(
             cfg.euler_order, current_pose[3:6], degrees=False
         ).as_matrix()
@@ -151,22 +160,19 @@ class AdmittanceController:
 
         err_pose = pose_error(desired_pose, pose_predicted)
         vel_ff = np.asarray(desired_vel_ff, dtype=float).copy()
-        if cfg.lock_orientation:
-            vel_ff[3:6] = 0.0
-            err_pose[3:6] = 0.0
-        v_pos_base = vel_ff + cfg.kp_pos * err_pose
-        if cfg.lock_orientation:
-            v_pos_base[3:6] = 0.0
-
-        v_pos_tool = np.zeros(6, dtype=float)
-        v_pos_tool[:3] = r_mat.T @ v_pos_base[:3]
-        v_pos_tool[3:] = r_mat.T @ v_pos_base[3:]
+        if cfg.open_loop:
+            err_pose[:] = 0.0
+        kp = cfg.kp_pos * cfg.track_axes
+        v_pos_base = vel_ff + kp * err_pose
 
         f_ext = np.asarray(f_ext, dtype=float)
         f_des = np.asarray(desired_force, dtype=float)
         v_force_tool = np.zeros(6, dtype=float)
 
-        in_contact = float(np.linalg.norm(f_ext[:3])) >= cfg.contact_threshold_n
+        if in_contact is None:
+            in_contact = float(np.linalg.norm(f_ext[:3])) >= cfg.contact_threshold_n
+        else:
+            in_contact = bool(in_contact)
 
         for axis in range(6):
             if cfg.force_axes[axis] < 0.5:
@@ -180,31 +186,17 @@ class AdmittanceController:
             v_force_tool[4] = cfg.k_align * f_ext[0]
 
         s_p, s_f = self._selection(normal_track=normal_track)
-        v_cmd_tool = s_p @ v_pos_tool + s_f @ v_force_tool
-        if cfg.lock_orientation:
-            v_cmd_tool[3:6] = 0.0
-        else:
-            v_cmd_tool[3:6] = (s_p @ v_pos_tool)[3:6]
-        vz_cap = cfg.max_vz_tool_m_s
-        if vz_cap > 0.0:
-            v_cmd_tool[2] = float(np.clip(v_cmd_tool[2], -vz_cap, vz_cap))
+        v_cmd_tool, v_cmd_base = self.fuse_tool_decoupled(
+            v_pos_base, v_force_tool, r_mat, s_p, s_f,
+        )
+        if cfg.max_vz_tool_m_s > 0.0:
+            v_cmd_tool[2] = float(np.clip(v_cmd_tool[2], -cfg.max_vz_tool_m_s, cfg.max_vz_tool_m_s))
+            if cfg.control_frame == "base":
+                v_cmd_base[:3] = r_mat @ v_cmd_tool[:3]
+                v_cmd_base[3:] = r_mat @ v_cmd_tool[3:]
 
-        if cfg.control_frame == "tool":
-            v_clamp = np.clip(v_cmd_tool, -cfg.max_velocity, cfg.max_velocity)
-            dv_max = cfg.max_acceleration * self.dt
-            v_final = np.clip(v_clamp, self.last_v_cmd - dv_max, self.last_v_cmd + dv_max)
-            if cfg.lock_orientation:
-                v_final[3:6] = 0.0
-            self.last_v_cmd = v_final.copy()
-            return v_final
-
-        v_cmd_base = np.zeros(6, dtype=float)
-        v_cmd_base[:3] = r_mat @ v_cmd_tool[:3]
-        v_cmd_base[3:] = r_mat @ v_cmd_tool[3:]
-        if cfg.lock_orientation:
-            v_cmd_base[3:6] = 0.0
-
-        v_clamp = np.clip(v_cmd_base, -cfg.max_velocity, cfg.max_velocity)
+        v_out = v_cmd_tool if cfg.control_frame == "tool" else v_cmd_base
+        v_clamp = np.clip(v_out, -cfg.max_velocity, cfg.max_velocity)
         dv_max = cfg.max_acceleration * self.dt
         v_final = np.clip(v_clamp, self.last_v_cmd - dv_max, self.last_v_cmd + dv_max)
         self.last_v_cmd = v_final.copy()
@@ -215,7 +207,8 @@ class AdmittanceController:
         if axis == 2 and not in_contact:
             self.force_error_integral[axis] = 0.0
             v = cfg.k_fp_release * f_err
-            return float(np.clip(v, -cfg.release_vz_down_m_s, cfg.release_vz_up_m_s))
+            cap = cfg.approach_vz_tool_m_s
+            return float(np.clip(v, -cap, cap))
 
         if abs(f_err) > 5.0:
             self.force_error_integral[axis] = 0.0
