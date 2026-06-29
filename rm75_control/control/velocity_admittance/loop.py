@@ -104,10 +104,122 @@ def settle_movev_after_init(
         )
 
 
-def _pose_tracking_error_mm_deg(pose_act: np.ndarray, pose_tgt: np.ndarray) -> tuple[float, float]:
-    err = pose_error(pose_tgt, pose_act)
+def wait_movev_quiescent(
+    robot,
+    *,
+    dt_ms: float,
+    follow: bool,
+    trajectory_mode: int,
+    radio: int,
+    settle_mm: float = 0.3,
+    need_consecutive: int = 5,
+    max_frames: int = 200,
+) -> tuple[np.ndarray | None, float, int]:
+    """
+    Stream zero velocity until the TCP stops moving, THEN anchor.
+
+    Switching into rm_movev_canfd carries a non-deterministic mode-switch transient:
+    even with v=0 the controller can coast a few mm before the internal velocity
+    reference settles (observed 0.05 mm one run, 9.4 mm the next, same config). Rather
+    than anchor a fixed N frames after init, we watch frame-to-frame motion and only
+    anchor once it is < settle_mm for need_consecutive ticks (or max_frames timeout).
+
+    Returns (last_pose, max_step_mm_observed, frames_used).
+    """
+    dt_s = dt_ms / 1000.0
+    zero = [0.0] * 6
+    next_tick = time.monotonic()
+    prev_xyz: np.ndarray | None = None
+    last_pose: np.ndarray | None = None
+    quiet = 0
+    max_step_mm = 0.0
+    for k in range(max_frames):
+        now = time.monotonic()
+        if now < next_tick:
+            time.sleep(min(0.002, next_tick - now))
+        next_tick += dt_s
+        send_velocity_canfd(
+            robot, zero,
+            follow=follow, trajectory_mode=trajectory_mode, radio=radio,
+        )
+        ret, st = robot.rm_get_current_arm_state()
+        if ret != 0:
+            continue
+        pose = np.asarray(st["pose"][:6], dtype=float)
+        last_pose = pose
+        if prev_xyz is not None:
+            step_mm = float(np.linalg.norm((pose[:3] - prev_xyz) * 1000.0))
+            max_step_mm = max(max_step_mm, step_mm)
+            if step_mm < settle_mm:
+                quiet += 1
+                if quiet >= need_consecutive:
+                    return last_pose, max_step_mm, k + 1
+            else:
+                quiet = 0
+        prev_xyz = pose[:3].copy()
+    return last_pose, max_step_mm, max_frames
+
+
+def hold_velocity_command(
+    pose_act: np.ndarray,
+    pose_anchor: np.ndarray,
+    *,
+    control_frame: str,
+    euler_order: str,
+    kp_pos: float,
+    kp_rot: float,
+    deadband_mm: float,
+    max_vel_m_s: float,
+    max_omega_rad_s: float,
+    last_v: np.ndarray,
+    max_accel_m_s2: float,
+    dt_s: float,
+    hold_z: bool = True,
+) -> np.ndarray:
+    """
+    Gentle position-hold velocity that actively cancels movev idle-creep.
+
+    Commanding v=0 does NOT reliably hold pose right after CANFD switch-in (the arm
+    can drift mm under a zero command). A small P-loop on the measured pose error vs
+    the captured anchor keeps the switch-in bumpless. Output is rate-limited so the
+    hold itself never injects a step. When hold_z is False the tool-Z (force) axis is
+    left to the force loop and only X/Y/attitude are held.
+    """
+    err = pose_error(pose_anchor, pose_act, euler_order)
+    if deadband_mm > 0.0:
+        thr = deadband_mm / 1000.0
+        for i in range(3):
+            if abs(err[i]) <= thr:
+                err[i] = 0.0
+    v_base = np.zeros(6, dtype=float)
+    v_base[:3] = kp_pos * err[:3]
+    v_base[3:] = kp_rot * err[3:6]
+    v_base[:3] = np.clip(v_base[:3], -max_vel_m_s, max_vel_m_s)
+    v_base[3:] = np.clip(v_base[3:], -max_omega_rad_s, max_omega_rad_s)
+
+    if control_frame == "tool":
+        r_mat = Rsc.from_euler(euler_order, pose_act[3:6], degrees=False).as_matrix()
+        v_out = np.zeros(6, dtype=float)
+        v_out[:3] = r_mat.T @ v_base[:3]
+        v_out[3:] = r_mat.T @ v_base[3:]
+    else:
+        v_out = v_base
+    if not hold_z:
+        v_out[2] = 0.0
+
+    dv = max_accel_m_s2 * dt_s
+    v_final = np.clip(v_out, last_v - dv, last_v + dv)
+    return v_final
+
+
+def _pose_tracking_error_mm_deg(
+    pose_act: np.ndarray,
+    pose_tgt: np.ndarray,
+    euler_order: str = "xyz",
+) -> tuple[float, float]:
+    err = pose_error(pose_tgt, pose_act, euler_order)
     pos_mm = float(np.linalg.norm(err[:3]) * 1000.0)
-    rot_deg = float(np.max(np.abs(np.degrees(err[3:6]))))
+    rot_deg = float(np.degrees(np.linalg.norm(err[3:6])))
     return pos_mm, rot_deg
 
 
@@ -157,8 +269,8 @@ def velocity_realign_to_pose(
         if snap.pose is None:
             continue
         pose_act = snap.pose
-        err = pose_error(pose_tgt, pose_act)
-        pos_mm, rot_deg = _pose_tracking_error_mm_deg(pose_act, pose_tgt)
+        err = pose_error(pose_tgt, pose_act, euler_order)
+        pos_mm, rot_deg = _pose_tracking_error_mm_deg(pose_act, pose_tgt, euler_order)
         if pos_mm <= pos_tol_mm and rot_deg <= rot_tol_deg:
             break
 
@@ -199,7 +311,7 @@ def velocity_realign_to_pose(
     snap = async_obs.read()
     if snap.pose is not None:
         pose_act = snap.pose
-    pos_mm, rot_deg = _pose_tracking_error_mm_deg(pose_act, pose_tgt)
+    pos_mm, rot_deg = _pose_tracking_error_mm_deg(pose_act, pose_tgt, euler_order)
     ok = pos_mm <= pos_tol_mm and rot_deg <= rot_tol_deg
     return pose_act, ok
 
@@ -259,7 +371,7 @@ def run_velocity_admittance(
     approach_ramp_s = float(startup.get("approach_ramp_s", 1.0))
     require_observer = bool(startup.get("require_observer_ready", True))
     post_init_realign = bool(startup.get("post_init_realign", False))
-    pre_movev_prep = str(startup.get("pre_movev_prep", "minimal")).lower()
+    pre_movev_prep = str(startup.get("pre_movev_prep", "light")).lower()
     pre_movev_settle_s = float(startup.get("pre_movev_settle_s", 0.0))
     realign_min_snap_mm = float(startup.get("realign_min_snap_mm", 0.5))
     realign_pos_tol_mm = float(startup.get("realign_pos_tol_mm", 1.5))
@@ -270,6 +382,15 @@ def run_velocity_admittance(
     realign_max_vel_m_s = float(startup.get("realign_max_vel_m_s", 0.025))
     realign_max_omega = float(startup.get("realign_max_omega_rad_s", 0.12))
     realign_target_mode = str(startup.get("realign_target", "pre_init")).lower()
+    # Active position-hold during the pre-scan hold phase (counters movev idle-creep
+    # so the switch-in is bumpless). Gentle gains; rate-limited; deadbanded.
+    hold_active = bool(startup.get("hold_active", True))
+    hold_kp_pos = float(startup.get("hold_kp_pos", 1.5))
+    hold_kp_rot = float(startup.get("hold_kp_rot", 1.5))
+    hold_deadband_mm = float(startup.get("hold_deadband_mm", 0.3))
+    hold_max_vel_m_s = float(startup.get("hold_max_vel_m_s", 0.02))
+    hold_max_omega_rad_s = float(startup.get("hold_max_omega_rad_s", 0.10))
+    hold_accel_m_s2 = float(startup.get("hold_accel_m_s2", 0.3))
     pose_slot_raw = startup.get("pose_slot", "d")
     pose_slot = (
         None
@@ -305,7 +426,7 @@ def run_velocity_admittance(
     f_des[2] = desired_z
     f_zero = np.zeros(6)
     auto_start_fz_n = float(startup.get("auto_start_fz_n", desired_z - auto_start_under_n))
-    auto_recover = bool(startup.get("auto_recover", True))
+    auto_recover = bool(startup.get("auto_recover", False))
     recover_probe_force = bool(startup.get("recover_probe_force_stream", False))
 
     print(
@@ -329,8 +450,9 @@ def run_velocity_admittance(
     )
     if wait_contact:
         print(
-            f"  auto-start: Fz≥{auto_start_fz_n:.1f}N for {auto_start_hold_s:.1f}s "
-            f"→ scan; approach Fz ramp {approach_ramp_s:.1f}s (no step at hold end)",
+            f"  auto-start: lock pose, wait Fz≥{auto_start_fz_n:.1f}N for "
+            f"{auto_start_hold_s:.1f}s → engage scan directly "
+            f"(no controller approach; external contact)",
             flush=True,
         )
     if pose_slot:
@@ -439,10 +561,28 @@ def run_velocity_admittance(
             bot.robot, dt_ms=dt_ms, follow=follow,
             trajectory_mode=traj_mode, radio=radio, n_frames=init_settle_frames,
         )
+        # Anchor only AFTER the switch-in transient has actually died out: stream zero
+        # velocity and watch frame-to-frame motion until the TCP is quiescent. This
+        # removes the non-deterministic "init snap" (the arm coasting mm under v=0
+        # right after CANFD switch-in) from biasing pose0 / traj origin.
+        pose_quiet, quiesce_step_mm, quiesce_frames = wait_movev_quiescent(
+            bot.robot, dt_ms=dt_ms, follow=follow,
+            trajectory_mode=traj_mode, radio=radio,
+            settle_mm=0.3, need_consecutive=5, max_frames=200,
+        )
+        print(
+            f"  movev quiescence: settled after {quiesce_frames} frames "
+            f"(max step {quiesce_step_mm:.2f}mm/tick)",
+            flush=True,
+        )
         ret_post, st_post = bot.robot.rm_get_current_arm_state()
         pose_post = pose0.copy()
+        if pose_quiet is not None:
+            pose_post = pose_quiet.copy()
+            ret_post = 0
         if ret_post == 0:
-            pose_post = np.asarray(st_post["pose"][:6], dtype=float)
+            if pose_quiet is None:
+                pose_post = np.asarray(st_post["pose"][:6], dtype=float)
             deuler = np.degrees(pose_post[3:6] - pose_pre[3:6])
             deuler = (deuler + 180.0) % 360.0 - 180.0
             dpos_mm = (pose_post[:3] - pose_pre[:3]) * 1000.0
@@ -484,7 +624,9 @@ def run_velocity_admittance(
                 realign_target = pose_slot_cartesian.copy()
             else:
                 realign_target = pose_pre.copy()
-            snap_to_target_mm, snap_rot_deg = _pose_tracking_error_mm_deg(pose0, realign_target)
+            snap_to_target_mm, snap_rot_deg = _pose_tracking_error_mm_deg(
+                pose0, realign_target, ctrl_cfg.euler_order,
+            )
             if snap_to_target_mm >= realign_min_snap_mm or snap_rot_deg >= realign_rot_tol_deg:
                 print(
                     f"  realign start: offset vs target "
@@ -515,7 +657,9 @@ def run_velocity_admittance(
                 pose0 = pose_realigned.copy()
                 traj_origin = pose0.copy()
                 traj.set_origin(pose0)
-                err_mm, err_deg = _pose_tracking_error_mm_deg(pose0, realign_target)
+                err_mm, err_deg = _pose_tracking_error_mm_deg(
+                    pose0, realign_target, ctrl_cfg.euler_order,
+                )
                 status = "OK" if realign_ok else "TIMEOUT"
                 print(
                     f"  realign {status}: residual {err_mm:.1f}mm / {err_deg:.2f}°  "
@@ -544,12 +688,13 @@ def run_velocity_admittance(
         t_scan0: float | None = None if wait_contact else t0
         f_ext = f_zero.copy()
         last_wait_msg = 0.0
-        fz_buf: list[float] = []
+        hold_anchor: np.ndarray | None = None
+        hold_drift_warned = False
 
         def _fz_smooth() -> float:
-            if not fz_buf:
-                return float(f_ext[2])
-            return float(np.median(fz_buf))
+            # The observer's causal biquad LPF already smooths f_ext, so the
+            # auto-start gate reads it directly (no extra median buffer needed).
+            return float(f_ext[2])
 
         try:
             while True:
@@ -568,20 +713,17 @@ def run_velocity_admittance(
                     pose_fb = snap.pose
                     if snap.q_deg is not None:
                         q_fb = snap.q_deg
-                    observer.append(t_s, pose_fb, snap.force_raw)
-                    wrench = observer.latest_wrench()
-                    if wrench is not None:
-                        f_ext = wrench[1]
-                        fz_buf.append(float(f_ext[2]))
-                        if len(fz_buf) > 7:
-                            fz_buf.pop(0)
+                    # O(1) causal wrench estimate (no whole-buffer filtfilt rebuild):
+                    # keeps the loop ~10 ms so high-follow movev stays bumpless, and
+                    # f_ext is phase-honest / free of filtfilt right-edge jitter.
+                    _signed, f_ext = observer.update(t_s, pose_fb, snap.force_raw)
                 pose = pose_fb
 
                 if not scan_started and wait_contact and t_s >= hold_s:
-                    if require_observer and not observer.ready():
+                    if require_observer and not observer.ready_causal():
                         if t_s - last_wait_msg >= 2.0:
                             print(
-                                f"  waiting phi observer ({len(observer.buf)}/"
+                                f"  waiting phi observer ({observer.n_samples}/"
                                 f"{observer.cfg.min_samples})…",
                                 flush=True,
                             )
@@ -616,25 +758,43 @@ def run_velocity_admittance(
                 f_des_z = float(desired_z)
 
                 if not scan_started:
-                    if t_s < hold_s or (require_observer and not observer.ready()):
-                        v_cmd = np.zeros(6, dtype=float)
-                        phase = 0
-                        pose_d_log = pose.copy()
+                    # No controller-driven approach descent: the external trajectory /
+                    # operator drives the probe into contact. This loop only LOCKS the
+                    # pose and waits until Fz≥threshold (auto-start) → then engages scan
+                    # directly. phase 0 = observer warm-up; phase 1 = locked, waiting for
+                    # contact. Both just hold (lock) the captured anchor.
+                    phase = 0 if (t_s < hold_s or (require_observer and not observer.ready_causal())) else 1
+                    if hold_anchor is None:
+                        hold_anchor = pose.copy()
+                    pose_d_log = hold_anchor.copy()
+                    if hold_active:
+                        v_cmd = hold_velocity_command(
+                            pose, hold_anchor,
+                            control_frame=control_frame,
+                            euler_order=ctrl_cfg.euler_order,
+                            kp_pos=hold_kp_pos, kp_rot=hold_kp_rot,
+                            deadband_mm=hold_deadband_mm,
+                            max_vel_m_s=hold_max_vel_m_s,
+                            max_omega_rad_s=hold_max_omega_rad_s,
+                            last_v=controller.last_v_cmd,
+                            max_accel_m_s2=hold_accel_m_s2,
+                            dt_s=dt_s,
+                            hold_z=True,
+                        )
+                        controller.last_v_cmd = v_cmd.copy()
                     else:
-                        since_approach = max(0.0, t_s - hold_s)
-                        f_scale = (
-                            min(1.0, since_approach / approach_ramp_s)
-                            if approach_ramp_s > 0
-                            else 1.0
+                        v_cmd = np.zeros(6, dtype=float)
+                    d_hold_mm = (pose[:3] - hold_anchor[:3]) * 1000.0
+                    drift_mm = float(np.linalg.norm(d_hold_mm))
+                    if not hold_drift_warned and t_s >= 0.15 and drift_mm > 3.0:
+                        hold_drift_warned = True
+                        kind = "residual creep" if hold_active else "movev idle creep"
+                        print(
+                            f"  WARN: hold TCP drifted {drift_mm:.1f}mm "
+                            f"(Δ=[{d_hold_mm[0]:+.1f},{d_hold_mm[1]:+.1f},"
+                            f"{d_hold_mm[2]:+.1f}]) — {kind}",
+                            flush=True,
                         )
-                        f_des_z = float(desired_z * f_scale)
-                        pose_d_log = pose0.copy()
-                        v_cmd = controller.compute_velocity_command(
-                            pose, pose0, np.zeros(6), f_ext, f_des * f_scale,
-                            in_contact=False,
-                            enable_pbac=False,
-                        )
-                        phase = 1
                     send_velocity_canfd(
                         bot.robot, v_cmd.tolist(),
                         follow=follow, trajectory_mode=traj_mode, radio=radio,
@@ -702,7 +862,9 @@ def run_velocity_admittance(
                         f"  t={t_s:.1f}s  ΔY_world={dy_mm:+.1f}mm  "
                         f"Δeuler_deg=[{deuler[0]:+.2f},{deuler[1]:+.2f},{deuler[2]:+.2f}]  "
                         f"Fz_ext={f_ext[2]:+.2f}N  "
-                        f"vy={v_cmd[1]:+.4f} ({control_frame} movev)",
+                        f"vy={v_cmd[1]:+.4f}  "
+                        f"Is={controller.instability_index:.3f} D={controller.damping_z_eff:.1f} "
+                        f"({control_frame} movev)",
                         flush=True,
                     )
         except KeyboardInterrupt:

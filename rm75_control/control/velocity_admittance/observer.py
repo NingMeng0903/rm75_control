@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import yaml
+from scipy.signal import butter, lfilter, lfilter_zi
 
 from rm75_control.force.compensation import regressor as fid
 from rm75_control.force.compensation.paths import CONFIG_FORCE, PHI_JSON
@@ -24,6 +25,12 @@ class ForceObserverConfig:
     min_samples: int = 35
     use_inertia: bool = False
     poll_hz: float = 100.0
+    # Causal online estimator (Keemink 2018 G2: keep filter order low and the
+    # cutoff high to avoid the phase lag that destabilises the marginally passive
+    # virtual-inertia model). Order 2 Butterworth realised as a persistent biquad.
+    causal_fc_hz: float = 6.0
+    causal_order: int = 2
+    causal_history: int = 5
 
 
 @dataclass
@@ -55,6 +62,18 @@ class CompensatedForceObserver:
         self.frame = fid.FrameConfig.from_yaml(cfg.force_sensor)
         max_len = max(cfg.min_samples + 5, int(cfg.buffer_s * cfg.poll_hz) + 5)
         self.buf = ForceSampleBuffer(max_len=max_len)
+
+        # --- causal online estimator state (O(1) per tick) ---
+        k = max(2, int(cfg.causal_history))
+        self._pose_ring: deque = deque(maxlen=k)
+        self._t_ring: deque = deque(maxlen=k)
+        self._n_updates = 0
+        fs = float(cfg.poll_hz)
+        wn = min(float(cfg.causal_fc_hz) / (0.5 * fs), 0.99)
+        self._lpf_b, self._lpf_a = butter(int(cfg.causal_order), wn, btype="low")
+        self._lpf_zi_unit = lfilter_zi(self._lpf_b, self._lpf_a)  # (order,)
+        self._lpf_zi: np.ndarray | None = None  # (order, 6), lazily warm-started
+        self._f_ext_last = np.zeros(6, dtype=float)
 
     @staticmethod
     def _load_phi(path: Path, source: str) -> np.ndarray:
@@ -91,6 +110,57 @@ class CompensatedForceObserver:
         f_ext = (Y[sl] - W[sl] @ self.phi).reshape(6)
         return raw_show, f_ext
 
+    def update(
+        self, t_s: float, pose6: np.ndarray, force_raw: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        O(1) causal external-wrench estimate (replaces append + latest_wrench on
+        the control hot path). Returns (signed_raw, f_ext_filtered), both 6D in
+        the sensor frame (≈ tool frame with sensor_offset=0 and a pure-translation
+        TCP; use f_ext[2] as tool-Z normal force).
+
+        Pipeline:
+          1. gravity/bias/inertia compensation via a single causal regressor row
+             (regressor_row_causal — gravity exact, dynamic terms tiny & causal),
+          2. one persistent low-order Butterworth biquad (lfilter with state) on
+             the compensated wrench. No acausal filtfilt, no whole-buffer rebuild,
+             so the newest sample is phase-honest and free of right-edge jitter.
+        """
+        pose6 = np.asarray(pose6, dtype=float)
+        self._pose_ring.append(pose6.copy())
+        self._t_ring.append(float(t_s))
+        self._n_updates += 1
+
+        poses = np.asarray(self._pose_ring, dtype=float)
+        times = np.asarray(self._t_ring, dtype=float)
+        W_row, _g_s = self._fid.regressor_row_causal(
+            poses, times, self.frame, use_inertia=self.cfg.use_inertia
+        )
+
+        signed = self._fid.apply_sign(
+            np.asarray(force_raw, dtype=float), self.frame.force_sign
+        )
+        f_ext_raw = signed - W_row @ self.phi  # (6,)
+
+        if self._lpf_zi is None:
+            # Warm-start each channel at its first value → no startup transient.
+            self._lpf_zi = np.outer(self._lpf_zi_unit, f_ext_raw)
+        f_ext_filt, self._lpf_zi = lfilter(
+            self._lpf_b, self._lpf_a, f_ext_raw[None, :], axis=0, zi=self._lpf_zi
+        )
+        f_ext_filt = f_ext_filt.reshape(6)
+        self._f_ext_last = f_ext_filt
+        return signed, f_ext_filt
+
+    def ready_causal(self) -> bool:
+        """Warm-up gate for the causal path (filter settled + history filled)."""
+        return self._n_updates >= self.cfg.min_samples
+
+    @property
+    def n_samples(self) -> int:
+        """Number of causal update() calls seen (for warm-up progress messages)."""
+        return self._n_updates
+
     @classmethod
     def from_yaml(cls, raw: dict) -> CompensatedForceObserver:
         f = raw.get("force", {})
@@ -98,6 +168,7 @@ class CompensatedForceObserver:
         fc_hz = float(f.get("fc_hz", fc_cfg))
         timing = raw.get("timing", {})
         dt_ms = float(timing.get("dt_ms", 10.0))
+        poll_ms = float(timing.get("async_poll_ms", dt_ms))
         return cls(
             ForceObserverConfig(
                 phi_path=PHI_JSON,
@@ -106,6 +177,9 @@ class CompensatedForceObserver:
                 buffer_s=float(f.get("buffer_s", 4.0)),
                 min_samples=int(f.get("min_samples", 35)),
                 use_inertia=bool(f.get("use_inertia", False)),
-                poll_hz=1000.0 / dt_ms,
+                poll_hz=1000.0 / poll_ms,
+                causal_fc_hz=float(f.get("causal_fc_hz", 6.0)),
+                causal_order=int(f.get("causal_order", 2)),
+                causal_history=int(f.get("causal_history", 5)),
             )
         )

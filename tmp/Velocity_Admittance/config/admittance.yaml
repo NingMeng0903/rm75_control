@@ -23,8 +23,12 @@ force:
   phi_source: phi_recommended
   buffer_s: 4.0
   min_samples: 35
-  use_inertia: false     # no virtual mass — PI admittance only (Keemink §5.4)
+  use_inertia: false
   desired_z_n: 3.0
+  # Causal online estimator (O(1)/tick, replaces the acausal whole-buffer filtfilt).
+  causal_fc_hz: 6.0
+  causal_order: 2
+  causal_history: 5
 
 trajectory:
   type: sin_tool_y       # hold | sin_tool_y | sin_base_y
@@ -33,24 +37,39 @@ trajectory:
   y_max_vel_cm_s: 1.0
 
 controller:
-  force_axes: [0, 0, 1, 0, 0, 0]   # 1 = admittance on axis (sensor frame)
-  motion_axes: [0, 1, 0, 0, 0, 0]
-  lock_orientation: true
-  enable_normal_tracking: false
-  kp_pos: [2.0, 2.0, 0.0, 1.5, 1.5, 1.5]
+  force_axes: [0, 0, 1, 0, 0, 0]   # tool-Z force-controlled (TFF: = contact normal)
+  enable_normal_tracking: false    # true → rotate tool-Z to null lateral forces
+  kp_pos: [0.3, 0.6, 0.0, 0.4, 0.4, 0.4]   # tool-frame PBAC gains (X,Y,-,Rx,Ry,Rz)
+  track_axes: [1, 1, 0, 1, 1, 1]
   system_delay_s: 0.015
-  k_fp_press: 0.015
-  k_fp_release: 0.005
-  k_fi: 0.008
-  integral_limit: 0.05
-  k_align: 0.0
   contact_threshold_n: 0.5
   deadband_n: 0.3
+  deadband_width_n: 0.2
+  pos_err_deadband_m: 0.0005
+  pos_correction_max_m_s: 0.05
+  # TRUE 2nd-order admittance on tool-Z: M·v̇ + D·v = (F_des − F_ext).
+  admittance_mass_z: 3.0
+  admittance_damping_z: 60.0
+  # Dimeas online variable damping (raise D when force oscillates, then decay).
+  var_damping_enabled: true
+  var_damping_omega_c_hz: 3.5
+  var_damping_lambda: 0.99
+  var_damping_f_max_n: 30.0
+  var_damping_d_u: 60.0
+  var_damping_m_u: 0.0
+  var_damping_dc_alpha: 0.02
+  k_align: 0.02
   max_vz_tool_m_s: 0.05
   max_velocity: [0.2, 0.2, 0.05, 0.08, 0.08, 0.08]
   max_acceleration: [1.0, 1.0, 0.05, 0.15, 0.15, 0.15]
   release_vz_up_m_s: 0.05
   release_vz_down_m_s: 0.05
+  # Legacy proportional/integral force gains — unused for tool-Z (2nd-order admittance
+  # supersedes them); kept for back-compat / non-Z force axes.
+  k_fp_press: 0.015
+  k_fp_release: 0.005
+  k_fi: 0.008
+  integral_limit: 0.05
 
 monitor:
   enabled: false

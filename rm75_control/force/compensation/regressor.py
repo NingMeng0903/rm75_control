@@ -184,6 +184,77 @@ def regressor_row(
     return W
 
 
+def _angular_velocity_sensor(R: np.ndarray, R_prev: np.ndarray, dt: float) -> np.ndarray:
+    """Sensor-frame angular velocity from two rotations via dR/dt @ R^T (causal)."""
+    dR = (R - R_prev) / max(dt, 1e-6)
+    sk = dR @ R.T
+    w = np.array(
+        [sk[2, 1] - sk[1, 2], sk[0, 2] - sk[2, 0], sk[1, 0] - sk[0, 1]],
+        dtype=float,
+    ) / 2.0
+    return R.T @ w
+
+
+def regressor_row_causal(
+    poses: np.ndarray,
+    times: np.ndarray,
+    cfg: FrameConfig,
+    *,
+    use_inertia: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Single-sample (current = last row) regressor for ONLINE causal force
+    compensation. Returns (W_row 6x16, g_s 3).
+
+    Gravity g_s = R^T g_base is exact from the current orientation (no
+    derivative, no lag). Angular rate/accel and linear accel use causal backward
+    finite differences over the supplied short history. These dynamic terms are
+    tiny at cm/s scan speeds (m*a ~ 0.01 N for a 1 kg tool), so crude estimates
+    plus a downstream causal LPF are sufficient. Mirrors regressor_row(); the
+    offline build_dataset() path is left untouched for identification.
+
+    poses: (K,6) base-frame pose history, oldest→newest (newest = current).
+    times: (K,) monotonic timestamps matching poses.
+    """
+    poses = np.asarray(poses, dtype=float)
+    times = np.asarray(times, dtype=float)
+    n = len(times)
+    cur = n - 1
+
+    R = R_base_sensor(poses[cur], cfg)
+    g_s = R.T @ np.asarray(cfg.gravity_base, dtype=float)
+
+    omega_s = np.zeros(3)
+    alpha_s = np.zeros(3)
+    a_s = np.zeros(3)
+
+    # Quasi-static compensation (use_inertia=False): keep ONLY the gravity term
+    # (g_s = R^T g_base, exact and smooth from orientation alone) + the constant
+    # bias. The dynamic terms (linear accel, ω, α) are obtained here by finite
+    # differencing the measured pose; at scan speeds (~cm/s) their TRUE force
+    # contribution is <0.05 N, but raw double-differencing of the quantised
+    # encoder injects ~2 N of noise (a_s std ≈ 1.7-2.8 m/s² × tool mass). That
+    # noise is what made the tool-Z force feel jittery. So we drop them unless
+    # the caller explicitly wants the inertial model (use_inertia=True), in which
+    # case they must be filtered upstream like the offline build_dataset path.
+    if use_inertia and n >= 2:
+        dt0 = max(times[cur] - times[cur - 1], 1e-6)
+        R_prev = R_base_sensor(poses[cur - 1], cfg)
+        omega_s = _angular_velocity_sensor(R, R_prev, dt0)
+        if n >= 3:
+            dt1 = max(times[cur - 1] - times[cur - 2], 1e-6)
+            dt_c = 0.5 * (dt0 + dt1)
+            v_now = (poses[cur, :3] - poses[cur - 1, :3]) / dt0
+            v_prev = (poses[cur - 1, :3] - poses[cur - 2, :3]) / dt1
+            a_s = R.T @ ((v_now - v_prev) / dt_c)
+            R_prev2 = R_base_sensor(poses[cur - 2], cfg)
+            omega_prev = _angular_velocity_sensor(R_prev, R_prev2, dt1)
+            alpha_s = (omega_s - omega_prev) / dt_c
+
+    W_row = regressor_row(a_s, g_s, omega_s, alpha_s, use_inertia=use_inertia)
+    return W_row, g_s
+
+
 def build_dataset(
     pose: np.ndarray,
     force_raw: np.ndarray,

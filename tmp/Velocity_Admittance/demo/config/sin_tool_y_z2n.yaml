@@ -1,12 +1,23 @@
-# Demo trajectory plugin + tool-Z force hybrid.
-# Architecture (sleeve / slider):
-#   trajectory → pose_d + vel_ff (base frame)
-#   controller → Tool-X/Y from R.T @ v_pos_base; Tool-Z from force admittance only
-#   open_loop: true → vel_ff only (245e676 stable baseline)
+# 5-DOF PBAC (X,Y,Rx,Ry,Rz) + tool-Z force admittance (sleeve decoupling).
 #
-# Init snap: rm_set_movev_canfd_init may shift ~1–6mm once. Do NOT run extra zero-v
-# settle or post_init_realign — both made snap worse in testing (2026-06-29).
-# After move_j use pre_movev_prep: minimal or skip (NOT full recover, NOT light slow_stop).
+# Task-frame formalism (De Schutter & Van Brussel 1988; Bruyninckx & De Schutter 1996):
+#   tool-Z = force-controlled direction; tool-X/Y + attitude = velocity-controlled
+#   tracking directions (orthogonal, never both on one DOF).
+#
+# Stability fixes grounded in Keemink et al. 2018 + Dimeas & Aspragathos 2016:
+#   1. Switch-in bumpless: O(1) causal force observer keeps the loop ~10 ms so the
+#      high-follow movev stream stays smooth (the old ~7 ms/tick filtfilt rebuild
+#      starved the loop → 20 ms spikes → switch-in dart). Plus quiescence-wait +
+#      active pose-hold during the hold/approach phase.
+#   2. Position dims: error deadband + bounded PBAC correction on the tracking axes
+#      (vel_ff stays authoritative; G5 phase-lead kept via system_delay_s). Both the
+#      translation AND rotation corrections run in the tool/task frame (TFF).
+#   3. Force-Z: TRUE 2nd-order admittance M·v̇ + D·v = (F_des−F_ext) (Keemink G4) —
+#      with an environment spring this is a stable mass-spring-damper, so an
+#      over-design poke gives a bounded damped retract, not a saturating limit cycle.
+#      D is raised online by the Dimeas instability index when oscillation appears.
+#   4. Force feedback smoothness: causal low-order Butterworth (G2: low order, high
+#      cutoff) replaces the acausal filtfilt that jittered the buffer right edge.
 #
 # Run:
 #   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y --log
@@ -19,14 +30,21 @@ startup:
   pose_slot: d
   settle_frames: 30
   hold_s: 1.0
-  pre_movev_prep: minimal     # skip | minimal | light | full
+  pre_movev_prep: light       # run_sin_tool_y: slow_stop + delete_traj before init
   pre_movev_settle_s: 0.0
   post_init_realign: false
-  auto_recover: true
-  wait_contact: true
-  auto_start_under_n: 0.5
-  auto_start_hold_s: 0.5
-  approach_ramp_s: 1.5
+  auto_recover: false         # true adds stop_all before move_j → larger init snap
+  wait_contact: true          # lock pose, wait for EXTERNAL contact (no descent here)
+  auto_start_under_n: 0.5      # trigger at Fz ≥ desired_z - 0.5 = 2.5 N
+  auto_start_hold_s: 0.3       # held 0.3 s → engage scan directly
+  # Active position-hold (counters movev idle-creep → bumpless switch-in).
+  hold_active: true
+  hold_kp_pos: 1.5
+  hold_kp_rot: 1.5
+  hold_deadband_mm: 0.3
+  hold_max_vel_m_s: 0.02
+  hold_max_omega_rad_s: 0.10
+  hold_accel_m_s2: 0.3
 
 frames:
   euler_order: xyz
@@ -42,10 +60,14 @@ velocity_canfd:
 force:
   phi_source: phi_recommended
   buffer_s: 2.0
-  min_samples: 22
-  fc_hz: 4.0
+  min_samples: 22            # also the causal-observer warm-up gate (ticks)
+  fc_hz: 4.0                 # legacy (offline filtfilt path); unused on hot path
   use_inertia: false
   desired_z_n: 3.0
+  # Causal online estimator (Keemink G2: low order + high cutoff to avoid phase lag).
+  causal_fc_hz: 6.0
+  causal_order: 2
+  causal_history: 5
 
 trajectory:
   type: sin_base_y_tool_rz
@@ -54,24 +76,61 @@ trajectory:
   y_max_vel_cm_s: 3.0
   soft_start: true
   ramp_s: 2.0
-  open_loop: true
+  open_loop: false
 
 controller:
   force_axes: [0, 0, 1, 0, 0, 0]
-  open_loop: true
-  track_axes: [0, 1, 0, 0, 0, 0]
-  kp_pos: [0, 0, 0, 0, 0, 0]
+  open_loop: false
+  # 5-DOF PBAC. kp_pos[0,1] are TOOL-X / TOOL-Y gains (translation loop runs in the
+  # tool frame, force axis tool-Z excluded); kp_pos[3:6] are tool-frame rotational
+  # gains (correction now also computed in the tool/task frame). Decoupling lets us
+  # raise XY safely: tool-X holds the probe laterally, tool-Y tracks the sweep.
+  # Modestly raised vs the open-loop-ish 0.15/0.30 to tighten swept-axis tracking.
+  track_axes: [1, 1, 0, 1, 1, 1]
+  kp_pos: [0.30, 0.60, 0.0, 0.4, 0.4, 0.4]
   deadband_n: 0.3
   deadband_width_n: 0.2
   system_delay_s: 0.015
-  k_fp_press: 0.045
-  k_fp_release: 0.025
+  # Position-loop conditioning (tracking axes): kill noise jitter + bound slip surge.
+  pos_err_deadband_m: 0.0005   # 0.5 mm
+  pos_correction_max_m_s: 0.05
+  # --- Normal (tool-Z) force axis: TRUE 2nd-order admittance M·v̇ + D·v = F_err ---
+  # With contact spring k_e this is a stable mass-spring-damper (ζ = D/(2√(M k_e))).
+  # M=3.0,D=60 keeps overshoot/ringing modest at stiff contact while staying
+  # responsive enough (|v|≈f_err/D) to follow the surface during the sweep; the
+  # higher M also low-passes residual force-sensor noise (force→vel gain ∝ 1/(Mω)),
+  # smoothing the tool-Z motion. Dimeas variable damping adds up to +60 N·s/m only
+  # when it actually rings. TUNE on hardware: ↑M = heavier/slower/smoother, ↑D =
+  # stiffer/more damped. M bounds accel, so no separate accel-limit hack is needed.
+  admittance_mass_z: 3.0
+  admittance_damping_z: 60.0
+  # Dimeas online variable damping: raise D only when the normal force shows
+  # high-frequency oscillation (Is∈[0,1]); decays back when it settles.
+  var_damping_enabled: true
+  var_damping_omega_c_hz: 3.5   # Dimeas crossover (mean of 1.2 & 5.8 Hz)
+  var_damping_lambda: 0.99
+  var_damping_f_max_n: 30.0
+  var_damping_d_u: 60.0         # +60 N·s/m of damping at Is=1
+  var_damping_m_u: 0.0          # damping-only (Dimeas preferred low-effort = mass, but
+                                # for force tracking damping is the direct stabiliser)
+  var_damping_dc_alpha: 0.02    # slow EWMA splitting the 3 N setpoint bias from the AC
+  # Velocity caps (safety only now — the admittance shapes the motion):
+  max_vz_tool_m_s: 0.15
+  approach_vz_tool_m_s: 0.02   # gentler contact → less preload overshoot at handoff
+  max_velocity: [0.03, 0.10, 0.15, 0.12, 0.12, 0.12]
+  max_acceleration: [0.5, 1.0, 3.0, 0.5, 0.5, 0.5]
+  # TFF note: tool-Z is the force-controlled task direction, so it MUST be the contact
+  # normal. Mount/orient the probe so tool +Z ≈ surface normal at contact. For a tilted
+  # or unknown surface, set enable_normal_tracking:true (+ tune k_align) so tool-Z is
+  # rotated to null the lateral forces f_ext[0:1] (Bruyninckx 1996 §III.I tracking).
+  enable_normal_tracking: false
+  k_align: 0.02
+  # Legacy proportional/integral force gains — UNUSED for tool-Z now (kept for any
+  # non-Z force axis / back-compat). The 2nd-order admittance above supersedes them.
+  k_fp_press: 0.035
+  k_fp_release: 0.030
   k_fi: 0.001
   integral_limit: 0.015
-  max_vz_tool_m_s: 0.15
-  approach_vz_tool_m_s: 0.03
-  max_velocity: [0.03, 0.10, 0.15, 0.15, 0.15, 0.35]
-  max_acceleration: [0.5, 1.0, 0.5, 1.0, 1.0, 1.5]
 
 monitor:
   log: false
