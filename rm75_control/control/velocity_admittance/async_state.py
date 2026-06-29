@@ -23,7 +23,7 @@ class AsyncStateObserver:
     Main loop reads latest snapshot without blocking on RPC.
     """
 
-    def __init__(self, robot, *, poll_s: float = 0.002) -> None:
+    def __init__(self, robot, *, poll_s: float = 0.01) -> None:
         self.robot = robot
         self.poll_s = poll_s
         self._lock = threading.Lock()

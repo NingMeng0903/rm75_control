@@ -1,18 +1,20 @@
 # Demo trajectory plugin + tool-Z force hybrid.
-# Architecture:
-#   trajectory → 6D (pose_d, vel_ff) in base frame
-#   controller → 2×2 lstsq (Base-X/Y track) + tool-Z force admittance
+# Architecture (sleeve / slider):
+#   trajectory or visual Servo → vel_ff (+ optional Kp) in base frame
+#   controller → Tool-X/Y from R.T @ v_pos_base; Tool-Z from force admittance only
+#   No world-XY lstsq lock — Z reciprocation does not lateral drift
 #
-# Phase 1 (validate 16 cm stroke): open_loop: true, kp_pos all zero
-# Phase 2 (weak PBAC Y drift): open_loop: false, uncomment phase2 block below
+# Phase 1: open_loop true, kp_pos all zero
+# Phase 2: weak PBAC — uncomment phase2 block
 #
 # Run:
-#   source env.sh && cd /media/camp/EXT_DRIVE/rm75_control
-#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_base_y
+#   source /media/camp/EXT_DRIVE/rm75_control/env.sh
+#   cd /media/camp/EXT_DRIVE/rm75_control
+#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y
 
 timing:
   dt_ms: 10.0
-  async_poll_ms: 2.0
+  async_poll_ms: 10.0
 
 startup:
   pose_slot: d
@@ -44,7 +46,7 @@ force:
   desired_z_n: 3.0
 
 trajectory:
-  type: sin_base_y_tool_rz    # demo plugin; replace with any Trajectory6D
+  type: sin_base_y_tool_rz    # hold | sin_tool_y | sin_base_y | sin_base_y_tool_rz
   y_peak_to_peak_cm: 16.0
   rz_amplitude_deg: 12.0
   y_max_vel_cm_s: 3.0
@@ -53,13 +55,15 @@ trajectory:
   open_loop: true
 
 controller:
-  force_axes: [0, 0, 1, 0, 0, 0]   # tool TCP-Z → force (f_ext[2] ≡ tool-Z when sensor∥flange)
+  force_axes: [0, 0, 1, 0, 0, 0]   # tool TCP-Z force; f_ext[2] when sensor parallel flange
   open_loop: true
-  track_axes: [0, 1, 0, 0, 0, 0]   # Phase 1: Y only when closed-loop enabled
+  track_axes: [0, 1, 0, 0, 0, 0]
   kp_pos: [0, 0, 0, 0, 0, 0]
-  # --- Phase 2 weak PBAC (after open-loop stroke OK) ---
+  deadband_n: 0.3
+  deadband_width_n: 0.2
+  # --- Phase 2 weak PBAC (after open-loop OK) ---
   # open_loop: false
-  # track_axes: [0, 1, 0, 1, 1, 1]   # Y + euler (pose_d includes spin)
+  # track_axes: [0, 1, 0, 1, 1, 1]
   # kp_pos: [0, 1.0, 0, 0.3, 0.3, 0.3]
   system_delay_s: 0.015
   k_fp_press: 0.045

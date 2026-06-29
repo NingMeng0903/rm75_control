@@ -109,7 +109,7 @@ def run_velocity_admittance(
     timing = raw.get("timing", {})
     dt_ms = float(timing.get("dt_ms", 10.0))
     dt_s = dt_ms / 1000.0
-    async_poll_ms = float(timing.get("async_poll_ms", 2.0))
+    async_poll_ms = float(timing.get("async_poll_ms", 10.0))
     vc = raw.get("velocity_canfd", {})
     follow = bool(vc.get("follow", True))
     traj_mode = int(vc.get("trajectory_mode", 0))
@@ -169,7 +169,7 @@ def run_velocity_admittance(
     print(f"  trajectory: {trajectory_summary(raw)}  kind={traj_kind}")
     scan_mode = "open-loop ff" if ctrl_cfg.open_loop else "closed-loop track"
     print(
-        f"  hybrid: traj=6D base  fuse=2x2 lstsq + tool-Z force "
+        f"  hybrid: traj/Servo=6D base  fuse=tool_sleeve (Z force, XY ff) "
         f"S_f={ctrl_cfg.force_axes.tolist()}  "
         f"movev={control_frame} frame_type={frame_type}  scan={scan_mode}",
         flush=True,

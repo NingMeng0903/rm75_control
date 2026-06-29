@@ -2,11 +2,9 @@
 
 > 用途：第三方审阅 / 离线对照。内容与仓库源码 **一字不差**。
 
-> 运行 demo：`source env.sh && python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_base_y`
+> 运行：`cd /media/camp/EXT_DRIVE/rm75_control && source env.sh && python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y`
 
-> 前置：`tmp/force_compensation/logs/force_id_phi.json`（先跑 force_calibrate.py）
-
-> 外部依赖：RealMan `RM_API2/Python`、numpy、scipy、pyyaml
+> 前置：`tmp/force_compensation/logs/force_id_phi.json`
 
 ## 目录
 
@@ -16,34 +14,24 @@
 - [三、运动下发与 Session](#三运动下发与-session)
 - [四、力补偿（phi → f_ext）](#四力补偿（phi-→-f_ext）)
 - [五、YAML 配置](#五yaml-配置)
-- [六、控制公式与修复要点](#六控制公式与修复要点)
+- [六、套筒融合公式](#六套筒融合公式)
 
 ## 零、模块关系
 
 ```
-sin_tool_y_z2n.py / run_admittance.py
-    └─ loop.run_velocity_admittance()
-           ├─ RobotSession.recover_controller()     # 清 planner / 力控残留
-           ├─ move_j + wait_settle (collection)     # 可选 slot 位姿
-           ├─ rm_set_movev_canfd_init + 零速 settle
-           ├─ post-init 锚定 pose0 / traj.set_origin
-           ├─ AsyncStateObserver (2ms 后台读 pose+force)
-           ├─ CompensatedForceObserver (phi → f_ext[2]≡tool-Z)
-           ├─ TrajectoryGenerator → (pose_d, vel_ff) base 6D
-           ├─ AdmittanceController
-           │     v_pos_base = vel_ff + Kp⊙(pose_d - pose)
-           │     fuse_constrained_xy: Tool-Z 力控 + 2×2 lstsq → Base-XY
-           └─ send_velocity_canfd → rm_movev_canfd (frame_type=0 tool)
+sin_tool_y_z2n.py → loop.run_velocity_admittance()
+  recover_controller → move_j(slot) → CANFD init → post-init anchor
+  AsyncStateObserver (~100Hz, async_poll_ms=10)
+  Trajectory / Servo → vel_ff (+ Kp·err when closed-loop)
+  phi observer → f_ext[2] → Tool-Z PI admittance (smooth deadband)
+  fuse_tool_sleeve: v_cmd_tool[0:1]=R.T@v_pos; v_cmd_tool[2]=v_force_z
+  rm_movev_canfd(frame_type=0)
 ```
 
-| 模块 | 职责 |
-|------|------|
-| `trajectory.py` | base 系 6D 参考 `(pose_d, vel_ff)`；spin 写入 pose_d |
-| `observer.py` + `regressor.py` | 滚动 buffer + phi 回归 → sensor 系 `f_ext` |
-| `controller.py` | PBAC + tool-Z PI 导纳 + **2×2 lstsq 融合**（替代旧 S_p 清零） |
-| `async_state.py` | 后台高频反馈，主循环无 decimation |
-| `loop.py` | 会话编排：init 锚定、接触检测、scan 切换 |
-| `canfd.py` | `rm_movev_canfd` 封装 |
+| 轴 | 职责 |
+|----|------|
+| Tool-Z | 力导纳套筒，沿法向进退，不锁世界坐标 |
+| Tool-X/Y | 轨迹前馈 / 视觉 Servo（vel_ff），Z 滑动时不侧向补偿 |
 
 
 ## 一、入口
@@ -233,7 +221,7 @@ class AsyncStateObserver:
     Main loop reads latest snapshot without blocking on RPC.
     """
 
-    def __init__(self, robot, *, poll_s: float = 0.002) -> None:
+    def __init__(self, robot, *, poll_s: float = 0.01) -> None:
         self.robot = robot
         self.poll_s = poll_s
         self._lock = threading.Lock()
@@ -324,13 +312,33 @@ def pose_error(desired: np.ndarray, current: np.ndarray) -> np.ndarray:
     return err
 
 
+def smooth_deadband_eff(f_err: float, deadband_n: float, width_n: float) -> float:
+    """
+    C1 smooth deadband: zero inside |f|<=db, ramps to f-sign*db outside transition.
+    Reduces PI limit cycles at the deadband edge (Z inertia ripple).
+    """
+    if width_n <= 0.0:
+        if abs(f_err) <= deadband_n:
+            return 0.0
+        return f_err - math.copysign(deadband_n, f_err)
+    af = abs(f_err)
+    if af <= deadband_n:
+        return 0.0
+    if af >= deadband_n + width_n:
+        return f_err - math.copysign(deadband_n + 0.5 * width_n, f_err)
+    t = (af - deadband_n) / width_n
+    gain = t * t * (3.0 - 2.0 * t)
+    return math.copysign(gain * (af - deadband_n), f_err)
+
+
 @dataclass
 class AdmittanceConfig:
     """
     force_axes: tool-frame mask for admittance (typ. [0,0,1,0,0,0] = TCP normal).
     f_ext from phi is in sensor frame; with sensor_offset=0 and TCP pure translation,
     f_ext[2] is used as tool-Z force (see observer docstring).
-    Trajectory pose_d / vel_ff are base-frame 6D from a Trajectory6D producer.
+    Trajectory pose_d / vel_ff are base-frame 6D (Servo / scan feedforward).
+    Fusion is tool-frame sleeve decoupling only — no world-XY lstsq lock.
     """
 
     euler_order: str = "xyz"
@@ -349,6 +357,7 @@ class AdmittanceConfig:
     enable_normal_tracking: bool = False
     contact_threshold_n: float = 0.5
     deadband_n: float = 0.3
+    deadband_width_n: float = 0.2
     max_velocity: np.ndarray = field(
         default_factory=lambda: np.array([0.2, 0.2, 0.08, 0.5, 0.5, 0.5])
     )
@@ -383,6 +392,7 @@ class AdmittanceConfig:
             enable_normal_tracking=bool(c.get("enable_normal_tracking", False)),
             contact_threshold_n=float(c.get("contact_threshold_n", 0.5)),
             deadband_n=float(c.get("deadband_n", 0.3)),
+            deadband_width_n=float(c.get("deadband_width_n", 0.2)),
             max_velocity=np.asarray(
                 c.get("max_velocity", [0.2, 0.2, 0.08, 0.5, 0.5, 0.5]), dtype=float
             ),
@@ -399,10 +409,14 @@ class AdmittanceConfig:
 
 class AdmittanceController:
     """
-    Pipeline (base trajectory → constrained fusion → movev):
+    Pipeline (base trajectory/Servo → sleeve fusion → movev):
       1. v_pos_base = vel_ff + kp * (pose_d - pose)
-      2. fuse_constrained_xy: Tool-Z = force admittance; Tool-X/Y lstsq → Base-X/Y
+      2. fuse_tool_sleeve: Tool-X/Y from R.T @ v_pos_base; Tool-Z from force admittance
       3. output v_cmd_tool (frame_type=0) or v_cmd_base
+
+    Sleeve vs old S_p @ (R.T v_base):
+      - Old S_p zeroed tool-Z trajectory rate → lost tilted scan component.
+      - Sleeve keeps tool-X/Y intact, replaces only [2] with force — no world-XY lock.
     """
 
     def __init__(self, dt: float, config: AdmittanceConfig | None = None) -> None:
@@ -416,7 +430,7 @@ class AdmittanceController:
         self.last_v_cmd.fill(0.0)
 
     @staticmethod
-    def fuse_constrained_xy(
+    def fuse_tool_sleeve(
         v_pos_base: np.ndarray,
         v_force_tool: np.ndarray,
         r_mat: np.ndarray,
@@ -424,18 +438,16 @@ class AdmittanceController:
         normal_track: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        2×2 constrained projection: match Base-X/Y while Tool-Z is force-controlled.
-
-        Replaces S_p @ (R^T v_base) which zeroed tool-Z trajectory rate and shrank
-        world-Y stroke when the TCP is tilted.
+        Tool-frame orthogonal decoupling (sleeve / slider):
+          Tool-X/Y ← trajectory or visual Servo feedforward
+          Tool-Z   ← force admittance only — no lateral compensation for Z motion.
         """
-        v_cmd_tool = np.zeros(6, dtype=float)
-        a_mat = r_mat[0:2, 0:2]
-        b_vec = np.asarray(v_pos_base[0:2], dtype=float) - r_mat[0:2, 2] * float(v_force_tool[2])
-        v_xy, _, _, _ = np.linalg.lstsq(a_mat, b_vec, rcond=None)
-        v_cmd_tool[0:2] = v_xy
+        v_pos_tool = np.zeros(6, dtype=float)
+        v_pos_tool[:3] = r_mat.T @ np.asarray(v_pos_base[:3], dtype=float)
+        v_pos_tool[3:6] = r_mat.T @ np.asarray(v_pos_base[3:6], dtype=float)
+
+        v_cmd_tool = v_pos_tool.copy()
         v_cmd_tool[2] = float(v_force_tool[2])
-        v_cmd_tool[3:6] = r_mat.T @ np.asarray(v_pos_base[3:6], dtype=float)
         if normal_track:
             v_cmd_tool[3:6] += np.asarray(v_force_tool[3:6], dtype=float)
 
@@ -493,14 +505,14 @@ class AdmittanceController:
             v_force_tool[3] = -cfg.k_align * f_ext[1]
             v_force_tool[4] = cfg.k_align * f_ext[0]
 
-        v_cmd_tool, v_cmd_base = self.fuse_constrained_xy(
+        v_cmd_tool, v_cmd_base = self.fuse_tool_sleeve(
             v_pos_base, v_force_tool, r_mat, normal_track=normal_track,
         )
         if cfg.max_vz_tool_m_s > 0.0:
             v_cmd_tool[2] = float(np.clip(v_cmd_tool[2], -cfg.max_vz_tool_m_s, cfg.max_vz_tool_m_s))
             if cfg.control_frame == "base":
                 v_cmd_base[:3] = r_mat @ v_cmd_tool[:3]
-                v_cmd_base[3:] = r_mat @ v_cmd_tool[3:]
+                v_cmd_base[3:] = r_mat @ v_cmd_tool[3:6]
 
         v_out = v_cmd_tool if cfg.control_frame == "tool" else v_cmd_base
         v_clamp = np.clip(v_out, -cfg.max_velocity, cfg.max_velocity)
@@ -520,9 +532,10 @@ class AdmittanceController:
         if abs(f_err) > 5.0:
             self.force_error_integral[axis] = 0.0
 
+        eff = smooth_deadband_eff(f_err, cfg.deadband_n, cfg.deadband_width_n)
         k_fp = cfg.k_fp_press if f_err < 0 else cfg.k_fp_release
-        if abs(f_err) > cfg.deadband_n:
-            eff = f_err - math.copysign(cfg.deadband_n, f_err)
+
+        if abs(eff) > 1e-9:
             self.force_error_integral[axis] += eff * self.dt
             if axis == 2:
                 if f_err < 0:
@@ -538,7 +551,8 @@ class AdmittanceController:
             )
             v = k_fp * eff + cfg.k_fi * self.force_error_integral[axis]
         else:
-            v = cfg.k_fi * self.force_error_integral[axis]
+            v = 0.0
+
         if axis == 2:
             v = float(np.clip(v, -cfg.max_vz_tool_m_s, cfg.max_vz_tool_m_s))
         return v
@@ -989,7 +1003,7 @@ def run_velocity_admittance(
     timing = raw.get("timing", {})
     dt_ms = float(timing.get("dt_ms", 10.0))
     dt_s = dt_ms / 1000.0
-    async_poll_ms = float(timing.get("async_poll_ms", 2.0))
+    async_poll_ms = float(timing.get("async_poll_ms", 10.0))
     vc = raw.get("velocity_canfd", {})
     follow = bool(vc.get("follow", True))
     traj_mode = int(vc.get("trajectory_mode", 0))
@@ -1049,7 +1063,7 @@ def run_velocity_admittance(
     print(f"  trajectory: {trajectory_summary(raw)}  kind={traj_kind}")
     scan_mode = "open-loop ff" if ctrl_cfg.open_loop else "closed-loop track"
     print(
-        f"  hybrid: traj=6D base  fuse=2x2 lstsq + tool-Z force "
+        f"  hybrid: traj/Servo=6D base  fuse=tool_sleeve (Z force, XY ff) "
         f"S_f={ctrl_cfg.force_axes.tolist()}  "
         f"movev={control_frame} frame_type={frame_type}  scan={scan_mode}",
         flush=True,
@@ -2377,20 +2391,22 @@ if __name__ == "__main__":
 
 ```yaml
 # Demo trajectory plugin + tool-Z force hybrid.
-# Architecture:
-#   trajectory → 6D (pose_d, vel_ff) in base frame
-#   controller → 2×2 lstsq (Base-X/Y track) + tool-Z force admittance
+# Architecture (sleeve / slider):
+#   trajectory or visual Servo → vel_ff (+ optional Kp) in base frame
+#   controller → Tool-X/Y from R.T @ v_pos_base; Tool-Z from force admittance only
+#   No world-XY lstsq lock — Z reciprocation does not lateral drift
 #
-# Phase 1 (validate 16 cm stroke): open_loop: true, kp_pos all zero
-# Phase 2 (weak PBAC Y drift): open_loop: false, uncomment phase2 block below
+# Phase 1: open_loop true, kp_pos all zero
+# Phase 2: weak PBAC — uncomment phase2 block
 #
 # Run:
-#   source env.sh && cd /media/camp/EXT_DRIVE/rm75_control
-#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_base_y
+#   source /media/camp/EXT_DRIVE/rm75_control/env.sh
+#   cd /media/camp/EXT_DRIVE/rm75_control
+#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y
 
 timing:
   dt_ms: 10.0
-  async_poll_ms: 2.0
+  async_poll_ms: 10.0
 
 startup:
   pose_slot: d
@@ -2422,7 +2438,7 @@ force:
   desired_z_n: 3.0
 
 trajectory:
-  type: sin_base_y_tool_rz    # demo plugin; replace with any Trajectory6D
+  type: sin_base_y_tool_rz    # hold | sin_tool_y | sin_base_y | sin_base_y_tool_rz
   y_peak_to_peak_cm: 16.0
   rz_amplitude_deg: 12.0
   y_max_vel_cm_s: 3.0
@@ -2431,13 +2447,15 @@ trajectory:
   open_loop: true
 
 controller:
-  force_axes: [0, 0, 1, 0, 0, 0]   # tool TCP-Z → force (f_ext[2] ≡ tool-Z when sensor∥flange)
+  force_axes: [0, 0, 1, 0, 0, 0]   # tool TCP-Z force; f_ext[2] when sensor parallel flange
   open_loop: true
-  track_axes: [0, 1, 0, 0, 0, 0]   # Phase 1: Y only when closed-loop enabled
+  track_axes: [0, 1, 0, 0, 0, 0]
   kp_pos: [0, 0, 0, 0, 0, 0]
-  # --- Phase 2 weak PBAC (after open-loop stroke OK) ---
+  deadband_n: 0.3
+  deadband_width_n: 0.2
+  # --- Phase 2 weak PBAC (after open-loop OK) ---
   # open_loop: false
-  # track_axes: [0, 1, 0, 1, 1, 1]   # Y + euler (pose_d includes spin)
+  # track_axes: [0, 1, 0, 1, 1, 1]
   # kp_pos: [0, 1.0, 0, 0.3, 0.3, 0.3]
   system_delay_s: 0.015
   k_fp_press: 0.045
@@ -2459,7 +2477,7 @@ controller:
 
 timing:
   dt_ms: 10.0
-  async_poll_ms: 2.0
+  async_poll_ms: 10.0
 
 startup:
   pose_slot: d
@@ -2513,28 +2531,16 @@ monitor:
   refresh_hz: 12.0
 ```
 
-## 六、控制公式与修复要点
+## 六、套筒融合公式
 
 ```text
-# 每 10ms 控制周期
-snap = AsyncStateObserver.read()          # ~2ms 后台更新
-f_ext = phi_compensate(snap.force, snap.pose)
-(pose_d, vel_ff) = traj.sample(t_scan)
-
-v_pos_base = vel_ff + kp_pos ⊙ track_axes ⊙ (pose_d - pose_predicted)
-v_force_tool[2] = PI_admittance(f_des[2] - f_ext[2])
-
-# 2×2 约束融合（倾斜 TCP 下保留 world-Y 行程）
-A = R[0:2, 0:2]
-b = v_pos_base[0:2] - R[0:2, 2] * v_force_tool[2]
-v_cmd_tool[0:2] = lstsq(A, b)
-v_cmd_tool[2] = v_force_tool[2]
-v_cmd_tool[3:6] = R.T @ v_pos_base[3:6]
-
+v_pos_base = vel_ff + kp ⊙ track_axes ⊙ (pose_d - pose)
+v_pos_tool[:3] = R.T @ v_pos_base[:3]
+v_pos_tool[3:6] = R.T @ v_pos_base[3:6]
+v_cmd_tool = v_pos_tool
+v_cmd_tool[2] = PI_admittance(f_des - f_ext)   # smooth deadband
 rm_movev_canfd(v_cmd_tool, frame_type=0)
 ```
 
-**Phase 1**：`open_loop: true`，验证 Y 16cm 行程。
-
-**Phase 2**：弱 PBAC（yaml 注释块）：`track_axes` 含 Y（+ euler 若 spin 已写入 pose_d）。
+**验证（机器人）**：TCP-Z 往返无 XY 漂；approach 不卡；扫查贴合 OK。
 

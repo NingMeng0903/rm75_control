@@ -56,7 +56,7 @@ git push -u origin main
 cd /media/camp/EXT_DRIVE/rm75_control
 git status
 git add .
-git commit -m "更新了冲击测量I，速度版本brust"
+git commit -m "大修改，解决4个问题，没有测试"
 git push origin main
 ```
 

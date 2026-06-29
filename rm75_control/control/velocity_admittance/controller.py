@@ -20,13 +20,33 @@ def pose_error(desired: np.ndarray, current: np.ndarray) -> np.ndarray:
     return err
 
 
+def smooth_deadband_eff(f_err: float, deadband_n: float, width_n: float) -> float:
+    """
+    C1 smooth deadband: zero inside |f|<=db, ramps to f-sign*db outside transition.
+    Reduces PI limit cycles at the deadband edge (Z inertia ripple).
+    """
+    if width_n <= 0.0:
+        if abs(f_err) <= deadband_n:
+            return 0.0
+        return f_err - math.copysign(deadband_n, f_err)
+    af = abs(f_err)
+    if af <= deadband_n:
+        return 0.0
+    if af >= deadband_n + width_n:
+        return f_err - math.copysign(deadband_n + 0.5 * width_n, f_err)
+    t = (af - deadband_n) / width_n
+    gain = t * t * (3.0 - 2.0 * t)
+    return math.copysign(gain * (af - deadband_n), f_err)
+
+
 @dataclass
 class AdmittanceConfig:
     """
     force_axes: tool-frame mask for admittance (typ. [0,0,1,0,0,0] = TCP normal).
     f_ext from phi is in sensor frame; with sensor_offset=0 and TCP pure translation,
     f_ext[2] is used as tool-Z force (see observer docstring).
-    Trajectory pose_d / vel_ff are base-frame 6D from a Trajectory6D producer.
+    Trajectory pose_d / vel_ff are base-frame 6D (Servo / scan feedforward).
+    Fusion is tool-frame sleeve decoupling only — no world-XY lstsq lock.
     """
 
     euler_order: str = "xyz"
@@ -45,6 +65,7 @@ class AdmittanceConfig:
     enable_normal_tracking: bool = False
     contact_threshold_n: float = 0.5
     deadband_n: float = 0.3
+    deadband_width_n: float = 0.2
     max_velocity: np.ndarray = field(
         default_factory=lambda: np.array([0.2, 0.2, 0.08, 0.5, 0.5, 0.5])
     )
@@ -79,6 +100,7 @@ class AdmittanceConfig:
             enable_normal_tracking=bool(c.get("enable_normal_tracking", False)),
             contact_threshold_n=float(c.get("contact_threshold_n", 0.5)),
             deadband_n=float(c.get("deadband_n", 0.3)),
+            deadband_width_n=float(c.get("deadband_width_n", 0.2)),
             max_velocity=np.asarray(
                 c.get("max_velocity", [0.2, 0.2, 0.08, 0.5, 0.5, 0.5]), dtype=float
             ),
@@ -95,10 +117,14 @@ class AdmittanceConfig:
 
 class AdmittanceController:
     """
-    Pipeline (base trajectory → constrained fusion → movev):
+    Pipeline (base trajectory/Servo → sleeve fusion → movev):
       1. v_pos_base = vel_ff + kp * (pose_d - pose)
-      2. fuse_constrained_xy: Tool-Z = force admittance; Tool-X/Y lstsq → Base-X/Y
+      2. fuse_tool_sleeve: Tool-X/Y from R.T @ v_pos_base; Tool-Z from force admittance
       3. output v_cmd_tool (frame_type=0) or v_cmd_base
+
+    Sleeve vs old S_p @ (R.T v_base):
+      - Old S_p zeroed tool-Z trajectory rate → lost tilted scan component.
+      - Sleeve keeps tool-X/Y intact, replaces only [2] with force — no world-XY lock.
     """
 
     def __init__(self, dt: float, config: AdmittanceConfig | None = None) -> None:
@@ -112,7 +138,7 @@ class AdmittanceController:
         self.last_v_cmd.fill(0.0)
 
     @staticmethod
-    def fuse_constrained_xy(
+    def fuse_tool_sleeve(
         v_pos_base: np.ndarray,
         v_force_tool: np.ndarray,
         r_mat: np.ndarray,
@@ -120,18 +146,16 @@ class AdmittanceController:
         normal_track: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        2×2 constrained projection: match Base-X/Y while Tool-Z is force-controlled.
-
-        Replaces S_p @ (R^T v_base) which zeroed tool-Z trajectory rate and shrank
-        world-Y stroke when the TCP is tilted.
+        Tool-frame orthogonal decoupling (sleeve / slider):
+          Tool-X/Y ← trajectory or visual Servo feedforward
+          Tool-Z   ← force admittance only — no lateral compensation for Z motion.
         """
-        v_cmd_tool = np.zeros(6, dtype=float)
-        a_mat = r_mat[0:2, 0:2]
-        b_vec = np.asarray(v_pos_base[0:2], dtype=float) - r_mat[0:2, 2] * float(v_force_tool[2])
-        v_xy, _, _, _ = np.linalg.lstsq(a_mat, b_vec, rcond=None)
-        v_cmd_tool[0:2] = v_xy
+        v_pos_tool = np.zeros(6, dtype=float)
+        v_pos_tool[:3] = r_mat.T @ np.asarray(v_pos_base[:3], dtype=float)
+        v_pos_tool[3:6] = r_mat.T @ np.asarray(v_pos_base[3:6], dtype=float)
+
+        v_cmd_tool = v_pos_tool.copy()
         v_cmd_tool[2] = float(v_force_tool[2])
-        v_cmd_tool[3:6] = r_mat.T @ np.asarray(v_pos_base[3:6], dtype=float)
         if normal_track:
             v_cmd_tool[3:6] += np.asarray(v_force_tool[3:6], dtype=float)
 
@@ -189,14 +213,14 @@ class AdmittanceController:
             v_force_tool[3] = -cfg.k_align * f_ext[1]
             v_force_tool[4] = cfg.k_align * f_ext[0]
 
-        v_cmd_tool, v_cmd_base = self.fuse_constrained_xy(
+        v_cmd_tool, v_cmd_base = self.fuse_tool_sleeve(
             v_pos_base, v_force_tool, r_mat, normal_track=normal_track,
         )
         if cfg.max_vz_tool_m_s > 0.0:
             v_cmd_tool[2] = float(np.clip(v_cmd_tool[2], -cfg.max_vz_tool_m_s, cfg.max_vz_tool_m_s))
             if cfg.control_frame == "base":
                 v_cmd_base[:3] = r_mat @ v_cmd_tool[:3]
-                v_cmd_base[3:] = r_mat @ v_cmd_tool[3:]
+                v_cmd_base[3:] = r_mat @ v_cmd_tool[3:6]
 
         v_out = v_cmd_tool if cfg.control_frame == "tool" else v_cmd_base
         v_clamp = np.clip(v_out, -cfg.max_velocity, cfg.max_velocity)
@@ -216,9 +240,10 @@ class AdmittanceController:
         if abs(f_err) > 5.0:
             self.force_error_integral[axis] = 0.0
 
+        eff = smooth_deadband_eff(f_err, cfg.deadband_n, cfg.deadband_width_n)
         k_fp = cfg.k_fp_press if f_err < 0 else cfg.k_fp_release
-        if abs(f_err) > cfg.deadband_n:
-            eff = f_err - math.copysign(cfg.deadband_n, f_err)
+
+        if abs(eff) > 1e-9:
             self.force_error_integral[axis] += eff * self.dt
             if axis == 2:
                 if f_err < 0:
@@ -234,7 +259,8 @@ class AdmittanceController:
             )
             v = k_fp * eff + cfg.k_fi * self.force_error_integral[axis]
         else:
-            v = cfg.k_fi * self.force_error_integral[axis]
+            v = 0.0
+
         if axis == 2:
             v = float(np.clip(v, -cfg.max_vz_tool_m_s, cfg.max_vz_tool_m_s))
         return v

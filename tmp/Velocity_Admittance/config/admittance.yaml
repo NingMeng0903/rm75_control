@@ -4,7 +4,7 @@
 
 timing:
   dt_ms: 10.0
-  async_poll_ms: 2.0
+  async_poll_ms: 10.0
 
 startup:
   pose_slot: d
