@@ -1,16 +1,19 @@
 # Demo trajectory plugin + tool-Z force hybrid.
 # Architecture (sleeve / slider):
-#   trajectory or visual Servo → vel_ff (+ optional Kp) in base frame
+#   trajectory → pose_d + vel_ff (base frame); other DOF constant except scan axis + optional spin
 #   controller → Tool-X/Y from R.T @ v_pos_base; Tool-Z from force admittance only
-#   No world-XY lstsq lock — Z reciprocation does not lateral drift
+#   open_loop: true → vel_ff only (245e676 stable baseline); loop respects yaml, no forced PBAC
 #
-# Phase 1: open_loop true, kp_pos all zero
-# Phase 2: weak PBAC — uncomment phase2 block
+# Phase 2 weak PBAC (only after open-loop OK on robot):
+#   open_loop: false, track_axes/kp_pos attitude-only — see commented block below
+#
+# Scan log (--log): python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y --log
+# Plot: python tmp/Velocity_Admittance/plot_scan_log.py logs/admittance_*.npz
 #
 # Run:
 #   source /media/camp/EXT_DRIVE/rm75_control/env.sh
 #   cd /media/camp/EXT_DRIVE/rm75_control
-#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y
+#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y --log
 
 timing:
   dt_ms: 10.0
@@ -63,8 +66,8 @@ controller:
   deadband_width_n: 0.2
   # --- Phase 2 weak PBAC (after open-loop OK) ---
   # open_loop: false
-  # track_axes: [0, 1, 0, 1, 1, 1]
-  # kp_pos: [0, 1.0, 0, 0.3, 0.3, 0.3]
+  # track_axes: [0, 0, 0, 1, 1, 1]
+  # kp_pos: [0, 0, 0, 0.15, 0.15, 0.15]
   system_delay_s: 0.015
   k_fp_press: 0.045
   k_fp_release: 0.025
@@ -74,3 +77,7 @@ controller:
   approach_vz_tool_m_s: 0.03
   max_velocity: [0.03, 0.10, 0.15, 0.15, 0.15, 0.35]
   max_acceleration: [0.5, 1.0, 0.5, 1.0, 1.0, 1.5]
+
+monitor:
+  log: false   # or --log on CLI
+  log_every: 1

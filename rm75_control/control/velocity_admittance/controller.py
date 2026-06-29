@@ -132,10 +132,13 @@ class AdmittanceController:
         self.cfg = config or AdmittanceConfig()
         self.force_error_integral = np.zeros(6)
         self.last_v_cmd = np.zeros(6)
+        self._contact_ticks = 0
 
-    def reset(self) -> None:
+    def reset(self, *, clear_velocity: bool = False) -> None:
         self.force_error_integral.fill(0.0)
-        self.last_v_cmd.fill(0.0)
+        self._contact_ticks = 0
+        if clear_velocity:
+            self.last_v_cmd.fill(0.0)
 
     @staticmethod
     def fuse_tool_sleeve(
@@ -173,6 +176,7 @@ class AdmittanceController:
         desired_force: np.ndarray,
         *,
         in_contact: bool | None = None,
+        enable_pbac: bool | None = None,
     ) -> np.ndarray:
         cfg = self.cfg
         r_mat = Rsc.from_euler(
@@ -188,7 +192,8 @@ class AdmittanceController:
 
         err_pose = pose_error(desired_pose, pose_predicted)
         vel_ff = np.asarray(desired_vel_ff, dtype=float).copy()
-        if cfg.open_loop:
+        use_pbac = (not cfg.open_loop) if enable_pbac is None else bool(enable_pbac)
+        if not use_pbac:
             err_pose[:] = 0.0
         kp = cfg.kp_pos * cfg.track_axes
         v_pos_base = vel_ff + kp * err_pose
@@ -202,11 +207,19 @@ class AdmittanceController:
         else:
             in_contact = bool(in_contact)
 
+        if in_contact:
+            self._contact_ticks += 1
+        else:
+            self._contact_ticks = 0
+        db_alpha = min(1.0, self._contact_ticks / 50.0)
+
         for axis in range(6):
             if cfg.force_axes[axis] < 0.5:
                 continue
             f_err = f_des[axis] - f_ext[axis]
-            v_force_tool[axis] = self._admittance_axis(axis, f_err, in_contact)
+            v_force_tool[axis] = self._admittance_axis(
+                axis, f_err, in_contact, db_alpha,
+            )
 
         normal_track = in_contact and cfg.enable_normal_tracking
         if normal_track:
@@ -229,7 +242,13 @@ class AdmittanceController:
         self.last_v_cmd = v_final.copy()
         return v_final
 
-    def _admittance_axis(self, axis: int, f_err: float, in_contact: bool) -> float:
+    def _admittance_axis(
+        self,
+        axis: int,
+        f_err: float,
+        in_contact: bool,
+        db_alpha: float = 1.0,
+    ) -> float:
         cfg = self.cfg
         if axis == 2 and not in_contact:
             self.force_error_integral[axis] = 0.0
@@ -240,7 +259,9 @@ class AdmittanceController:
         if abs(f_err) > 5.0:
             self.force_error_integral[axis] = 0.0
 
-        eff = smooth_deadband_eff(f_err, cfg.deadband_n, cfg.deadband_width_n)
+        actual_deadband = cfg.deadband_n * db_alpha
+        actual_width = cfg.deadband_width_n * db_alpha
+        eff = smooth_deadband_eff(f_err, actual_deadband, actual_width)
         k_fp = cfg.k_fp_press if f_err < 0 else cfg.k_fp_release
 
         if abs(eff) > 1e-9:

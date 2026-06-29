@@ -6,6 +6,12 @@ from rm75_control.control.velocity_admittance.controller import (
 )
 from rm75_control.control.velocity_admittance.loop import load_yaml, run_velocity_admittance
 from rm75_control.control.velocity_admittance.observer import CompensatedForceObserver
+from rm75_control.control.velocity_admittance.scan_log import (
+    ScanLogRecorder,
+    load_scan_log,
+    print_jerk_summary,
+    scan_tracking_world_mm,
+)
 from rm75_control.control.velocity_admittance.trajectory import (
     Trajectory6D,
     TrajectoryGenerator,
@@ -20,6 +26,10 @@ __all__ = [
     "AdmittanceConfig",
     "AdmittanceController",
     "CompensatedForceObserver",
+    "ScanLogRecorder",
+    "load_scan_log",
+    "print_jerk_summary",
+    "scan_tracking_world_mm",
     "Trajectory6D",
     "TrajectoryGenerator",
     "TrajectorySample",

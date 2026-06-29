@@ -12,6 +12,7 @@ import numpy as np
 @dataclass
 class AsyncStateSnapshot:
     pose: np.ndarray | None = None
+    q_deg: np.ndarray | None = None
     force_raw: np.ndarray = field(default_factory=lambda: np.zeros(6))
     t_s: float = 0.0
     ok: bool = False
@@ -63,6 +64,7 @@ class AsyncStateObserver:
                 )
             return AsyncStateSnapshot(
                 pose=self._snap.pose.copy(),
+                q_deg=self._snap.q_deg.copy() if self._snap.q_deg is not None else None,
                 force_raw=self._snap.force_raw.copy(),
                 t_s=self._snap.t_s,
                 ok=self._snap.ok,
@@ -76,12 +78,15 @@ class AsyncStateObserver:
             snap = AsyncStateSnapshot(t_s=t_s)
             if ret_s == 0:
                 snap.pose = np.asarray(st["pose"][:6], dtype=float)
+                snap.q_deg = np.asarray(st["joint"][:7], dtype=float)
             if ret_f == 0:
                 snap.force_raw = np.asarray(fd["force_data"][:6], dtype=float)
             snap.ok = snap.pose is not None and ret_f == 0
             with self._lock:
                 if snap.pose is not None:
                     self._snap.pose = snap.pose
+                if snap.q_deg is not None:
+                    self._snap.q_deg = snap.q_deg
                 if ret_f == 0:
                     self._snap.force_raw = snap.force_raw
                 self._snap.t_s = t_s

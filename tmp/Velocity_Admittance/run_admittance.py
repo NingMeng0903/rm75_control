@@ -22,6 +22,8 @@ def main() -> int:
     parser.add_argument("--trajectory", type=str, default=None)
     parser.add_argument("--desired-z", type=float, default=None, help="sensor Fz target (N)")
     parser.add_argument("--duration", type=float, default=None, help="run time (s)")
+    parser.add_argument("--log", action="store_true", help="record scan npz (pose_d vs pose_act)")
+    parser.add_argument("--log-path", type=Path, default=None)
     args = parser.parse_args()
 
     raw = load_yaml(args.config)
@@ -30,7 +32,12 @@ def main() -> int:
     if args.desired_z is not None:
         raw.setdefault("force", {})["desired_z_n"] = args.desired_z
 
-    return run_velocity_admittance(raw, duration_s=args.duration)
+    return run_velocity_admittance(
+        raw,
+        duration_s=args.duration,
+        log_enabled=args.log or args.log_path is not None,
+        log_path=args.log_path,
+    )
 
 
 if __name__ == "__main__":

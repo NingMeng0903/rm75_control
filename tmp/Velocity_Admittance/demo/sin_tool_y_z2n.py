@@ -31,6 +31,8 @@ def main() -> int:
     parser.add_argument("--y-pp-cm", type=float, default=None, help="world-Y peak-to-peak (cm)")
     parser.add_argument("--rz-deg", type=float, default=None, help="tool +Z spin amplitude (deg)")
     parser.add_argument("--duration", type=float, default=None, help="scan duration (s)")
+    parser.add_argument("--log", action="store_true", help="record pose_d vs pose_act npz every cycle")
+    parser.add_argument("--log-path", type=Path, default=None, help="npz output (default: tmp/Velocity_Admittance/logs/)")
     args = parser.parse_args()
 
     raw = load_yaml(args.config)
@@ -48,6 +50,8 @@ def main() -> int:
         raw,
         title="Demo 6D traj + tool-Z force",
         duration_s=args.duration,
+        log_enabled=args.log or args.log_path is not None,
+        log_path=args.log_path,
     )
 
 

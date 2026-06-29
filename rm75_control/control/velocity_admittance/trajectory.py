@@ -7,8 +7,24 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
+from scipy.spatial.transform import Rotation as Rsc
 
 from .rm_algo import end2tool_pose
+
+
+def tool_frame_delta_pose(
+    pose_ref: np.ndarray,
+    dx: float,
+    dy: float,
+    dz: float,
+    *,
+    euler_order: str = "xyz",
+) -> np.ndarray:
+    """Tool-frame translation without rm_algo RPC (matches frameMode=1 pure translation)."""
+    pose = np.asarray(pose_ref, dtype=float).copy()
+    r_mat = Rsc.from_euler(euler_order, pose[3:6], degrees=False).as_matrix()
+    pose[:3] = pose[:3] + r_mat @ np.array([dx, dy, dz], dtype=float)
+    return pose
 
 
 def tool_offset_pose(robot, ref_pose: list[float], dx: float, dy: float, dz: float) -> list[float]:
@@ -182,11 +198,9 @@ class TrajectoryGenerator:
         pose = np.asarray(
             tool_offset_pose(self.robot, list(self.pose0), 0.0, dy, 0.0), dtype=float
         )
-        pose_p = np.asarray(
-            tool_offset_pose(self.robot, list(self.pose0), 0.0, dy + vy * 1e-3, 0.0),
-            dtype=float,
-        )
-        vel = (pose_p - pose) / 1e-3
+        r_mat = Rsc.from_euler("xyz", pose[3:6], degrees=False).as_matrix()
+        vel = np.zeros(6, dtype=float)
+        vel[:3] = r_mat @ np.array([0.0, vy, 0.0], dtype=float)
         return TrajectorySample(pose, vel)
 
     @classmethod

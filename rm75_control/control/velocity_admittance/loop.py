@@ -17,6 +17,7 @@ from .async_state import AsyncStateObserver
 from .controller import AdmittanceConfig, AdmittanceController
 from .observer import CompensatedForceObserver
 from .paths import CONFIG_ROBOT, PHI_JSON
+from .scan_log import ScanLogRecorder, default_log_path, print_jerk_summary
 from .trajectory import TrajectoryGenerator, sin_period_for_peak_vel
 
 
@@ -102,6 +103,8 @@ def run_velocity_admittance(
     title: str = "Velocity admittance",
     duration_s: float | None = None,
     tool_hint: bool = True,
+    log_path: Path | None = None,
+    log_enabled: bool | None = None,
 ) -> int:
     if not PHI_JSON.exists():
         raise SystemExit(f"Missing {PHI_JSON} — run force_calibrate.py first")
@@ -131,6 +134,13 @@ def run_velocity_admittance(
         else str(pose_slot_raw).lower()
     )
     move_speed = startup.get("move_speed")
+
+    monitor = raw.get("monitor", {})
+    if log_enabled is None:
+        log_enabled = bool(monitor.get("log", False))
+    log_every = max(1, int(monitor.get("log_every", 1)))
+    if log_enabled and log_path is None:
+        log_path = default_log_path()
 
     ctrl_cfg = AdmittanceConfig.from_dict(raw)
     control_frame = ctrl_cfg.control_frame
@@ -184,6 +194,8 @@ def run_velocity_admittance(
         print(f"  startup pose: move_j → slot '{pose_slot}'", flush=True)
     if tool_hint:
         print("  Ensure gripper (or desired tool) is active in RM Web UI before contact tasks.")
+    if log_enabled:
+        print(f"  scan log: ON → {log_path}  every {log_every} cycle(s)", flush=True)
 
     from rm75_control import RobotSession
 
@@ -251,10 +263,10 @@ def run_velocity_admittance(
         init_velocity_canfd(bot.robot, vc_run, dt_ms)
         settle_movev_after_init(
             bot.robot, dt_ms=dt_ms, follow=follow,
-            trajectory_mode=traj_mode, radio=radio, n_frames=max(settle_frames, 30),
+            trajectory_mode=traj_mode, radio=radio, n_frames=max(settle_frames, 40),
         )
         ret_post, st_post = bot.robot.rm_get_current_arm_state()
-        snap_detected = False
+        pose_post = pose0.copy()
         if ret_post == 0:
             pose_post = np.asarray(st_post["pose"][:6], dtype=float)
             deuler = np.degrees(pose_post[3:6] - pose_pre[3:6])
@@ -267,17 +279,18 @@ def run_velocity_admittance(
                 flush=True,
             )
             snap_detected = (
-                float(np.max(np.abs(deuler))) > 0.5
-                or float(np.linalg.norm(dpos_mm)) > 2.0
+                float(np.max(np.abs(deuler))) > 0.8
+                or float(np.linalg.norm(dpos_mm)) > 3.0
             )
             if snap_detected:
                 print(
-                    "  WARN: init snap detected — extra zero-velocity settle",
+                    f"  WARN: init snap detected (Δpos={float(np.linalg.norm(dpos_mm)):.1f}mm)"
+                    f" — deep settle...",
                     flush=True,
                 )
                 settle_movev_after_init(
                     bot.robot, dt_ms=dt_ms, follow=follow,
-                    trajectory_mode=traj_mode, radio=radio, n_frames=50,
+                    trajectory_mode=traj_mode, radio=radio, n_frames=60,
                 )
                 ret_post2, st_post2 = bot.robot.rm_get_current_arm_state()
                 if ret_post2 == 0:
@@ -298,14 +311,19 @@ def run_velocity_admittance(
         except TimeoutError:
             async_obs.stop()
             raise SystemExit("AsyncStateObserver: no pose after CANFD init")
+        q_fb = np.zeros(7, dtype=float)
 
-        controller.reset()
+        controller.reset(clear_velocity=True)
         print("Velocity CANFD initialized. Ctrl+C to stop.", flush=True)
+
+        scan_log = ScanLogRecorder() if log_enabled else None
+        log_tick = 0
 
         t0 = time.monotonic()
         next_tick = t0
         last_log = t0
         scan_started = not wait_contact
+        pending_scan = False
         start_streak = 0
         t_scan0: float | None = None if wait_contact else t0
         f_ext = f_zero.copy()
@@ -332,6 +350,8 @@ def run_velocity_admittance(
                 snap = async_obs.read()
                 if snap.pose is not None:
                     pose_fb = snap.pose
+                    if snap.q_deg is not None:
+                        q_fb = snap.q_deg
                     observer.append(t_s, pose_fb, snap.force_raw)
                     wrench = observer.latest_wrench()
                     if wrench is not None:
@@ -358,19 +378,32 @@ def run_velocity_admittance(
                         else:
                             start_streak = 0
                         if start_streak >= auto_start_samples:
-                            scan_started = True
-                            t_scan0 = now
-                            traj_origin = pose.copy()
-                            traj.set_origin(traj_origin)
-                            controller.reset()
-                            print(
-                                f"  scan ON @ t={t_s:.1f}s  Fz={f_ext[2]:+.2f}N  traj={traj_kind}",
-                                flush=True,
-                            )
+                            pending_scan = True
+                            start_streak = 0
+
+                if pending_scan and not scan_started:
+                    pending_scan = False
+                    scan_started = True
+                    t_scan0 = now
+                    traj_origin = pose.copy()
+                    traj.set_origin(traj_origin)
+                    controller.reset(clear_velocity=ctrl_cfg.open_loop)
+                    print(
+                        f"  scan ON @ t={t_s:.1f}s  Fz={f_ext[2]:+.2f}N  traj={traj_kind}",
+                        flush=True,
+                    )
+
+                t_scan = (now - t_scan0) if (scan_started and t_scan0 is not None) else float("nan")
+                phase = 2 if scan_started else (1 if t_s >= hold_s else 0)
+                pose_d_log = np.zeros(6, dtype=float)
+                vel_ff_log = np.zeros(6, dtype=float)
+                f_des_z = float(desired_z)
 
                 if not scan_started:
                     if t_s < hold_s or (require_observer and not observer.ready()):
-                        v_cmd = [0.0] * 6
+                        v_cmd = np.zeros(6, dtype=float)
+                        phase = 0
+                        pose_d_log = pose.copy()
                     else:
                         since_approach = max(0.0, t_s - hold_s)
                         f_scale = (
@@ -378,27 +411,71 @@ def run_velocity_admittance(
                             if approach_ramp_s > 0
                             else 1.0
                         )
+                        f_des_z = float(desired_z * f_scale)
+                        pose_d_log = pose0.copy()
                         v_cmd = controller.compute_velocity_command(
                             pose, pose0, np.zeros(6), f_ext, f_des * f_scale,
                             in_contact=False,
+                            enable_pbac=False,
                         )
+                        phase = 1
                     send_velocity_canfd(
-                        bot.robot, np.asarray(v_cmd, dtype=float).tolist(),
+                        bot.robot, v_cmd.tolist(),
                         follow=follow, trajectory_mode=traj_mode, radio=radio,
                     )
+                    if scan_log is not None:
+                        log_tick += 1
+                        if log_tick >= log_every:
+                            log_tick = 0
+                            scan_log.append_row(
+                                t_s=t_s, t_scan=t_scan, phase=phase,
+                                pose_act=pose, q_deg=q_fb, pose_d=pose_d_log,
+                                vel_ff=vel_ff_log, v_cmd=v_cmd, f_ext=f_ext,
+                                f_des_z=f_des_z,
+                            )
                     continue
 
-                t_scan = now - t_scan0 if t_scan0 is not None else 0.0
                 sample = traj.sample(t_scan)
+                pose_d_log = sample.pose_d.copy()
+                vel_ff_log = sample.vel_ff.copy()
                 v_cmd = controller.compute_velocity_command(
                     pose, sample.pose_d, sample.vel_ff, f_ext, f_des,
+                    in_contact=True,
+                    enable_pbac=not ctrl_cfg.open_loop,
                 )
+                phase = 2
+
+                v_cmd = np.asarray(v_cmd, dtype=float)
+                if not np.all(np.isfinite(v_cmd)):
+                    print(
+                        f"  WARN: non-finite v_cmd {v_cmd} — sending zero (phase={phase})",
+                        flush=True,
+                    )
+                    v_cmd = np.zeros(6, dtype=float)
+
+                if scan_log is not None:
+                    log_tick += 1
+                    if log_tick >= log_every:
+                        log_tick = 0
+                        scan_log.append_row(
+                            t_s=t_s,
+                            t_scan=t_scan,
+                            phase=phase,
+                            pose_act=pose,
+                            q_deg=q_fb,
+                            pose_d=pose_d_log,
+                            vel_ff=vel_ff_log,
+                            v_cmd=v_cmd,
+                            f_ext=f_ext,
+                            f_des_z=f_des_z,
+                        )
+
                 send_velocity_canfd(
-                    bot.robot, np.asarray(v_cmd, dtype=float).tolist(),
+                    bot.robot, v_cmd.tolist(),
                     follow=follow, trajectory_mode=traj_mode, radio=radio,
                 )
 
-                if now - last_log >= 1.0:
+                if scan_started and now - last_log >= 1.0:
                     last_log = now
                     from .controller import wrap_pi
 
@@ -417,6 +494,22 @@ def run_velocity_admittance(
             print("\nStopped.", flush=True)
         finally:
             async_obs.stop()
+            if scan_log is not None and len(scan_log) > 0 and log_path is not None:
+                try:
+                    saved = scan_log.save(
+                        log_path,
+                        meta={
+                            "traj_kind": traj_kind,
+                            "dt_ms": dt_ms,
+                            "async_poll_ms": async_poll_ms,
+                            "control_frame": control_frame,
+                            "frame_type": frame_type,
+                        },
+                    )
+                    print(f"  scan log saved → {saved} ({len(scan_log)} samples)", flush=True)
+                    print_jerk_summary(saved, dt_s=dt_s)
+                except Exception as exc:
+                    print(f"  scan log save failed: {exc}", flush=True)
             try:
                 settle_movev_after_init(
                     bot.robot, dt_ms=dt_ms, follow=follow,

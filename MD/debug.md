@@ -1,40 +1,72 @@
 # RM75 力位混合速度导纳 — 完整代码包（debug）
 
-> 用途：第三方审阅 / 离线对照。内容与仓库源码 **一字不差**。
+> 用途：第三方审阅 / 离线对照。内容与仓库源码 **一字不差**（由 `scripts/gen_debug_va.py` 生成）。
 
-> 运行：`cd /media/camp/EXT_DRIVE/rm75_control && source env.sh && python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y`
+> 运行：
+> ```bash
+> cd /media/camp/EXT_DRIVE/rm75_control && source env.sh
+> python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y --log --duration 60
+> ```
+
+> 出图：
+> ```bash
+> python tmp/Velocity_Admittance/plot_scan_log.py tmp/Velocity_Admittance/logs/admittance_*.npz
+> python tmp/Velocity_Admittance/plot_scan_log.py logs/admittance_xxx.npz --save /tmp/plot.png
+> ```
 
 > 前置：`tmp/force_compensation/logs/force_id_phi.json`
 
 ## 目录
 
-- [零、模块关系](#零模块关系)
-- [一、入口](#一入口)
+- [零、架构与 log 诊断](#零架构与-log-诊断)
+- [一、入口与出图](#一入口与出图)
 - [二、velocity_admittance 包](#二velocity_admittance-包)
-- [三、运动下发与 Session](#三运动下发与-session)
-- [四、力补偿（phi → f_ext）](#四力补偿（phi-→-f_ext）)
-- [五、YAML 配置](#五yaml-配置)
-- [六、套筒融合公式](#六套筒融合公式)
+- [三、YAML](#三yaml)
+- [四、CANFD 下发](#四canfd-下发)
 
-## 零、模块关系
+## 零、架构与 log 诊断
 
 ```
 sin_tool_y_z2n.py → loop.run_velocity_admittance()
-  recover_controller → move_j(slot) → CANFD init → post-init anchor
-  AsyncStateObserver (~100Hz, async_poll_ms=10)
-  Trajectory / Servo → vel_ff (+ Kp·err when closed-loop)
-  phi observer → f_ext[2] → Tool-Z PI admittance (smooth deadband)
-  fuse_tool_sleeve: v_cmd_tool[0:1]=R.T@v_pos; v_cmd_tool[2]=v_force_z
-  rm_movev_canfd(frame_type=0)
+  recover → move_j(slot) → CANFD init → post-init anchor pose0
+  AsyncStateObserver (async_poll_ms=10)
+  phases: 0 hold | 1 approach (Z force, pose_d=anchor) | 2 scan (traj.sample)
+  scan ON: pending_scan → traj.set_origin(current pose); controller.reset(clear_velocity=False)
+  deadband ramp: _contact_ticks/50 → db_alpha scales deadband (scan ON bumpless Z)
+  CANFD init: settle max(frames,40); snap → deep settle 60 frames; re-anchor pose0
+  Trajectory → pose_d + vel_ff (constant DOF: vel_ff=0; sin_tool_y: tool-Y only)
+  fuse_tool_sleeve: v_cmd_tool[0:1]=R.T@v_pos; v_cmd_tool[2]=force PI
+  rm_movev_canfd(frame_type=0 tool)
+  --log → ScanLogRecorder → print_jerk_summary + plot_scan_log.py
 ```
 
-| 轴 | 职责 |
-|----|------|
-| Tool-Z | 力导纳套筒，沿法向进退，不锁世界坐标 |
-| Tool-X/Y | 轨迹前馈 / 视觉 Servo（vel_ff），Z 滑动时不侧向补偿 |
+| 维度 | 轨迹约束 | demo yaml（Phase2 已启用） |
+|------|----------|---------------------------|
+| tool-Y | sin, vel_ff | Kp=1.0 on track_axes[1] |
+| tool-X | 常数 | Kp=0 |
+| Rx,Ry,Rz | 常数 | Kp=1.0 姿态弱闭环 |
+| tool-Z | 力控 | kp=0；deadband ramp 0.5s；k_fp_press=0.035 |
 
+**三类跳变（勿混淆）**
 
-## 一、入口
+1. **CANFD init**（t≈0~2s）：movev 模式切入，非接触 — deep settle + re-anchor
+2. **scan ON**（t≈4s）：approach→scan 力律；db_alpha ramp 抹 vz 台阶
+3. **pitch slip**（t≈5~8s）：Fz 丢失 + 软接触 — Phase2 PBAC 抑制
+
+**跟踪评估（scan_log / plot）**
+
+- 原点：`pose_act` @ scan ON（`phase≥2` 首样本）
+- 指标：`tool-Y→world` = dot(Δpos, R0[:,1])；**不含 world-Z**（力控轴）
+- `world-XY |Δcmd−Δact|`：交叉轨
+- **Plot 仅画 scan 段位置**（pre-scan 用 scan0 参考会假 -200mm 误差）
+- scan ON 瞬间 log 中 cmd≈act≈0；CANFD init 与 scan ON 是不同事件
+
+**典型现象（软接触）**
+
+- Fz 周期性 &lt;1N → 滑移；pitch 漂 → world ΔX 放大（非少给 X 维）
+- v_cmd tool-Y 平滑 + pose 误差大 → 执行/接触，不是 fusion 尖峰
+
+## 一、入口与出图
 
 ### `tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py`
 
@@ -72,6 +104,8 @@ def main() -> int:
     parser.add_argument("--y-pp-cm", type=float, default=None, help="world-Y peak-to-peak (cm)")
     parser.add_argument("--rz-deg", type=float, default=None, help="tool +Z spin amplitude (deg)")
     parser.add_argument("--duration", type=float, default=None, help="scan duration (s)")
+    parser.add_argument("--log", action="store_true", help="record pose_d vs pose_act npz every cycle")
+    parser.add_argument("--log-path", type=Path, default=None, help="npz output (default: tmp/Velocity_Admittance/logs/)")
     args = parser.parse_args()
 
     raw = load_yaml(args.config)
@@ -89,13 +123,14 @@ def main() -> int:
         raw,
         title="Demo 6D traj + tool-Z force",
         duration_s=args.duration,
+        log_enabled=args.log or args.log_path is not None,
+        log_path=args.log_path,
     )
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
 ```
-
 ### `tmp/Velocity_Admittance/run_admittance.py`
 
 ```python
@@ -123,6 +158,8 @@ def main() -> int:
     parser.add_argument("--trajectory", type=str, default=None)
     parser.add_argument("--desired-z", type=float, default=None, help="sensor Fz target (N)")
     parser.add_argument("--duration", type=float, default=None, help="run time (s)")
+    parser.add_argument("--log", action="store_true", help="record scan npz (pose_d vs pose_act)")
+    parser.add_argument("--log-path", type=Path, default=None)
     args = parser.parse_args()
 
     raw = load_yaml(args.config)
@@ -131,13 +168,180 @@ def main() -> int:
     if args.desired_z is not None:
         raw.setdefault("force", {})["desired_z_n"] = args.desired_z
 
-    return run_velocity_admittance(raw, duration_s=args.duration)
+    return run_velocity_admittance(
+        raw,
+        duration_s=args.duration,
+        log_enabled=args.log or args.log_path is not None,
+        log_path=args.log_path,
+    )
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
 ```
+### `tmp/Velocity_Admittance/plot_scan_log.py`
 
+```python
+#!/usr/bin/env python3
+"""Plot admittance scan log — diagnose controller vs execution vs contact."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.spatial.transform import Rotation as Rsc
+
+from rm75_control.control.velocity_admittance.scan_log import (
+    load_scan_log,
+    scan_tracking_world_mm,
+)
+
+
+def _euler_delta_deg(pose: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    d = pose - ref
+    d[:, 3:6] = (d[:, 3:6] + np.pi) % (2 * np.pi) - np.pi
+    return np.degrees(d[:, 3:6])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Plot admittance scan log npz")
+    parser.add_argument("npz", type=Path)
+    parser.add_argument("--save", type=Path, default=None, help="PNG output (use if no display)")
+    parser.add_argument("--tmax", type=float, default=None, help="limit time axis (s)")
+    args = parser.parse_args()
+
+    d = load_scan_log(args.npz)
+    t = d["t_s"]
+    if args.tmax is not None:
+        m = t <= args.tmax
+        d = {k: v[m] if hasattr(v, "__len__") and len(v) == len(t) else v for k, v in d.items()}
+        t = d["t_s"]
+
+    v = d["v_cmd"]
+    vf = d["vel_ff"]
+    pose = d["pose_act"]
+    pose_d = d["pose_d"]
+    f = d["f_ext"]
+    phase = d["phase"]
+    scan = phase >= 2
+    si = int(np.where(scan)[0][0]) if np.any(scan) else 0
+    t_scan_on = float(t[si]) if np.any(scan) else 0.0
+    dt_ms = np.concatenate([[np.nan], np.diff(t) * 1000.0])
+
+    deuler = _euler_delta_deg(pose, pose[si])
+    tr = scan_tracking_world_mm(pose_d, pose, scan_mask=scan if np.any(scan) else np.ones(len(t), dtype=bool))
+    d_cmd = tr["d_cmd_mm"].copy()
+    d_act = tr["d_act_mm"].copy()
+    s_cmd = tr["s_cmd_mm"].copy()
+    s_act = tr["s_act_mm"].copy()
+    track_err = tr["scan_track_err_mm"].copy()
+    # Pre-scan: pose_d / ref frame differ (hold logs zeros, approach logs post-init pose0).
+    # Mask so position panels only show scan tracking (cmd=act at scan ON).
+    pre = ~scan
+    d_cmd[pre] = np.nan
+    d_act[pre] = np.nan
+    s_cmd[pre] = np.nan
+    s_act[pre] = np.nan
+    track_err[pre] = np.nan
+
+    vy_ff_tool = np.zeros(len(t))
+    for i in range(len(t)):
+        r = Rsc.from_euler("xyz", pose[i, 3:6], degrees=False).as_matrix()
+        vy_ff_tool[i] = (r.T @ vf[i, :3])[1]
+
+    fig, axes = plt.subplots(7, 1, figsize=(13, 14), sharex=True)
+    fig.suptitle(
+        f"{args.npz.name}  scan position vs scan0 (pre-scan masked); vel: full run"
+    )
+
+    ax = axes[0]
+    ax.plot(t, v[:, 1], "C0", lw=0.8, label="v_cmd tool-Y")
+    ax.plot(t, vy_ff_tool, "C1", lw=0.8, alpha=0.7, label="R.T@vel_ff tool-Y")
+    ax.axvline(t[si], color="gray", ls="--", lw=0.8, label="scan ON")
+    ax.set_ylabel("tool Y vel (m/s)")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    ax.plot(t, v[:, 2], "C2", lw=0.8, label="v_cmd tool-Z")
+    ax.set_ylabel("tool Z vel")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[2]
+    ax.plot(t, f[:, 2], "C3", lw=0.8, label="Fz ext")
+    ax.axhline(3.0, color="r", ls="--", lw=0.8, label="Fz des 3N")
+    ax.axhline(1.0, color="orange", ls=":", lw=0.8, label="contact loss ~1N")
+    ax.set_ylabel("Fz (N)")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[3]
+    ax.plot(t, deuler[:, 1], label="Δpitch deg")
+    ax.plot(t, deuler[:, 2], label="Δyaw deg", alpha=0.8)
+    ax.set_ylabel("Δeuler vs scan0")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[4]
+    ax.plot(t, s_cmd, "C1", lw=0.9, ls="--", label="cmd tool-Y→world")
+    ax.plot(t, s_act, "C0", lw=0.9, label="act tool-Y→world")
+    ax.plot(t, track_err, "C3", lw=0.6, alpha=0.7, label="track err")
+    ax.axvline(t_scan_on, color="gray", ls="--", lw=0.8)
+    if np.any(scan):
+        ax.scatter([t_scan_on], [0.0], c="k", s=12, zorder=5, label="scan ON cmd≈act")
+    ax.set_ylabel("scan axis mm")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[5]
+    ax.plot(t, d_cmd[:, 1], "C3", lw=0.8, ls="--", label="cmd ΔY world")
+    ax.plot(t, d_act[:, 1], "C2", lw=0.8, label="act ΔY world")
+    ax.set_ylabel("world ΔY mm")
+    ax.legend(loc="upper right", fontsize=7)
+    ax.grid(True, alpha=0.3)
+    ax2 = ax.twinx()
+    ax2.plot(t, d_cmd[:, 0], "C1", lw=0.8, ls=":", alpha=0.9, label="cmd ΔX")
+    ax2.plot(t, d_act[:, 0], "C0", lw=0.6, alpha=0.8, label="act ΔX")
+    ax2.set_ylabel("world ΔX mm (right)")
+    cx = float(np.max(np.abs(d_cmd[scan, 0]))) if np.any(scan) else 0.0
+    ax.text(
+        0.02, 0.04,
+        f"sin_tool_y: 1 DOF tool-Y only; cmd ΔX≈±{cx:.1f}mm from tilt\n"
+        "act ΔX blow-up = contact slip + pitch drift (not missing X cmd)",
+        transform=ax.transAxes,
+        fontsize=7,
+        va="bottom",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.35),
+    )
+
+    ax = axes[6]
+    ax.plot(t, dt_ms, "k", lw=0.6, alpha=0.7)
+    ax.axhline(10, color="g", ls="--", lw=0.8)
+    ax.axhline(15, color="r", ls=":", lw=0.8)
+    ax.set_ylabel("loop dt ms")
+    ax.set_xlabel("t (s)")
+    ax.grid(True, alpha=0.3)
+
+    for ax in axes:
+        ax.fill_between(t, ax.get_ylim()[0], ax.get_ylim()[1], where=scan, alpha=0.04, color="blue")
+
+    fig.tight_layout()
+    if args.save:
+        args.save.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(args.save, dpi=130)
+        print(f"saved → {args.save}")
+    else:
+        plt.show()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
 ## 二、velocity_admittance 包
 
 ### `rm75_control/control/velocity_admittance/__init__.py`
@@ -151,6 +355,12 @@ from rm75_control.control.velocity_admittance.controller import (
 )
 from rm75_control.control.velocity_admittance.loop import load_yaml, run_velocity_admittance
 from rm75_control.control.velocity_admittance.observer import CompensatedForceObserver
+from rm75_control.control.velocity_admittance.scan_log import (
+    ScanLogRecorder,
+    load_scan_log,
+    print_jerk_summary,
+    scan_tracking_world_mm,
+)
 from rm75_control.control.velocity_admittance.trajectory import (
     Trajectory6D,
     TrajectoryGenerator,
@@ -165,6 +375,10 @@ __all__ = [
     "AdmittanceConfig",
     "AdmittanceController",
     "CompensatedForceObserver",
+    "ScanLogRecorder",
+    "load_scan_log",
+    "print_jerk_summary",
+    "scan_tracking_world_mm",
     "Trajectory6D",
     "TrajectoryGenerator",
     "TrajectorySample",
@@ -174,7 +388,6 @@ __all__ = [
     "run_velocity_admittance",
 ]
 ```
-
 ### `rm75_control/control/velocity_admittance/paths.py`
 
 ```python
@@ -192,7 +405,6 @@ DEMO_CONFIG_DIR = VA_DATA_DIR / "demo" / "config"
 CONFIG_ADMITTANCE = CONFIG_DIR / "admittance.yaml"
 CONFIG_SIN_TOOL_Y_Z2N = DEMO_CONFIG_DIR / "sin_tool_y_z2n.yaml"
 ```
-
 ### `rm75_control/control/velocity_admittance/async_state.py`
 
 ```python
@@ -210,6 +422,7 @@ import numpy as np
 @dataclass
 class AsyncStateSnapshot:
     pose: np.ndarray | None = None
+    q_deg: np.ndarray | None = None
     force_raw: np.ndarray = field(default_factory=lambda: np.zeros(6))
     t_s: float = 0.0
     ok: bool = False
@@ -261,6 +474,7 @@ class AsyncStateObserver:
                 )
             return AsyncStateSnapshot(
                 pose=self._snap.pose.copy(),
+                q_deg=self._snap.q_deg.copy() if self._snap.q_deg is not None else None,
                 force_raw=self._snap.force_raw.copy(),
                 t_s=self._snap.t_s,
                 ok=self._snap.ok,
@@ -274,19 +488,21 @@ class AsyncStateObserver:
             snap = AsyncStateSnapshot(t_s=t_s)
             if ret_s == 0:
                 snap.pose = np.asarray(st["pose"][:6], dtype=float)
+                snap.q_deg = np.asarray(st["joint"][:7], dtype=float)
             if ret_f == 0:
                 snap.force_raw = np.asarray(fd["force_data"][:6], dtype=float)
             snap.ok = snap.pose is not None and ret_f == 0
             with self._lock:
                 if snap.pose is not None:
                     self._snap.pose = snap.pose
+                if snap.q_deg is not None:
+                    self._snap.q_deg = snap.q_deg
                 if ret_f == 0:
                     self._snap.force_raw = snap.force_raw
                 self._snap.t_s = t_s
                 self._snap.ok = snap.ok
             time.sleep(self.poll_s)
 ```
-
 ### `rm75_control/control/velocity_admittance/controller.py`
 
 ```python
@@ -424,10 +640,13 @@ class AdmittanceController:
         self.cfg = config or AdmittanceConfig()
         self.force_error_integral = np.zeros(6)
         self.last_v_cmd = np.zeros(6)
+        self._contact_ticks = 0
 
-    def reset(self) -> None:
+    def reset(self, *, clear_velocity: bool = False) -> None:
         self.force_error_integral.fill(0.0)
-        self.last_v_cmd.fill(0.0)
+        self._contact_ticks = 0
+        if clear_velocity:
+            self.last_v_cmd.fill(0.0)
 
     @staticmethod
     def fuse_tool_sleeve(
@@ -465,6 +684,7 @@ class AdmittanceController:
         desired_force: np.ndarray,
         *,
         in_contact: bool | None = None,
+        enable_pbac: bool | None = None,
     ) -> np.ndarray:
         cfg = self.cfg
         r_mat = Rsc.from_euler(
@@ -480,7 +700,8 @@ class AdmittanceController:
 
         err_pose = pose_error(desired_pose, pose_predicted)
         vel_ff = np.asarray(desired_vel_ff, dtype=float).copy()
-        if cfg.open_loop:
+        use_pbac = (not cfg.open_loop) if enable_pbac is None else bool(enable_pbac)
+        if not use_pbac:
             err_pose[:] = 0.0
         kp = cfg.kp_pos * cfg.track_axes
         v_pos_base = vel_ff + kp * err_pose
@@ -494,11 +715,19 @@ class AdmittanceController:
         else:
             in_contact = bool(in_contact)
 
+        if in_contact:
+            self._contact_ticks += 1
+        else:
+            self._contact_ticks = 0
+        db_alpha = min(1.0, self._contact_ticks / 50.0)
+
         for axis in range(6):
             if cfg.force_axes[axis] < 0.5:
                 continue
             f_err = f_des[axis] - f_ext[axis]
-            v_force_tool[axis] = self._admittance_axis(axis, f_err, in_contact)
+            v_force_tool[axis] = self._admittance_axis(
+                axis, f_err, in_contact, db_alpha,
+            )
 
         normal_track = in_contact and cfg.enable_normal_tracking
         if normal_track:
@@ -521,7 +750,13 @@ class AdmittanceController:
         self.last_v_cmd = v_final.copy()
         return v_final
 
-    def _admittance_axis(self, axis: int, f_err: float, in_contact: bool) -> float:
+    def _admittance_axis(
+        self,
+        axis: int,
+        f_err: float,
+        in_contact: bool,
+        db_alpha: float = 1.0,
+    ) -> float:
         cfg = self.cfg
         if axis == 2 and not in_contact:
             self.force_error_integral[axis] = 0.0
@@ -532,7 +767,9 @@ class AdmittanceController:
         if abs(f_err) > 5.0:
             self.force_error_integral[axis] = 0.0
 
-        eff = smooth_deadband_eff(f_err, cfg.deadband_n, cfg.deadband_width_n)
+        actual_deadband = cfg.deadband_n * db_alpha
+        actual_width = cfg.deadband_width_n * db_alpha
+        eff = smooth_deadband_eff(f_err, actual_deadband, actual_width)
         k_fp = cfg.k_fp_press if f_err < 0 else cfg.k_fp_release
 
         if abs(eff) > 1e-9:
@@ -557,7 +794,6 @@ class AdmittanceController:
             v = float(np.clip(v, -cfg.max_vz_tool_m_s, cfg.max_vz_tool_m_s))
         return v
 ```
-
 ### `rm75_control/control/velocity_admittance/trajectory.py`
 
 ```python
@@ -570,8 +806,24 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
+from scipy.spatial.transform import Rotation as Rsc
 
 from .rm_algo import end2tool_pose
+
+
+def tool_frame_delta_pose(
+    pose_ref: np.ndarray,
+    dx: float,
+    dy: float,
+    dz: float,
+    *,
+    euler_order: str = "xyz",
+) -> np.ndarray:
+    """Tool-frame translation without rm_algo RPC (matches frameMode=1 pure translation)."""
+    pose = np.asarray(pose_ref, dtype=float).copy()
+    r_mat = Rsc.from_euler(euler_order, pose[3:6], degrees=False).as_matrix()
+    pose[:3] = pose[:3] + r_mat @ np.array([dx, dy, dz], dtype=float)
+    return pose
 
 
 def tool_offset_pose(robot, ref_pose: list[float], dx: float, dy: float, dz: float) -> list[float]:
@@ -745,11 +997,9 @@ class TrajectoryGenerator:
         pose = np.asarray(
             tool_offset_pose(self.robot, list(self.pose0), 0.0, dy, 0.0), dtype=float
         )
-        pose_p = np.asarray(
-            tool_offset_pose(self.robot, list(self.pose0), 0.0, dy + vy * 1e-3, 0.0),
-            dtype=float,
-        )
-        vel = (pose_p - pose) / 1e-3
+        r_mat = Rsc.from_euler("xyz", pose[3:6], degrees=False).as_matrix()
+        vel = np.zeros(6, dtype=float)
+        vel[:3] = r_mat @ np.array([0.0, vy, 0.0], dtype=float)
         return TrajectorySample(pose, vel)
 
     @classmethod
@@ -772,7 +1022,6 @@ class TrajectoryGenerator:
             robot,
         )
 ```
-
 ### `rm75_control/control/velocity_admittance/observer.py`
 
 ```python
@@ -888,7 +1137,278 @@ class CompensatedForceObserver:
             )
         )
 ```
+### `rm75_control/control/velocity_admittance/scan_log.py`
 
+```python
+"""High-rate scan log: target trajectory vs actual encoder feedback."""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import numpy as np
+
+from rm75_control.control.velocity_admittance.paths import VA_DATA_DIR
+
+
+LOG_DIR = VA_DATA_DIR / "logs"
+_GROW = 512
+
+
+class ScanLogRecorder:
+    """Pre-allocated ring growth — minimal per-tick overhead."""
+
+    def __init__(self, *, capacity: int = 4096) -> None:
+        self._cap = capacity
+        self._n = 0
+        self.t_s = np.zeros(capacity, dtype=float)
+        self.t_scan = np.full(capacity, np.nan, dtype=float)
+        self.phase = np.zeros(capacity, dtype=np.int8)
+        self.pose_act = np.zeros((capacity, 6), dtype=float)
+        self.q_deg = np.zeros((capacity, 7), dtype=float)
+        self.pose_d = np.zeros((capacity, 6), dtype=float)
+        self.vel_ff = np.zeros((capacity, 6), dtype=float)
+        self.v_cmd = np.zeros((capacity, 6), dtype=float)
+        self.f_ext = np.zeros((capacity, 6), dtype=float)
+        self.f_des_z = np.zeros(capacity, dtype=float)
+
+    def __len__(self) -> int:
+        return self._n
+
+    def _grow(self) -> None:
+        new_cap = self._cap + _GROW
+        for name in (
+            "t_s", "t_scan", "phase", "f_des_z",
+        ):
+            old = getattr(self, name)
+            ext = np.zeros(new_cap, dtype=old.dtype)
+            ext[: self._cap] = old
+            if name == "t_scan":
+                ext[self._cap :] = np.nan
+            setattr(self, name, ext)
+        for name in ("pose_act", "pose_d", "vel_ff", "v_cmd", "f_ext"):
+            old = getattr(self, name)
+            ext = np.zeros((new_cap, 6), dtype=float)
+            ext[: self._cap] = old
+            setattr(self, name, ext)
+        old = self.q_deg
+        ext = np.zeros((new_cap, 7), dtype=float)
+        ext[: self._cap] = old
+        self.q_deg = ext
+        self._cap = new_cap
+
+    def append_row(
+        self,
+        *,
+        t_s: float,
+        t_scan: float,
+        phase: int,
+        pose_act: np.ndarray,
+        q_deg: np.ndarray,
+        pose_d: np.ndarray,
+        vel_ff: np.ndarray,
+        v_cmd: np.ndarray,
+        f_ext: np.ndarray,
+        f_des_z: float,
+    ) -> None:
+        if self._n >= self._cap:
+            self._grow()
+        i = self._n
+        self.t_s[i] = t_s
+        self.t_scan[i] = t_scan
+        self.phase[i] = phase
+        self.pose_act[i] = pose_act
+        self.q_deg[i] = q_deg
+        self.pose_d[i] = pose_d
+        self.vel_ff[i] = vel_ff
+        self.v_cmd[i] = v_cmd
+        self.f_ext[i] = f_ext
+        self.f_des_z[i] = f_des_z
+        self._n += 1
+
+    def save(self, path: Path, *, meta: dict | None = None) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        n = self._n
+        if n == 0:
+            raise ValueError("ScanLogRecorder: no samples")
+        pack = {
+            "t_s": self.t_s[:n].copy(),
+            "t_scan": self.t_scan[:n].copy(),
+            "phase": self.phase[:n].copy(),
+            "pose_act": self.pose_act[:n].copy(),
+            "q_deg": self.q_deg[:n].copy(),
+            "pose_d": self.pose_d[:n].copy(),
+            "vel_ff": self.vel_ff[:n].copy(),
+            "v_cmd": self.v_cmd[:n].copy(),
+            "f_ext": self.f_ext[:n].copy(),
+            "f_des_z": self.f_des_z[:n].copy(),
+        }
+        if meta:
+            pack["meta_json"] = np.array([str(meta)])
+        np.savez_compressed(path, **pack)
+        return path
+
+
+def default_log_path(prefix: str = "admittance") -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return LOG_DIR / f"{prefix}_{stamp}.npz"
+
+
+def load_scan_log(path: Path) -> dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as z:
+        return {k: z[k] for k in z.files}
+
+
+def scan_origin_r(pose_act: np.ndarray, scan_mask: np.ndarray) -> tuple[int, np.ndarray, np.ndarray]:
+    """Scan ON index, pose0, and R0 (tool orientation in world at scan start)."""
+    from scipy.spatial.transform import Rotation as Rsc
+
+    idx = np.where(scan_mask)[0]
+    if len(idx) == 0:
+        return 0, pose_act[0].copy(), np.eye(3)
+    si = int(idx[0])
+    pose0 = pose_act[si].copy()
+    r0 = Rsc.from_euler("xyz", pose0[3:6], degrees=False).as_matrix()
+    return si, pose0, r0
+
+
+def world_delta_mm(pose: np.ndarray, pose0: np.ndarray) -> np.ndarray:
+    """TCP linear displacement vs scan origin, in world frame (mm)."""
+    return (pose[:, :3] - pose0[:3]) * 1000.0
+
+
+def tool_y_world_scalar_mm(delta_world_mm: np.ndarray, r0: np.ndarray) -> np.ndarray:
+    """Tool-Y scan progress: world displacement projected onto tool +Y at scan ON."""
+    e_scan = r0[:, 1]
+    return delta_world_mm @ e_scan
+
+
+def scan_tracking_world_mm(
+    pose_d: np.ndarray,
+    pose_act: np.ndarray,
+    *,
+    scan_mask: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """
+    Decoupled scan tracking in world frame.
+
+    Compare commanded vs actual TCP world deltas from scan origin. TCP-Z is force-controlled:
+    use scan-axis scalar (tool-Y in world @ scan0) and world-XY cross-track, not world-Z.
+    """
+    si, pose0, r0 = scan_origin_r(pose_act, scan_mask)
+    d_cmd = world_delta_mm(pose_d, pose0)
+    d_act = world_delta_mm(pose_act, pose0)
+    s_cmd = tool_y_world_scalar_mm(d_cmd, r0)
+    s_act = tool_y_world_scalar_mm(d_act, r0)
+    dxy_err = (d_cmd[:, :2] - d_act[:, :2])
+    return {
+        "d_cmd_mm": d_cmd,
+        "d_act_mm": d_act,
+        "s_cmd_mm": s_cmd,
+        "s_act_mm": s_act,
+        "scan_track_err_mm": s_cmd - s_act,
+        "world_xy_err_mm": np.linalg.norm(dxy_err, axis=1),
+        "scan_idx": si,
+        "r0": r0,
+    }
+
+
+def print_jerk_summary(path: Path, *, dt_s: float) -> None:
+    """Print v_cmd / pose tracking diagnostics to separate planner vs execution."""
+    data = load_scan_log(path)
+    t = data["t_s"]
+    v = data["v_cmd"]
+    pose_act = data["pose_act"]
+    pose_d = data["pose_d"]
+    phase = data["phase"]
+    n = len(t)
+    if n < 3:
+        print(f"  log summary: too few samples ({n})", flush=True)
+        return
+
+    dv = np.diff(v, axis=0) / np.maximum(np.diff(t)[:, None], 1e-6)
+    jerk_proxy = np.diff(dv, axis=0) / np.maximum(np.diff(t)[1:, None], 1e-6)
+    scan_mask = phase >= 2
+    mask = scan_mask if np.any(scan_mask) else np.ones(n, dtype=bool)
+
+    idx = np.where(mask)[0]
+    idx = idx[(idx > 0) & (idx < n - 2)]
+    if len(idx) == 0:
+        idx = np.arange(1, min(n - 2, n))
+
+    finite_dv = np.isfinite(dv).all(axis=1)
+    finite_jk = np.isfinite(jerk_proxy).all(axis=1) if len(jerk_proxy) else np.array([True])
+    idx_dv = idx[np.isin(idx - 1, np.where(finite_dv)[0])]
+    idx_jk = idx[np.isin(idx - 2, np.where(finite_jk)[0])]
+
+    dv_n = np.linalg.norm(dv[idx_dv - 1], axis=1) if len(idx_dv) else np.array([0.0])
+    jk_n = (
+        np.linalg.norm(jerk_proxy[idx_jk - 2], axis=1)
+        if len(idx_jk) and len(jerk_proxy)
+        else np.array([0.0])
+    )
+
+    tr = scan_tracking_world_mm(pose_d, pose_act, scan_mask=mask)
+    idx_scan = np.where(mask)[0]
+    s_cmd = tr["s_cmd_mm"][idx_scan] if len(idx_scan) else np.array([0.0])
+    s_act = tr["s_act_mm"][idx_scan] if len(idx_scan) else np.array([0.0])
+    scan_track = np.abs(tr["scan_track_err_mm"][idx_scan]) if len(idx_scan) else np.array([0.0])
+    xy_cross = tr["world_xy_err_mm"][idx_scan] if len(idx_scan) else np.array([0.0])
+
+    loop_dt = np.diff(t[scan_mask]) * 1000.0 if np.any(scan_mask) else np.diff(t) * 1000.0
+    loop_dt = loop_dt[np.isfinite(loop_dt)]
+
+    print("\n=== scan log summary ===", flush=True)
+    print(f"  file: {path}", flush=True)
+    print(f"  samples={n}  scan_samples={int(np.sum(scan_mask))}  dt_nom={dt_s*1000:.1f}ms", flush=True)
+    if len(loop_dt):
+        print(
+            f"  loop dt ms: median={float(np.median(loop_dt)):.2f}  "
+            f"max={float(np.max(loop_dt)):.2f}  "
+            f">15ms={int(np.sum(loop_dt > 15))}/{len(loop_dt)}",
+            flush=True,
+        )
+    print(
+        f"  |dv_cmd| max={float(np.nanmax(dv_n)) if len(dv_n) else 0:.4f} m/s²  "
+        f"p95={float(np.nanpercentile(dv_n, 95)) if len(dv_n) else 0:.4f}  "
+        f"|jerk_proxy| max={float(np.nanmax(jk_n)) if len(jk_n) else 0:.2f}",
+        flush=True,
+    )
+    if len(idx_scan):
+        print(
+            f"  tool-Y world (scan axis @ scan0): track err max={float(np.max(scan_track)):.2f} mm  "
+            f"p95={float(np.percentile(scan_track, 95)):.2f} mm  "
+            f"(world-Z decoupled — force axis)",
+            flush=True,
+        )
+        print(
+            f"  tool-Y world stroke  cmd [{float(s_cmd.min()):+.1f}, {float(s_cmd.max()):+.1f}] mm  "
+            f"act [{float(s_act.min()):+.1f}, {float(s_act.max()):+.1f}] mm  "
+            f"world-XY |Δcmd−Δact| p95={float(np.percentile(xy_cross, 95)):.2f} mm",
+            flush=True,
+        )
+        print(
+            "  (large world track err + smooth v_cmd tool-Y → execution/contact slip)",
+            flush=True,
+        )
+    for axis, name in enumerate(["vx", "vy", "vz", "wx", "wy", "wz"]):
+        col = v[scan_mask, axis] if np.any(scan_mask) else v[:, axis]
+        col = col[np.isfinite(col)]
+        if len(col) < 2:
+            continue
+        dcol = np.diff(col) / dt_s
+        dcol = dcol[np.isfinite(dcol)]
+        if len(dcol) == 0:
+            continue
+        spikes = int(np.sum(np.abs(dcol) > 3.0 * float(np.std(dcol) + 1e-9)))
+        print(
+            f"  v_cmd {name}: std={float(np.std(col)):.5f}  "
+            f"|dv/dt| max={float(np.max(np.abs(dcol))):.4f}  spikes(>3σ)={spikes}",
+            flush=True,
+        )
+```
 ### `rm75_control/control/velocity_admittance/loop.py`
 
 ```python
@@ -911,6 +1431,7 @@ from .async_state import AsyncStateObserver
 from .controller import AdmittanceConfig, AdmittanceController
 from .observer import CompensatedForceObserver
 from .paths import CONFIG_ROBOT, PHI_JSON
+from .scan_log import ScanLogRecorder, default_log_path, print_jerk_summary
 from .trajectory import TrajectoryGenerator, sin_period_for_peak_vel
 
 
@@ -996,6 +1517,8 @@ def run_velocity_admittance(
     title: str = "Velocity admittance",
     duration_s: float | None = None,
     tool_hint: bool = True,
+    log_path: Path | None = None,
+    log_enabled: bool | None = None,
 ) -> int:
     if not PHI_JSON.exists():
         raise SystemExit(f"Missing {PHI_JSON} — run force_calibrate.py first")
@@ -1025,6 +1548,13 @@ def run_velocity_admittance(
         else str(pose_slot_raw).lower()
     )
     move_speed = startup.get("move_speed")
+
+    monitor = raw.get("monitor", {})
+    if log_enabled is None:
+        log_enabled = bool(monitor.get("log", False))
+    log_every = max(1, int(monitor.get("log_every", 1)))
+    if log_enabled and log_path is None:
+        log_path = default_log_path()
 
     ctrl_cfg = AdmittanceConfig.from_dict(raw)
     control_frame = ctrl_cfg.control_frame
@@ -1078,6 +1608,8 @@ def run_velocity_admittance(
         print(f"  startup pose: move_j → slot '{pose_slot}'", flush=True)
     if tool_hint:
         print("  Ensure gripper (or desired tool) is active in RM Web UI before contact tasks.")
+    if log_enabled:
+        print(f"  scan log: ON → {log_path}  every {log_every} cycle(s)", flush=True)
 
     from rm75_control import RobotSession
 
@@ -1145,10 +1677,10 @@ def run_velocity_admittance(
         init_velocity_canfd(bot.robot, vc_run, dt_ms)
         settle_movev_after_init(
             bot.robot, dt_ms=dt_ms, follow=follow,
-            trajectory_mode=traj_mode, radio=radio, n_frames=max(settle_frames, 30),
+            trajectory_mode=traj_mode, radio=radio, n_frames=max(settle_frames, 40),
         )
         ret_post, st_post = bot.robot.rm_get_current_arm_state()
-        snap_detected = False
+        pose_post = pose0.copy()
         if ret_post == 0:
             pose_post = np.asarray(st_post["pose"][:6], dtype=float)
             deuler = np.degrees(pose_post[3:6] - pose_pre[3:6])
@@ -1161,17 +1693,18 @@ def run_velocity_admittance(
                 flush=True,
             )
             snap_detected = (
-                float(np.max(np.abs(deuler))) > 0.5
-                or float(np.linalg.norm(dpos_mm)) > 2.0
+                float(np.max(np.abs(deuler))) > 0.8
+                or float(np.linalg.norm(dpos_mm)) > 3.0
             )
             if snap_detected:
                 print(
-                    "  WARN: init snap detected — extra zero-velocity settle",
+                    f"  WARN: init snap detected (Δpos={float(np.linalg.norm(dpos_mm)):.1f}mm)"
+                    f" — deep settle...",
                     flush=True,
                 )
                 settle_movev_after_init(
                     bot.robot, dt_ms=dt_ms, follow=follow,
-                    trajectory_mode=traj_mode, radio=radio, n_frames=50,
+                    trajectory_mode=traj_mode, radio=radio, n_frames=60,
                 )
                 ret_post2, st_post2 = bot.robot.rm_get_current_arm_state()
                 if ret_post2 == 0:
@@ -1192,14 +1725,19 @@ def run_velocity_admittance(
         except TimeoutError:
             async_obs.stop()
             raise SystemExit("AsyncStateObserver: no pose after CANFD init")
+        q_fb = np.zeros(7, dtype=float)
 
-        controller.reset()
+        controller.reset(clear_velocity=True)
         print("Velocity CANFD initialized. Ctrl+C to stop.", flush=True)
+
+        scan_log = ScanLogRecorder() if log_enabled else None
+        log_tick = 0
 
         t0 = time.monotonic()
         next_tick = t0
         last_log = t0
         scan_started = not wait_contact
+        pending_scan = False
         start_streak = 0
         t_scan0: float | None = None if wait_contact else t0
         f_ext = f_zero.copy()
@@ -1226,6 +1764,8 @@ def run_velocity_admittance(
                 snap = async_obs.read()
                 if snap.pose is not None:
                     pose_fb = snap.pose
+                    if snap.q_deg is not None:
+                        q_fb = snap.q_deg
                     observer.append(t_s, pose_fb, snap.force_raw)
                     wrench = observer.latest_wrench()
                     if wrench is not None:
@@ -1252,19 +1792,32 @@ def run_velocity_admittance(
                         else:
                             start_streak = 0
                         if start_streak >= auto_start_samples:
-                            scan_started = True
-                            t_scan0 = now
-                            traj_origin = pose.copy()
-                            traj.set_origin(traj_origin)
-                            controller.reset()
-                            print(
-                                f"  scan ON @ t={t_s:.1f}s  Fz={f_ext[2]:+.2f}N  traj={traj_kind}",
-                                flush=True,
-                            )
+                            pending_scan = True
+                            start_streak = 0
+
+                if pending_scan and not scan_started:
+                    pending_scan = False
+                    scan_started = True
+                    t_scan0 = now
+                    traj_origin = pose.copy()
+                    traj.set_origin(traj_origin)
+                    controller.reset(clear_velocity=False)
+                    print(
+                        f"  scan ON @ t={t_s:.1f}s  Fz={f_ext[2]:+.2f}N  traj={traj_kind}",
+                        flush=True,
+                    )
+
+                t_scan = (now - t_scan0) if (scan_started and t_scan0 is not None) else float("nan")
+                phase = 2 if scan_started else (1 if t_s >= hold_s else 0)
+                pose_d_log = np.zeros(6, dtype=float)
+                vel_ff_log = np.zeros(6, dtype=float)
+                f_des_z = float(desired_z)
 
                 if not scan_started:
                     if t_s < hold_s or (require_observer and not observer.ready()):
-                        v_cmd = [0.0] * 6
+                        v_cmd = np.zeros(6, dtype=float)
+                        phase = 0
+                        pose_d_log = pose.copy()
                     else:
                         since_approach = max(0.0, t_s - hold_s)
                         f_scale = (
@@ -1272,27 +1825,71 @@ def run_velocity_admittance(
                             if approach_ramp_s > 0
                             else 1.0
                         )
+                        f_des_z = float(desired_z * f_scale)
+                        pose_d_log = pose0.copy()
                         v_cmd = controller.compute_velocity_command(
                             pose, pose0, np.zeros(6), f_ext, f_des * f_scale,
                             in_contact=False,
+                            enable_pbac=False,
                         )
+                        phase = 1
                     send_velocity_canfd(
-                        bot.robot, np.asarray(v_cmd, dtype=float).tolist(),
+                        bot.robot, v_cmd.tolist(),
                         follow=follow, trajectory_mode=traj_mode, radio=radio,
                     )
+                    if scan_log is not None:
+                        log_tick += 1
+                        if log_tick >= log_every:
+                            log_tick = 0
+                            scan_log.append_row(
+                                t_s=t_s, t_scan=t_scan, phase=phase,
+                                pose_act=pose, q_deg=q_fb, pose_d=pose_d_log,
+                                vel_ff=vel_ff_log, v_cmd=v_cmd, f_ext=f_ext,
+                                f_des_z=f_des_z,
+                            )
                     continue
 
-                t_scan = now - t_scan0 if t_scan0 is not None else 0.0
                 sample = traj.sample(t_scan)
+                pose_d_log = sample.pose_d.copy()
+                vel_ff_log = sample.vel_ff.copy()
                 v_cmd = controller.compute_velocity_command(
                     pose, sample.pose_d, sample.vel_ff, f_ext, f_des,
+                    in_contact=True,
+                    enable_pbac=True,
                 )
+                phase = 2
+
+                v_cmd = np.asarray(v_cmd, dtype=float)
+                if not np.all(np.isfinite(v_cmd)):
+                    print(
+                        f"  WARN: non-finite v_cmd {v_cmd} — sending zero (phase={phase})",
+                        flush=True,
+                    )
+                    v_cmd = np.zeros(6, dtype=float)
+
+                if scan_log is not None:
+                    log_tick += 1
+                    if log_tick >= log_every:
+                        log_tick = 0
+                        scan_log.append_row(
+                            t_s=t_s,
+                            t_scan=t_scan,
+                            phase=phase,
+                            pose_act=pose,
+                            q_deg=q_fb,
+                            pose_d=pose_d_log,
+                            vel_ff=vel_ff_log,
+                            v_cmd=v_cmd,
+                            f_ext=f_ext,
+                            f_des_z=f_des_z,
+                        )
+
                 send_velocity_canfd(
-                    bot.robot, np.asarray(v_cmd, dtype=float).tolist(),
+                    bot.robot, v_cmd.tolist(),
                     follow=follow, trajectory_mode=traj_mode, radio=radio,
                 )
 
-                if now - last_log >= 1.0:
+                if scan_started and now - last_log >= 1.0:
                     last_log = now
                     from .controller import wrap_pi
 
@@ -1311,6 +1908,22 @@ def run_velocity_admittance(
             print("\nStopped.", flush=True)
         finally:
             async_obs.stop()
+            if scan_log is not None and len(scan_log) > 0 and log_path is not None:
+                try:
+                    saved = scan_log.save(
+                        log_path,
+                        meta={
+                            "traj_kind": traj_kind,
+                            "dt_ms": dt_ms,
+                            "async_poll_ms": async_poll_ms,
+                            "control_frame": control_frame,
+                            "frame_type": frame_type,
+                        },
+                    )
+                    print(f"  scan log saved → {saved} ({len(scan_log)} samples)", flush=True)
+                    print_jerk_summary(saved, dt_s=dt_s)
+                except Exception as exc:
+                    print(f"  scan log save failed: {exc}", flush=True)
             try:
                 settle_movev_after_init(
                     bot.robot, dt_ms=dt_ms, follow=follow,
@@ -1322,7 +1935,6 @@ def run_velocity_admittance(
 
     return 0
 ```
-
 ### `rm75_control/control/velocity_admittance/rm_algo.py`
 
 ```python
@@ -1347,8 +1959,154 @@ def end2tool_pose(robot, pose6: list[float]) -> list[float]:
 def end2tool_xyz(robot, pose6: list[float]) -> list[float]:
     return end2tool_pose(robot, pose6)[:3]
 ```
+## 三、YAML
 
-## 三、运动下发与 Session
+### `tmp/Velocity_Admittance/demo/config/sin_tool_y_z2n.yaml`
+
+```yaml
+# Demo trajectory plugin + tool-Z force hybrid.
+# Architecture (sleeve / slider):
+#   trajectory → pose_d + vel_ff (base frame); other DOF constant except scan axis + optional spin
+#   controller → Tool-X/Y from R.T @ v_pos_base; Tool-Z from force admittance only
+#   open_loop: false + scan-only PBAC (see loop enable_pbac); attitude kp only, Y=vel_ff
+#
+# Scan log (--log): phase 0 hold pose_d=pose_act; phase 1 pose_d=post-init anchor;
+#   phase 2 pose_d from traj.sample; scan ON → traj.set_origin(current pose), cmd≈act@scan0
+# Plot: python tmp/Velocity_Admittance/plot_scan_log.py logs/admittance_*.npz
+#   Position panels mask pre-scan (avoid false -200mm cmd vs scan0 ref)
+#
+# Run:
+#   source /media/camp/EXT_DRIVE/rm75_control/env.sh
+#   cd /media/camp/EXT_DRIVE/rm75_control
+#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y --log
+
+timing:
+  dt_ms: 10.0
+  async_poll_ms: 10.0
+
+startup:
+  pose_slot: d
+  settle_frames: 40
+  hold_s: 1.0
+  auto_recover: true
+  wait_contact: true
+  auto_start_under_n: 0.5
+  auto_start_hold_s: 0.5
+  approach_ramp_s: 1.5
+
+frames:
+  euler_order: xyz
+  control_frame: tool
+
+velocity_canfd:
+  frame_type: 0
+  avoid_singularity: 0
+  follow: true
+  trajectory_mode: 0
+  radio: 0
+
+force:
+  phi_source: phi_recommended
+  buffer_s: 2.0
+  min_samples: 22
+  fc_hz: 4.0
+  use_inertia: false
+  desired_z_n: 3.0
+
+trajectory:
+  type: sin_base_y_tool_rz    # hold | sin_tool_y | sin_base_y | sin_base_y_tool_rz
+  y_peak_to_peak_cm: 16.0
+  rz_amplitude_deg: 12.0
+  y_max_vel_cm_s: 3.0
+  soft_start: true
+  ramp_s: 2.0
+  open_loop: true
+
+controller:
+  force_axes: [0, 0, 1, 0, 0, 0]   # tool TCP-Z force; f_ext[2] when sensor parallel flange
+  open_loop: false
+  # Scan-only PBAC (loop enable_pbac=False during approach). Y via vel_ff only; lock attitude.
+  track_axes: [0, 0, 0, 1, 1, 1]
+  kp_pos: [0.0, 0.0, 0.0, 0.3, 0.3, 0.3]
+  deadband_n: 0.3
+  deadband_width_n: 0.2
+  system_delay_s: 0.015
+  k_fp_press: 0.035
+  k_fp_release: 0.025
+  k_fi: 0.001
+  integral_limit: 0.015
+  max_vz_tool_m_s: 0.15
+  approach_vz_tool_m_s: 0.03
+  max_velocity: [0.03, 0.10, 0.15, 0.10, 0.10, 0.10]
+  max_acceleration: [0.5, 1.0, 0.5, 0.3, 0.3, 0.3]
+
+monitor:
+  log: false   # or --log on CLI
+  log_every: 1  # 2 = half rate if needed; control loop always 100Hz
+```
+### `tmp/Velocity_Admittance/config/admittance.yaml`
+
+```yaml
+# Velocity admittance — library: rm75_control.control.velocity_admittance
+# Generic: python tmp/Velocity_Admittance/run_admittance.py
+# Demo:    python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
+
+timing:
+  dt_ms: 10.0
+  async_poll_ms: 10.0
+
+startup:
+  pose_slot: d
+
+frames:
+  euler_order: xyz   # rm_get_current_arm_state pose; match configs/force_sensor.yaml
+
+velocity_canfd:
+  frame_type: 1          # 0 tool, 1 work/base — v_cmd output is base frame
+  avoid_singularity: 0
+  follow: true
+  trajectory_mode: 0     # 0 passthrough — smoothing in controller only
+  radio: 0
+
+force:
+  phi_source: phi_recommended
+  buffer_s: 4.0
+  min_samples: 35
+  use_inertia: false     # no virtual mass — PI admittance only (Keemink §5.4)
+  desired_z_n: 3.0
+
+trajectory:
+  type: sin_tool_y       # hold | sin_tool_y | sin_base_y
+  amplitude_mm: 5.0
+  period_s: null         # auto from y_max_vel_cm_s if null
+  y_max_vel_cm_s: 1.0
+
+controller:
+  force_axes: [0, 0, 1, 0, 0, 0]   # 1 = admittance on axis (sensor frame)
+  motion_axes: [0, 1, 0, 0, 0, 0]
+  lock_orientation: true
+  enable_normal_tracking: false
+  kp_pos: [2.0, 2.0, 0.0, 1.5, 1.5, 1.5]
+  system_delay_s: 0.015
+  k_fp_press: 0.015
+  k_fp_release: 0.005
+  k_fi: 0.008
+  integral_limit: 0.05
+  k_align: 0.0
+  contact_threshold_n: 0.5
+  deadband_n: 0.3
+  max_vz_tool_m_s: 0.05
+  max_velocity: [0.2, 0.2, 0.05, 0.08, 0.08, 0.08]
+  max_acceleration: [1.0, 1.0, 0.05, 0.15, 0.15, 0.15]
+  release_vz_up_m_s: 0.05
+  release_vz_down_m_s: 0.05
+
+monitor:
+  enabled: false
+  window_s: 25.0
+  refresh_hz: 12.0
+```
+## 四、CANFD 下发
 
 ### `rm75_control/motion/canfd.py`
 
@@ -1438,1109 +2196,14 @@ def send_velocity_canfd(
         raise MotionError(f"rm_movev_canfd failed with code {ret}")
 ```
 
-### `rm75_control/core/session.py`
-
-```python
-"""Robot session: connect, mode switching, high-level entry point."""
-
-from __future__ import annotations
-
-import time
-from pathlib import Path
-from typing import Any, Sequence
-
-import yaml
-
-from rm75_control.backend.realman import RealManBackend
-from rm75_control.control.cartesian_pose import (
-    CartesianPoseController,
-    CartesianPoseStreamConfig,
-)
-from rm75_control.core.exceptions import ControlModeError, MotionError
-from rm75_control.core.types import ControlMode
-from rm75_control.force.scan import ForceScanConfig, ForceScanController
-
-Pose6 = Sequence[float]
-
-
-class RobotSession:
-    """Top-level facade for init -> cartesian path -> reset workflows."""
-
-    def __init__(
-        self,
-        ip: str | None = None,
-        port: int | None = None,
-        config: str | Path | None = None,
-        *,
-        dry_run: bool = False,
-    ) -> None:
-        self._config = self._load_config(config)
-        robot_cfg = self._config.get("robot", {})
-        self.ip = ip or robot_cfg.get("ip", "192.168.1.18")
-        self.port = port or robot_cfg.get("port", 8080)
-        self.thread_mode = robot_cfg.get("thread_mode", 2)
-        self.dry_run = dry_run
-        self.mode = ControlMode.IDLE
-        self._backend: RealManBackend | None = None
-        self._force_scan: ForceScanController | None = None
-
-    @staticmethod
-    def _load_config(config: str | Path | None) -> dict[str, Any]:
-        if config is None:
-            return {}
-        path = Path(config)
-        with path.open("r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-
-    @property
-    def backend(self) -> RealManBackend:
-        if self._backend is None:
-            raise RuntimeError("RobotSession is not connected")
-        return self._backend
-
-    @property
-    def robot(self):
-        return self.backend.robot
-
-    def connect(self) -> None:
-        print(f"Connecting to {self.ip}:{self.port}...", flush=True)
-        self._backend = RealManBackend(
-            self.ip,
-            self.port,
-            thread_mode=self.thread_mode,
-        )
-        if not self.dry_run:
-            self._backend.connect()
-        self.mode = ControlMode.IDLE
-        print("Connected.", flush=True)
-
-    def disconnect(self) -> None:
-        if self._backend is not None and not self.dry_run:
-            self.stop_all(hard=False)
-            self._backend.disconnect()
-        self._backend = None
-        self.mode = ControlMode.IDLE
-
-    def stop_motion(self, *, hard: bool = False) -> None:
-        if self.dry_run or self._backend is None:
-            self.mode = ControlMode.IDLE
-            return
-        if self.mode == ControlMode.FORCE_SCAN:
-            raise ControlModeError(
-                "In FORCE_SCAN mode; call stop_force_scan() before stop_motion()"
-            )
-        ret = (
-            self.robot.rm_set_arm_stop()
-            if hard
-            else self.robot.rm_set_arm_slow_stop()
-        )
-        if ret != 0:
-            raise MotionError(f"stop motion failed with code {ret}")
-        self.mode = ControlMode.IDLE
-
-    def stop_force_scan(self) -> None:
-        if self._force_scan is not None:
-            self._force_scan.stop()
-            self._force_scan = None
-        self.mode = ControlMode.IDLE
-
-    def stop_all(self, *, hard: bool = False) -> None:
-        """Stop force scan (if active) then stop planned/canfd motion."""
-        self.stop_force_scan()
-        if self._backend is not None and not self.dry_run:
-            self.stop_motion(hard=hard)
-
-    def _wait_planning_idle(self, timeout_s: float = 10.0) -> bool:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            traj = self.robot.rm_get_arm_current_trajectory()
-            if traj.get("return_code") == 0 and traj.get("trajectory_type", 0) == 0:
-                return True
-            time.sleep(0.05)
-        return False
-
-    def prepare_for_force_stream(self, *, settle_s: float = 1.0) -> dict[str, Any]:
-        """
-        Exit planned force (rm_set_force_position) and stale CANFD force modes.
-
-        rm_set_force_position + rm_start_force_position_move must never overlap;
-        a failed mix can leave the controller rejecting stream start until recovery.
-        """
-        diag: dict[str, Any] = {}
-        try:
-            diag["stop_force_move"] = self.robot.rm_stop_force_position_move()
-        except Exception:
-            diag["stop_force_move"] = -999
-        diag["stop_force"] = self.robot.rm_stop_force_position()
-        traj = self.robot.rm_get_arm_current_trajectory()
-        diag["trajectory_type"] = traj.get("trajectory_type", -1)
-        if traj.get("trajectory_type", 0) != 0:
-            diag["slow_stop"] = self.robot.rm_set_arm_slow_stop()
-            diag["planning_idle"] = self._wait_planning_idle()
-        if settle_s > 0.0:
-            time.sleep(settle_s)
-        return diag
-
-    def recover_controller(
-        self,
-        *,
-        settle_s: float = 1.0,
-        clear_errors: bool = True,
-        probe_force_stream: bool = False,
-    ) -> dict[str, Any]:
-        """
-        Full controller cleanup before velocity CANFD (run every session start).
-
-        Clears latched errors, exits force/plan modes, waits for planner idle.
-        Optional force-stream probe unsticks rm_set_force_position conflicts.
-        """
-        diag: dict[str, Any] = {}
-        if clear_errors:
-            try:
-                diag["clear_system_err"] = self.robot.rm_clear_system_err()
-            except Exception:
-                diag["clear_system_err"] = -999
-            time.sleep(0.3)
-            ret, st = self.robot.rm_get_current_arm_state()
-            if ret == 0:
-                err = st.get("err", {})
-                diag["system_err"] = list(err.get("err", []))[: int(err.get("err_len", 0))]
-
-        if not self.dry_run and self._backend is not None:
-            self.stop_all(hard=False)
-        diag.update(self.prepare_for_force_stream(settle_s=0.0))
-        try:
-            diag["delete_traj"] = self.robot.rm_set_arm_delete_trajectory()
-        except Exception:
-            diag["delete_traj"] = -999
-        diag["slow_stop"] = self.robot.rm_set_arm_slow_stop()
-        diag["planning_idle"] = self._wait_planning_idle(timeout_s=8.0)
-
-        if probe_force_stream and not self.dry_run:
-            try:
-                ret = self.robot.rm_start_force_position_move()
-                diag["force_stream_probe"] = ret
-                if ret == 0:
-                    self.robot.rm_stop_force_position_move()
-                    time.sleep(0.3)
-            except Exception:
-                diag["force_stream_probe"] = -999
-
-        if settle_s > 0.0:
-            time.sleep(settle_s)
-
-        traj = self.robot.rm_get_arm_current_trajectory()
-        diag["trajectory_type_final"] = traj.get("trajectory_type", -1)
-        ret, st = self.robot.rm_get_current_arm_state()
-        if ret == 0:
-            diag["pose_euler_deg"] = [
-                round(float(v) * 180.0 / 3.141592653589793, 3) for v in st["pose"][3:6]
-            ]
-        self.mode = ControlMode.IDLE
-        return diag
-
-    def start_force_scan(self, **overrides: Any) -> ForceScanController:
-        self.stop_force_scan()
-        if self._backend is not None and not self.dry_run and self.mode != ControlMode.IDLE:
-            self.stop_motion(hard=False)
-        cfg = ForceScanConfig.from_config(self._config, **overrides)
-        self._force_scan = ForceScanController(
-            self.robot if not self.dry_run else _DryRunForceClient(),
-            cfg,
-            dry_run=self.dry_run,
-        )
-        last_err: MotionError | None = None
-        for attempt in range(5):
-            if self._backend is not None and not self.dry_run:
-                diag = self.prepare_for_force_stream(settle_s=2.0 if attempt else 1.0)
-                if attempt:
-                    print(f"force stream recover attempt {attempt}: {diag}", flush=True)
-            try:
-                self._force_scan.start()
-                last_err = None
-                break
-            except MotionError as exc:
-                last_err = exc
-        if last_err is not None:
-            raise MotionError(
-                f"{last_err}. Planned force (rm_set_force_position) and stream force "
-                f"(rm_start_force_position_move) cannot be mixed. Run "
-                f"python /media/camp/EXT_DRIVE/rm75_control/tmp/recover_force_stream.py "
-                f"or stop/power-cycle on the teach pendant."
-            ) from last_err
-        self.mode = ControlMode.FORCE_SCAN
-        return self._force_scan
-
-    def _ensure_idle(self) -> None:
-        if self.mode == ControlMode.FORCE_SCAN:
-            raise ControlModeError(
-                "In FORCE_SCAN mode; call stop_force_scan() first"
-            )
-        if self.mode not in (ControlMode.IDLE, ControlMode.PTP_PLANNED):
-            raise ControlModeError(
-                f"Cannot start motion while mode={self.mode.name}; call stop_motion() first"
-            )
-
-    def move_joints(
-        self,
-        joint: Sequence[float],
-        *,
-        velocity_percent: int | None = None,
-        block: int = 1,
-    ) -> None:
-        if self.dry_run:
-            self.mode = ControlMode.IDLE
-            return
-
-        self._ensure_idle()
-        motion = self._config.get("motion", {})
-        v = velocity_percent or motion.get("default_velocity_percent", 20)
-        self.mode = ControlMode.PTP_PLANNED
-        ret = self.robot.rm_movej(list(joint), v, 0, 0, block)
-        self.mode = ControlMode.IDLE
-        if ret != 0:
-            raise MotionError(f"rm_movej failed with code {ret}")
-
-    def move_cartesian_path(
-        self,
-        waypoints: Sequence[Pose6],
-        *,
-        use_ruckig: bool | None = None,
-        follow: bool | None = None,
-        trajectory_mode: int | None = None,
-        radio: int | None = None,
-        period_ms: float | None = None,
-        steps_per_segment: int | None = None,
-    ) -> None:
-        """Cartesian pose CANFD. Native rm_movep_canfd params preserved; use_ruckig is the only extra switch."""
-        self._ensure_idle()
-        cfg = CartesianPoseStreamConfig.from_config(
-            self._config,
-            use_ruckig=use_ruckig,
-            follow=follow,
-            trajectory_mode=trajectory_mode,
-            radio=radio,
-            period_ms=period_ms,
-            steps_per_segment=steps_per_segment,
-        )
-        controller = CartesianPoseController(
-            self.robot if not self.dry_run else _DryRunCanfdClient(),
-            cfg,
-            dry_run=self.dry_run,
-        )
-        start_pose = None
-        if not self.dry_run and self._backend is not None:
-            try:
-                start_pose = self._backend.get_tcp_pose()
-            except Exception:
-                start_pose = None
-        self.mode = ControlMode.CARTESIAN_POSE_CANFD
-        try:
-            controller.run(waypoints, start_pose=start_pose)
-        finally:
-            self.mode = ControlMode.IDLE
-
-    def run_init_path_reset(
-        self,
-        home_joint: Sequence[float],
-        path_waypoints: Sequence[Pose6],
-        *,
-        use_ruckig: bool | None = None,
-        follow: bool | None = None,
-        trajectory_mode: int | None = None,
-        radio: int | None = None,
-    ) -> None:
-        self.move_joints(home_joint)
-        self.move_cartesian_path(
-            path_waypoints,
-            use_ruckig=use_ruckig,
-            follow=follow,
-            trajectory_mode=trajectory_mode,
-            radio=radio,
-        )
-        self.stop_motion(hard=False)
-        self.move_joints(home_joint)
-
-    def __enter__(self) -> RobotSession:
-        self.connect()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.disconnect()
-
-
-class _DryRunCanfdClient:
-    def rm_movep_canfd(self, pose, follow, trajectory_mode=0, radio=0) -> int:
-        return 0
-
-
-class _DryRunForceClient:
-    def rm_start_force_position_move(self) -> int:
-        return 0
-
-    def rm_stop_force_position_move(self) -> int:
-        return 0
-
-    def rm_force_position_move(self, param) -> int:
-        return 0
-```
-
-## 四、力补偿（phi → f_ext）
-
-### `rm75_control/force/compensation/paths.py`
-
-```python
-"""Shared paths for force-ID data and configs (under tmp/force_compensation)."""
-
-from __future__ import annotations
-
-from pathlib import Path
-
-REPO = Path(__file__).resolve().parents[3]
-DATA_DIR = REPO / "tmp" / "force_compensation"
-CONFIG_DIR = DATA_DIR / "config"
-LOG_DIR = DATA_DIR / "logs"
-CONFIG_ROBOT = REPO / "configs" / "rm75f_default.yaml"
-CONFIG_FORCE = REPO / "configs" / "force_sensor.yaml"
-CONFIG_ID = CONFIG_DIR / "force_id.yaml"
-POSES_YAML = CONFIG_DIR / "poses.yaml"
-PHI_JSON = LOG_DIR / "force_id_phi.json"
-
-POSE_SLOTS = ("a", "b", "c", "d")
-
-
-def npz_for_slot(slot: str) -> Path:
-    return LOG_DIR / f"force_id_pose_{slot}.npz"
-```
-
-### `rm75_control/force/compensation/regressor.py`
-
-```python
-"""Newton-Euler regressor: kinematics + W matrix for force compensation ID."""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import Path
-
-import numpy as np
-import yaml
-from scipy.signal import butter, filtfilt
-from scipy.spatial.transform import Rotation as Rsc
-
-PHI_NAMES = [
-    "m",
-    "mc_x",
-    "mc_y",
-    "mc_z",
-    "Ixx",
-    "Iyy",
-    "Izz",
-    "Ixy",
-    "Ixz",
-    "Iyz",
-    "Fx0",
-    "Fy0",
-    "Fz0",
-    "Mx0",
-    "My0",
-    "Mz0",
-]
-
-
-@dataclass(frozen=True)
-class FrameConfig:
-    force_sign: tuple[int, ...]
-    euler_order: str
-    offset_rad: tuple[float, float, float]
-    origin_in_link7_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    gravity_base: tuple[float, float, float] = (0.0, 0.0, -9.80665)
-
-    def label(self) -> str:
-        fs = ",".join(str(int(s)) for s in self.force_sign)
-        off = "0" if self.offset_rad == (0.0, 0.0, 0.0) else ",".join(
-            f"{v:.2f}" for v in self.offset_rad
-        )
-        return f"sign=[{fs}] order={self.euler_order} off=[{off}]"
-
-    @classmethod
-    def from_yaml(cls, path: Path) -> FrameConfig:
-        data = yaml.safe_load(path.read_text())
-        return cls(
-            force_sign=tuple(int(x) for x in data["force_sign"]),
-            euler_order=str(data["euler_order"]),
-            offset_rad=tuple(float(x) for x in data["sensor_offset_euler_xyz_rad"]),
-            origin_in_link7_m=tuple(
-                float(x) for x in data.get("sensor_origin_in_link7_m", [0.0, 0.0, 0.0])
-            ),
-            gravity_base=tuple(float(x) for x in data["gravity_base"]),
-        )
-
-
-def com_from_phi(phi: np.ndarray, cfg: FrameConfig) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Center of mass position (m) from identified phi.
-
-    mc is the first mass moment in the **sensor** frame: mc = m * r_com_sensor.
-    link7 frame: R_link7_sensor @ r_com_sensor + sensor origin in link7,
-    with R_link7_sensor = R_off from sensor_offset_euler (same as regressor).
-    """
-    m = float(phi[0])
-    if m <= 1e-9:
-        z = np.zeros(3, dtype=float)
-        return z, z
-    r_sensor = np.asarray(phi[1:4], dtype=float) / m
-    if cfg.offset_rad != (0.0, 0.0, 0.0):
-        r_off = Rsc.from_euler("xyz", cfg.offset_rad, degrees=False).as_matrix()
-        r_link7 = r_off @ r_sensor
-    else:
-        r_link7 = r_sensor.copy()
-    r_link7 = r_link7 + np.asarray(cfg.origin_in_link7_m, dtype=float)
-    return r_sensor, r_link7
-
-
-def com_dict_mm(r_m: np.ndarray) -> dict[str, float]:
-    r_mm = np.asarray(r_m, dtype=float) * 1000.0
-    return {
-        "Cx": float(r_mm[0]),
-        "Cy": float(r_mm[1]),
-        "Cz": float(r_mm[2]),
-    }
-
-
-def skew(v: np.ndarray) -> np.ndarray:
-    return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-
-
-def inertia_op(w: np.ndarray) -> np.ndarray:
-    wx, wy, wz = w
-    return np.array(
-        [[wx, 0, 0, wy, wz, 0], [0, wy, 0, wx, 0, wz], [0, 0, wz, 0, wx, wy]]
-    )
-
-
-def R_base_sensor(pose6: np.ndarray, cfg: FrameConfig) -> np.ndarray:
-    R = Rsc.from_euler(cfg.euler_order, pose6[3:6], degrees=False).as_matrix()
-    if cfg.offset_rad != (0.0, 0.0, 0.0):
-        R_off = Rsc.from_euler("xyz", cfg.offset_rad, degrees=False).as_matrix()
-        R = R @ R_off
-    return R
-
-
-def apply_sign(raw6: np.ndarray, sign: tuple[int, ...]) -> np.ndarray:
-    return raw6 * np.array(sign, dtype=float)
-
-
-def filtfilt_cols(x: np.ndarray, fs: float, fc: float) -> np.ndarray:
-    if len(x) < 30:
-        return x
-    b, a = butter(2, min(fc / (0.5 * fs), 0.99), btype="low")
-    return filtfilt(b, a, x, axis=0)
-
-
-def kinematics_sensor(
-    pose: np.ndarray, t: np.ndarray, cfg: FrameConfig, fc: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    fs = 1.0 / np.mean(np.diff(t))
-    euler = pose[:, 3:6].copy()
-    for j in range(3):
-        euler[:, j] = np.unwrap(euler[:, j])
-
-    p_f = filtfilt_cols(pose[:, :3], fs, fc)
-    v_b = np.gradient(p_f, t, axis=0)
-    a_b = np.gradient(filtfilt_cols(v_b, fs, fc * 0.8), t, axis=0)
-
-    n = len(t)
-    omega_s = np.zeros((n, 3))
-    a_s = np.zeros((n, 3))
-    g_s = np.zeros((n, 3))
-    g_base = np.asarray(cfg.gravity_base, dtype=float)
-
-    for i in range(n):
-        p6 = np.concatenate([pose[i, :3], euler[i]])
-        R = R_base_sensor(p6, cfg)
-        if i == 0:
-            R1 = R_base_sensor(np.concatenate([pose[1, :3], euler[1]]), cfg)
-            dR = (R1 - R) / max(t[1] - t[0], 1e-6)
-        elif i == n - 1:
-            R0 = R_base_sensor(np.concatenate([pose[i - 1, :3], euler[i - 1]]), cfg)
-            dR = (R - R0) / max(t[-1] - t[-2], 1e-6)
-        else:
-            Rp = R_base_sensor(np.concatenate([pose[i + 1, :3], euler[i + 1]]), cfg)
-            Rm = R_base_sensor(np.concatenate([pose[i - 1, :3], euler[i - 1]]), cfg)
-            dR = (Rp - Rm) / max(t[i + 1] - t[i - 1], 1e-6)
-        sk = dR @ R.T
-        w = np.array([sk[2, 1] - sk[1, 2], sk[0, 2] - sk[2, 0], sk[1, 0] - sk[0, 1]]) / 2
-        omega_s[i] = R.T @ w
-        a_s[i] = R.T @ a_b[i]
-        g_s[i] = R.T @ g_base
-
-    omega_s = filtfilt_cols(omega_s, fs, fc * 0.8)
-    alpha_s = np.gradient(filtfilt_cols(omega_s, fs, fc * 0.6), t, axis=0)
-    a_s = filtfilt_cols(a_s, fs, fc * 0.8)
-    return omega_s, alpha_s, a_s, g_s
-
-
-def regressor_row(
-    a_s: np.ndarray,
-    g_s: np.ndarray,
-    omega_s: np.ndarray,
-    alpha_s: np.ndarray,
-    *,
-    use_inertia: bool,
-) -> np.ndarray:
-    aeq = a_s - g_s
-    w, al = omega_s, alpha_s
-    sw, sa = skew(w), skew(al)
-    W = np.zeros((6, 16))
-    W[0:3, 0] = aeq
-    W[0:3, 1:4] = sa + sw @ sw
-    W[3:6, 1:4] = -skew(aeq)
-    if use_inertia:
-        W[3:6, 4:10] = inertia_op(al) + sw @ inertia_op(w)
-    W[:, 10:16] = np.eye(6)
-    return W
-
-
-def build_dataset(
-    pose: np.ndarray,
-    force_raw: np.ndarray,
-    t: np.ndarray,
-    cfg: FrameConfig,
-    *,
-    fc: float,
-    use_inertia: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    omega_s, alpha_s, a_s, g_s = kinematics_sensor(pose, t, cfg, fc)
-    fs = 1.0 / np.mean(np.diff(t))
-    f = filtfilt_cols(apply_sign(force_raw, cfg.force_sign), fs, fc)
-    rows, Y = [], []
-    for i in range(len(t)):
-        rows.append(
-            regressor_row(a_s[i], g_s[i], omega_s[i], alpha_s[i], use_inertia=use_inertia)
-        )
-        Y.append(f[i])
-    return np.vstack(rows), np.concatenate(Y)
-```
-
-### `rm75_control/force/compensation/collection.py`
-
-```python
-"""
-Multi-pose force-ID data collection: A → B → C → D → return A.
-
-  source env.sh
-  python -m rm75_control.force.compensation.collection
-  python tmp/force_compensation/force_calibrate.py
-"""
-
-from __future__ import annotations
-
-import argparse
-import time
-from pathlib import Path
-
-import numpy as np
-
-from . import excitation as ex
-from .id_config import ForceIdConfig, load_config
-from .paths import CONFIG_ID, CONFIG_ROBOT, npz_for_slot
-from .progress import stage_progress
-
-
-def load_slot(cfg: ForceIdConfig, slot: str) -> tuple[np.ndarray, np.ndarray, dict]:
-    data = ex.load_poses_yaml(cfg.poses_yaml)
-    rec = ex.get_slot_record(data, slot)
-    if rec is None:
-        raise SystemExit(f"Pose slot '{slot}' missing in {cfg.poses_yaml}")
-    return (
-        np.asarray(rec["q_deg"], dtype=float),
-        np.asarray(rec["pose_base"], dtype=float),
-        rec,
-    )
-
-
-def move_j(robot, q_deg: np.ndarray, *, speed: int) -> None:
-    ret = robot.rm_movej(q_deg.tolist(), speed, 0, 0, 1)
-    if ret != 0:
-        raise RuntimeError(f"rm_movej failed: {ret}")
-
-
-def wait_settle(robot, target_q: np.ndarray, *, timeout_s: float) -> tuple[np.ndarray, np.ndarray]:
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout_s:
-        ret, st = robot.rm_get_current_arm_state()
-        if ret == 0:
-            q = np.asarray(st["joint"][:7], dtype=float)
-            if float(np.max(np.abs(q - target_q))) < 0.5:
-                time.sleep(0.5)
-                return np.asarray(st["pose"][:6], dtype=float), q
-        time.sleep(0.1)
-    ret, st = robot.rm_get_current_arm_state()
-    if ret != 0:
-        raise RuntimeError("get state failed after movej")
-    return np.asarray(st["pose"][:6], dtype=float), np.asarray(st["joint"][:7], dtype=float)
-
-
-def run_cartesian(bot, cfg: ForceIdConfig, slot: str) -> Path:
-    from rm75_control.motion.canfd import send_pose_canfd
-
-    c = cfg.collect
-    cart = c.cartesian
-    max_deg = cart.max_deg_for_slot(slot)
-    dt_s = c.dt_ms / 1000.0
-    duration = cart.duration_s
-    out = npz_for_slot(slot)
-    exc = ex.CartesianExcitation.from_config(cart, c.scale, slot)
-
-    ret, state = bot.robot.rm_get_current_arm_state()
-    if ret != 0:
-        raise RuntimeError(f"get state failed: {ret}")
-    pose0 = np.asarray(state["pose"][:6], dtype=float)
-    q0 = np.asarray(state["joint"][:7], dtype=float)
-
-    n_cmd = int(duration / dt_s) + 1
-    n_log = (n_cmd + c.log_every - 1) // c.log_every
-    t_log = np.zeros(n_log)
-    pose_log = np.zeros((n_log, 6))
-    q_log = np.zeros((n_log, 7))
-    f_log = np.zeros((n_log, 6))
-    delta_log = np.zeros((n_log, 6))
-
-    print(f"\n  {slot}", flush=True)
-    next_tick = time.monotonic()
-    log_i = 0
-    try:
-        for i in range(n_cmd):
-            now = time.monotonic()
-            if now < next_tick:
-                time.sleep(next_tick - now)
-            next_tick += dt_s
-            t_cmd = i * dt_s
-            stage_progress(slot, i + 1, n_cmd)
-            ramp = min(1.0, t_cmd / c.warmup_s) if c.warmup_s > 0 else 1.0
-            delta = ex.clamp_delta(
-                exc.delta_pose(t_cmd) * ramp,
-                max_mm=cart.max_delta_mm,
-                max_rot_deg=max_deg,
-            )
-            send_pose_canfd(
-                bot.robot, (pose0 + delta).tolist(),
-                follow=c.follow, trajectory_mode=0, radio=0,
-            )
-            if i % c.log_every == 0:
-                ret_s, st = bot.robot.rm_get_current_arm_state()
-                ret_f, fd = bot.robot.rm_get_force_data()
-                if ret_s == 0:
-                    pose_log[log_i] = st["pose"][:6]
-                    q_log[log_i] = st["joint"][:7]
-                if ret_f == 0:
-                    f_log[log_i] = np.asarray(fd["force_data"][:6], dtype=float)
-                delta_log[log_i] = delta
-                t_log[log_i] = t_cmd
-                log_i += 1
-    finally:
-        bot.stop_all()
-        try:
-            send_pose_canfd(bot.robot, pose0.tolist(), follow=c.follow, trajectory_mode=0, radio=0)
-        except Exception:
-            pass
-
-    if out.exists():
-        out.unlink()
-    cfg.log_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        out,
-        t=t_log[:log_i], pose=pose_log[:log_i], q_deg=q_log[:log_i],
-        force_raw=f_log[:log_i], delta_pose=delta_log[:log_i],
-        pose0=pose0, q0_deg=q0, pose_slot=slot, preset="cartesian",
-        scale=c.scale, max_delta_mm=cart.max_delta_mm, max_delta_deg=max_deg,
-        dt_ms=c.dt_ms, log_every=c.log_every, method="cartesian",
-    )
-    return out
-
-
-def run_pose_d(bot, cfg: ForceIdConfig) -> Path:
-    from rm75_control.motion.canfd import send_velocity_canfd
-
-    c = cfg.collect
-    pd = c.pose_d
-    vb = pd.velocity_burst
-    dt_s = c.dt_ms / 1000.0
-    total_s = pd.joint_duration_s + pd.burst_duration_s
-    out = npz_for_slot("d")
-
-    ret, state = bot.robot.rm_get_current_arm_state()
-    if ret != 0:
-        raise RuntimeError(f"get state failed: {ret}")
-    pose0 = np.asarray(state["pose"][:6], dtype=float)
-    q0 = np.asarray(state["joint"][:7], dtype=float)
-
-    n_total = int(total_s / dt_s) + 1
-    n_log = (n_total + c.log_every - 1) // c.log_every
-    t_log = np.zeros(n_log)
-    pose_log = np.zeros((n_log, 6))
-    q_log = np.zeros((n_log, 7))
-    f_log = np.zeros((n_log, 6))
-    phase_log = np.zeros(n_log, dtype=np.int8)
-
-    print("\n  d (joint + pose_d_vel_burst)", flush=True)
-    next_tick = time.monotonic()
-    log_i = 0
-    movev_ready = False
-    ramped_down = False
-    last_vel = np.zeros(6, dtype=float)
-    burst_pose0 = pose0.copy()
-
-    try:
-        for i in range(n_total):
-            now = time.monotonic()
-            if now < next_tick:
-                time.sleep(next_tick - now)
-            next_tick += dt_s
-            t_cmd = i * dt_s
-            stage_progress("d", i + 1, n_total)
-            ramp = min(1.0, t_cmd / c.warmup_s) if c.warmup_s > 0 else 1.0
-
-            if pd.joint_duration_s > 0 and t_cmd < pd.joint_duration_s:
-                q_cmd = ex.joint_cmd(t_cmd, q0, pd, c.scale * ramp)
-                ret = bot.robot.rm_movej_canfd(q_cmd.tolist(), False, 0, 0, 0)
-                phase = 0
-            else:
-                if not movev_ready:
-                    if pd.joint_duration_s > 0:
-                        print("  resync pose d before burst…", flush=True)
-                        # Joint movej_canfd must stop before planned movej + movev init.
-                        bot.stop_all()
-                        time.sleep(0.5)
-                        move_j(bot.robot, q0, speed=c.move_speed)
-                        burst_pose0, _ = wait_settle(
-                            bot.robot, q0, timeout_s=c.settle_timeout_s,
-                        )
-                    else:
-                        burst_pose0 = pose0.copy()
-                    next_tick = ex.begin_pose_d_vel_burst(
-                        bot, vb=vb, dt_ms=c.dt_ms,
-                    )
-                    movev_ready = True
-                t_burst = t_cmd - pd.joint_duration_s
-                vel_cmd, _ = ex.vel_burst_cmd(t_burst, vb, scale=c.scale)
-                last_vel = vel_cmd
-                send_velocity_canfd(
-                    bot.robot, vel_cmd.tolist(),
-                    follow=vb.follow,
-                    trajectory_mode=vb.trajectory_mode,
-                    radio=vb.radio,
-                )
-                phase = 1
-                ret = 0
-            if ret != 0:
-                raise RuntimeError(f"pose d command failed: {ret}")
-
-            if i % c.log_every == 0:
-                ret_s, st = bot.robot.rm_get_current_arm_state()
-                ret_f, fd = bot.robot.rm_get_force_data()
-                if ret_s == 0:
-                    pose_log[log_i] = st["pose"][:6]
-                    q_log[log_i] = st["joint"][:7]
-                if ret_f == 0:
-                    f_log[log_i] = np.asarray(fd["force_data"][:6], dtype=float)
-                t_log[log_i] = t_cmd
-                phase_log[log_i] = phase
-                log_i += 1
-
-        if movev_ready:
-            ex.ramp_down_velocity(
-                bot.robot, last_vel, vb=vb, dt_ms=c.dt_ms, next_tick=next_tick,
-            )
-            ramped_down = True
-
-    finally:
-        if movev_ready and not ramped_down:
-            try:
-                ex.ramp_down_velocity(bot.robot, last_vel, vb=vb, dt_ms=c.dt_ms)
-            except Exception:
-                pass
-        if movev_ready:
-            try:
-                bot.robot.rm_set_arm_slow_stop()
-            except Exception:
-                pass
-        else:
-            bot.stop_all()
-        try:
-            bot.robot.rm_movej_canfd(q0.tolist(), False, 0, 0, 0)
-        except Exception:
-            pass
-
-    burst_pose0_save = burst_pose0.copy()
-    if log_i > 0 and np.any(phase_log[:log_i] == 1) and pd.joint_duration_s <= 0:
-        burst_pose0_save = pose_log[:log_i][phase_log[:log_i] == 1][0].copy()
-
-    if out.exists():
-        out.unlink()
-    cfg.log_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        out,
-        t=t_log[:log_i], pose=pose_log[:log_i], q_deg=q_log[:log_i],
-        force_raw=f_log[:log_i], phase=phase_log[:log_i],
-        pose0=pose0, pose_burst0=burst_pose0_save, q0_deg=q0, pose_slot="d",
-        preset="pose_d_vel_burst", scale=c.scale,
-        joint_s=pd.joint_duration_s, burst_s=pd.burst_duration_s,
-        dt_ms=c.dt_ms, log_every=c.log_every, method="pose_d_vel_burst",
-        velocity_burst_profile=vb.profile,
-    )
-    return out
-
-
-def slot_kind(slot: str) -> str:
-    return "pose_d_vel_burst" if slot == "d" else "cartesian"
-
-
-def dry_run(cfg: ForceIdConfig) -> None:
-    seq = cfg.collect.sequence
-    print(f"Collect {' → '.join(seq)} → {cfg.collect.return_home}")
-    for slot in seq:
-        _, _, rec = load_slot(cfg, slot)
-        line = f"  {slot} [{slot_kind(slot)}]: {rec.get('label', f'pose_{slot}')}"
-        if slot == "d":
-            vb = cfg.collect.pose_d.velocity_burst
-            line += (
-                f" | burst={vb.profile} {vb.amp_deg_s}°/s frame={vb.frame_type} "
-                f"order={list(vb.axis_order)} ramp_down={vb.ramp_down_s}s"
-            )
-        print(line)
-
-
-def save_current_pose(cfg: ForceIdConfig, slot: str, label: str | None) -> None:
-    from rm75_control import RobotSession
-
-    with RobotSession(config=CONFIG_ROBOT) as bot:
-        ret, st = bot.robot.rm_get_current_arm_state()
-        if ret != 0:
-            raise SystemExit(f"get state failed: {ret}")
-        pose = np.asarray(st["pose"][:6], dtype=float)
-        q = np.asarray(st["joint"][:7], dtype=float)
-    ex.save_pose_slot(cfg.poses_yaml, slot, pose, q, label)
-    print(f"Saved pose '{slot}' → {cfg.poses_yaml}")
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="A→B→C→D→A force-ID collection")
-    parser.add_argument("--config", type=Path, default=CONFIG_ID)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--save-pose", type=str, default=None, metavar="SLOT")
-    parser.add_argument("--pose-label", type=str, default=None)
-    args = parser.parse_args(argv)
-
-    cfg = load_config(args.config)
-
-    if args.save_pose:
-        save_current_pose(cfg, args.save_pose, args.pose_label)
-        return 0
-    if args.dry_run:
-        dry_run(cfg)
-        return 0
-
-    c = cfg.collect
-    seq = c.sequence
-    slots = {s: load_slot(cfg, s) for s in set(seq) | {c.return_home}}
-    print(f"Collect {' → '.join(seq)} → {c.return_home}")
-    for s in seq:
-        line = f"  {s} [{slot_kind(s)}]: {slots[s][2].get('label', f'pose_{s}')}"
-        if s == "d":
-            vb = c.pose_d.velocity_burst
-            line += (
-                f" | burst={vb.profile} {vb.amp_deg_s}°/s frame={vb.frame_type} "
-                f"order={list(vb.axis_order)}"
-            )
-        print(line)
-
-    from rm75_control import RobotSession
-
-    with RobotSession(config=CONFIG_ROBOT) as bot:
-        saved = []
-        for slot in seq:
-            q_tgt, _, rec = slots[slot]
-            print(f"\nMove {slot}")
-            move_j(bot.robot, q_tgt, speed=c.move_speed)
-            wait_settle(bot.robot, q_tgt, timeout_s=c.settle_timeout_s)
-            if slot == "d":
-                saved.append(run_pose_d(bot, cfg))
-            else:
-                saved.append(run_cartesian(bot, cfg, slot))
-
-        home = c.return_home
-        q_h, _, _ = slots[home]
-        print(f"\nReturn {home}")
-        move_j(bot.robot, q_h, speed=c.move_speed)
-        wait_settle(bot.robot, q_h, timeout_s=c.settle_timeout_s)
-        print("\nCollection done:")
-        for p in saved:
-            print(f"  {p}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
-
-## 五、YAML 配置
-
-### `tmp/Velocity_Admittance/demo/config/sin_tool_y_z2n.yaml`
-
-```yaml
-# Demo trajectory plugin + tool-Z force hybrid.
-# Architecture (sleeve / slider):
-#   trajectory or visual Servo → vel_ff (+ optional Kp) in base frame
-#   controller → Tool-X/Y from R.T @ v_pos_base; Tool-Z from force admittance only
-#   No world-XY lstsq lock — Z reciprocation does not lateral drift
-#
-# Phase 1: open_loop true, kp_pos all zero
-# Phase 2: weak PBAC — uncomment phase2 block
-#
-# Run:
-#   source /media/camp/EXT_DRIVE/rm75_control/env.sh
-#   cd /media/camp/EXT_DRIVE/rm75_control
-#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y
-
-timing:
-  dt_ms: 10.0
-  async_poll_ms: 10.0
-
-startup:
-  pose_slot: d
-  settle_frames: 25
-  hold_s: 1.0
-  auto_recover: true
-  wait_contact: true
-  auto_start_under_n: 0.5
-  auto_start_hold_s: 0.5
-  approach_ramp_s: 1.5
-
-frames:
-  euler_order: xyz
-  control_frame: tool
-
-velocity_canfd:
-  frame_type: 0
-  avoid_singularity: 0
-  follow: true
-  trajectory_mode: 0
-  radio: 0
-
-force:
-  phi_source: phi_recommended
-  buffer_s: 2.0
-  min_samples: 22
-  fc_hz: 4.0
-  use_inertia: false
-  desired_z_n: 3.0
-
-trajectory:
-  type: sin_base_y_tool_rz    # hold | sin_tool_y | sin_base_y | sin_base_y_tool_rz
-  y_peak_to_peak_cm: 16.0
-  rz_amplitude_deg: 12.0
-  y_max_vel_cm_s: 3.0
-  soft_start: true
-  ramp_s: 2.0
-  open_loop: true
-
-controller:
-  force_axes: [0, 0, 1, 0, 0, 0]   # tool TCP-Z force; f_ext[2] when sensor parallel flange
-  open_loop: true
-  track_axes: [0, 1, 0, 0, 0, 0]
-  kp_pos: [0, 0, 0, 0, 0, 0]
-  deadband_n: 0.3
-  deadband_width_n: 0.2
-  # --- Phase 2 weak PBAC (after open-loop OK) ---
-  # open_loop: false
-  # track_axes: [0, 1, 0, 1, 1, 1]
-  # kp_pos: [0, 1.0, 0, 0.3, 0.3, 0.3]
-  system_delay_s: 0.015
-  k_fp_press: 0.045
-  k_fp_release: 0.025
-  k_fi: 0.001
-  integral_limit: 0.015
-  max_vz_tool_m_s: 0.15
-  approach_vz_tool_m_s: 0.03
-  max_velocity: [0.03, 0.10, 0.15, 0.15, 0.15, 0.35]
-  max_acceleration: [0.5, 1.0, 0.5, 1.0, 1.0, 1.5]
-```
-
-### `tmp/Velocity_Admittance/config/admittance.yaml`
-
-```yaml
-# Velocity admittance — library: rm75_control.control.velocity_admittance
-# Generic: python tmp/Velocity_Admittance/run_admittance.py
-# Demo:    python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
-
-timing:
-  dt_ms: 10.0
-  async_poll_ms: 10.0
-
-startup:
-  pose_slot: d
-
-frames:
-  euler_order: xyz   # rm_get_current_arm_state pose; match configs/force_sensor.yaml
-
-velocity_canfd:
-  frame_type: 1          # 0 tool, 1 work/base — v_cmd output is base frame
-  avoid_singularity: 0
-  follow: true
-  trajectory_mode: 0     # 0 passthrough — smoothing in controller only
-  radio: 0
-
-force:
-  phi_source: phi_recommended
-  buffer_s: 4.0
-  min_samples: 35
-  use_inertia: false     # no virtual mass — PI admittance only (Keemink §5.4)
-  desired_z_n: 3.0
-
-trajectory:
-  type: sin_tool_y       # hold | sin_tool_y | sin_base_y
-  amplitude_mm: 5.0
-  period_s: null         # auto from y_max_vel_cm_s if null
-  y_max_vel_cm_s: 1.0
-
-controller:
-  force_axes: [0, 0, 1, 0, 0, 0]   # 1 = admittance on axis (sensor frame)
-  motion_axes: [0, 1, 0, 0, 0, 0]
-  lock_orientation: true
-  enable_normal_tracking: false
-  kp_pos: [2.0, 2.0, 0.0, 1.5, 1.5, 1.5]
-  system_delay_s: 0.015
-  k_fp_press: 0.015
-  k_fp_release: 0.005
-  k_fi: 0.008
-  integral_limit: 0.05
-  k_align: 0.0
-  contact_threshold_n: 0.5
-  deadband_n: 0.3
-  max_vz_tool_m_s: 0.05
-  max_velocity: [0.2, 0.2, 0.05, 0.08, 0.08, 0.08]
-  max_acceleration: [1.0, 1.0, 0.05, 0.15, 0.15, 0.15]
-  release_vz_up_m_s: 0.05
-  release_vz_down_m_s: 0.05
-
-monitor:
-  enabled: false
-  window_s: 25.0
-  refresh_hz: 12.0
-```
-
-## 六、套筒融合公式
+## 五、套筒融合公式
 
 ```text
-v_pos_base = vel_ff + kp ⊙ track_axes ⊙ (pose_d - pose)
+v_pos_base = vel_ff + kp ⊙ track_axes ⊙ (pose_d - pose)   # open_loop: err=0
 v_pos_tool[:3] = R.T @ v_pos_base[:3]
 v_pos_tool[3:6] = R.T @ v_pos_base[3:6]
-v_cmd_tool = v_pos_tool
-v_cmd_tool[2] = PI_admittance(f_des - f_ext)   # smooth deadband
+v_cmd_tool = v_pos_tool;  v_cmd_tool[2] = PI_admittance(f_des - f_ext)
 rm_movev_canfd(v_cmd_tool, frame_type=0)
 ```
 
-**验证（机器人）**：TCP-Z 往返无 XY 漂；approach 不卡；扫查贴合 OK。
-
+重新生成本文档：`python scripts/gen_debug_va.py`
