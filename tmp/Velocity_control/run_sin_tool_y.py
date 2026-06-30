@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from rm75_control import RobotSession
-from rm75_control.control.velocity_admittance.rm_algo import end2tool_pose
+from rm75_control.control.hybrid_motion.rm_algo import end2tool_pose
 from rm75_control.force.compensation.collection import load_slot, move_j, wait_settle
 from rm75_control.force.compensation.id_config import load_config
 from rm75_control.force.compensation.paths import CONFIG_ID

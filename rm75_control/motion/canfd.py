@@ -213,7 +213,19 @@ def settle_movev_after_init(
     n_frames: int = 30,
     next_tick: float | None = None,
 ) -> float:
-    """Zero-velocity frames after rm_set_movev_canfd_init (traj0)."""
+    """
+    Zero-velocity frames after rm_set_movev_canfd_init — always low follow.
+
+    rm_set_movev_canfd_init captures the current joint state as the IK
+    reference.  If the arm is still micro-vibrating (which is common <200ms
+    after move_j), with follow=True the high-bandwidth servo sees the residual
+    error and issues a large corrective velocity → visible twitch/snap.
+
+    Sending ALL settle frames with follow=False (低跟随, gentler servo) keeps
+    the correction velocity small regardless of when init was called.  The
+    actual scan commands use follow=True from the first tick of the main loop,
+    by which point the arm is already confirmed quiescent.
+    """
     dt_s = dt_ms / 1000.0
     if next_tick is None:
         next_tick = time.monotonic()
@@ -223,7 +235,7 @@ def settle_movev_after_init(
         if now < next_tick:
             time.sleep(min(0.002, next_tick - now))
         next_tick += dt_s
-        send_velocity_canfd(robot, zero, follow=follow)
+        send_velocity_canfd(robot, zero, follow=False)
     return next_tick
 
 
@@ -240,11 +252,16 @@ def wait_movev_quiescent(
     """
     Stream zero velocity until TCP motion < settle_mm for need_consecutive ticks.
 
+    Uses follow=False (低跟随) to match settle_movev_after_init — quiescence is
+    measured under the same gentle-servo conditions the arm will settle in.
+    The actual session's follow mode takes effect from the first real command.
+
     Returns (last_pose, max_step_mm, frames_used, next_tick).
     """
     dt_s = dt_ms / 1000.0
     if next_tick is None:
         next_tick = time.monotonic()
+    del follow  # low follow throughout; see docstring
     zero = [0.0] * 6
     prev_xyz: np.ndarray | None = None
     last_pose: np.ndarray | None = None
@@ -255,7 +272,7 @@ def wait_movev_quiescent(
         if now < next_tick:
             time.sleep(min(0.002, next_tick - now))
         next_tick += dt_s
-        send_velocity_canfd(robot, zero, follow=follow)
+        send_velocity_canfd(robot, zero, follow=False)
         ret, st = robot.rm_get_current_arm_state()
         if ret != 0:
             continue
@@ -282,16 +299,22 @@ def enter_movev_session(
     dt_ms: float,
     follow: bool,
     q_resync: np.ndarray | None = None,
-    settle_frames: int = 30,
-    quiescent_mm: float = 0.3,
-    quiescent_consecutive: int = 5,
+    settle_frames: int = 50,
+    quiescent_mm: float = 0.25,
+    quiescent_consecutive: int = 10,
     move_speed: int = 15,
     settle_timeout_s: float = 15.0,
+    pre_init_settle_s: float = 1.5,
     next_tick: float | None = None,
     print_diag: bool = False,
 ) -> tuple[float, dict[str, Any]]:
     """
-    Full movev handoff: exit → init → zero frames → quiescence.
+    Full movev handoff: exit → (settle) → init → zero frames → quiescence.
+
+    pre_init_settle_s: extra sleep between exit_canfd_session and
+    rm_set_movev_canfd_init.  exit_canfd_session already sleeps 0.3s, so the
+    total static time before init = 0.3 + pre_init_settle_s.  Default 1.5s
+    gives 1.8s total — arm must be fully static before init captures FK.
 
     Returns (next_tick, diag).
     """
@@ -302,6 +325,9 @@ def enter_movev_session(
         settle_timeout_s=settle_timeout_s,
         print_diag=False,
     )
+
+    if pre_init_settle_s > 0.0:
+        time.sleep(pre_init_settle_s)
 
     # rm_set_movev_canfd_init can transiently refuse if the controller's internal
     # CANFD state machine (joint-CANFD layer) hasn't fully reset yet — the

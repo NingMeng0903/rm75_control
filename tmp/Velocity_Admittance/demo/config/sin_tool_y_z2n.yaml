@@ -22,16 +22,23 @@
 # Run:
 #   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y --log
 
+reference:
+  shaper: pass_through
+
 timing:
   dt_ms: 10.0
   async_poll_ms: 10.0
 
 startup:
   pose_slot: d
-  settle_frames: 30
+  settle_frames: 50
   hold_s: 1.0
-  pre_movev_prep: light       # run_sin_tool_y: slow_stop + delete_traj before init
-  pre_movev_settle_s: 0.0
+  pre_movev_prep: light
+  # Static before movev init: 0.3s (exit) + pre_movev_settle_s.
+  pre_movev_settle_s: 1.5
+  movev_quiescent_mm: 0.25
+  movev_quiescent_consecutive: 10
+  post_handoff_zero_s: 1.0
   post_init_realign: false
   auto_recover: false         # true adds stop_all before move_j → larger init snap
   wait_contact: true          # lock pose, wait for EXTERNAL contact (no descent here)
@@ -69,6 +76,15 @@ force:
   causal_order: 2
   causal_history: 5
 
+trajectory_demo:
+  type: sin_base_y_tool_rz
+  y_peak_to_peak_cm: 16.0
+  rz_amplitude_deg: 12.0
+  y_max_vel_cm_s: 3.0
+  soft_start: true
+  ramp_s: 2.0
+  open_loop: false
+
 trajectory:
   type: sin_base_y_tool_rz
   y_peak_to_peak_cm: 16.0
@@ -78,7 +94,7 @@ trajectory:
   ramp_s: 2.0
   open_loop: false
 
-controller:
+hybrid_motion:
   force_axes: [0, 0, 1, 0, 0, 0]
   open_loop: false
   # 5-DOF PBAC. kp_pos[0,1] are TOOL-X / TOOL-Y gains (translation loop runs in the

@@ -1,6 +1,9 @@
-# Velocity admittance — library: rm75_control.control.velocity_admittance
+# Hybrid motion demo — core: rm75_control.control.hybrid_motion
 # Generic: python tmp/Velocity_Admittance/run_admittance.py
 # Demo:    python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
+
+reference:
+  shaper: pass_through    # pass_through | ruckig (not wired yet)
 
 timing:
   dt_ms: 10.0
@@ -8,6 +11,11 @@ timing:
 
 startup:
   pose_slot: d
+  pre_movev_settle_s: 1.5      # +0.3s in exit → 1.8s static before movev init
+  settle_frames: 50             # zero-vel frames right after init
+  movev_quiescent_mm: 0.25    # TCP must move < this for quiescence
+  movev_quiescent_consecutive: 10
+  post_handoff_zero_s: 1.0      # extra zero-vel bridge before main loop
 
 frames:
   euler_order: xyz   # rm_get_current_arm_state pose; match configs/force_sensor.yaml
@@ -30,13 +38,20 @@ force:
   causal_order: 2
   causal_history: 5
 
-trajectory:
-  type: sin_tool_y       # hold | sin_tool_y | sin_base_y
+trajectory_demo:
+  type: sin_tool_y       # hold | sin_tool_y | sin_base_y | sin_base_y_tool_rz
   amplitude_mm: 5.0
   period_s: null         # auto from y_max_vel_cm_s if null
   y_max_vel_cm_s: 1.0
 
-controller:
+# Legacy key — still read if trajectory_demo is absent
+trajectory:
+  type: sin_tool_y
+  amplitude_mm: 5.0
+  period_s: null
+  y_max_vel_cm_s: 1.0
+
+hybrid_motion:
   force_axes: [0, 0, 1, 0, 0, 0]   # tool-Z force-controlled (TFF: = contact normal)
   enable_normal_tracking: false    # true → rotate tool-Z to null lateral forces
   kp_pos: [0.3, 0.6, 0.0, 0.4, 0.4, 0.4]   # tool-frame PBAC gains (X,Y,-,Rx,Ry,Rz)

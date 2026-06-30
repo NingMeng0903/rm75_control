@@ -13,10 +13,15 @@ from rm75_control.control.cartesian_velocity import (
     CartesianVelocityTrackerConfig,
 )
 
-from rm75_control.control.velocity_admittance import (
+from rm75_control.control.hybrid_motion import (
     AdmittanceConfig,
     AdmittanceController,
     CompensatedForceObserver,
+    HybridMotionConfig,
+    HybridMotionController,
+    MotionReference,
+    MotionReferenceSource,
+    run_hybrid_motion_loop,
     run_velocity_admittance,
 )
 
@@ -32,5 +37,10 @@ __all__ = [
     "CartesianVelocityTracker",
     "CartesianVelocityTrackerConfig",
     "CompensatedForceObserver",
+    "HybridMotionConfig",
+    "HybridMotionController",
+    "MotionReference",
+    "MotionReferenceSource",
+    "run_hybrid_motion_loop",
     "run_velocity_admittance",
 ]

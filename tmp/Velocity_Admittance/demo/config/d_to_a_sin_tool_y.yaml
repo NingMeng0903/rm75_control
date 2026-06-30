@@ -1,0 +1,102 @@
+# Demo: slot d → slot a transfer, then tool-Y sin scan at pose a.
+#
+# Flow:
+#   1. move_j → slot d (startup.pose_slot)
+#   2. hold + wait external contact at d
+#   3. scan ON: smooth transfer d→a (transfer_s), then sin_tool_y at a
+#
+# Run:
+#   python tmp/Velocity_Admittance/demo/d_to_a_sin_tool_y.py --log
+#   python tmp/Velocity_Admittance/demo/d_to_a_sin_tool_y.py --transfer-s 15 --duration 60 --log
+
+reference:
+  shaper: pass_through
+
+timing:
+  dt_ms: 10.0
+  async_poll_ms: 10.0
+
+startup:
+  pose_slot: d
+  settle_frames: 50
+  hold_s: 1.0
+  pre_movev_settle_s: 1.5
+  movev_quiescent_mm: 0.25
+  movev_quiescent_consecutive: 10
+  post_handoff_zero_s: 1.0
+  wait_contact: true
+  auto_start_under_n: 0.5
+  auto_start_hold_s: 0.3
+  hold_active: true
+  hold_kp_pos: 1.5
+  hold_kp_rot: 1.5
+  hold_deadband_mm: 0.3
+  hold_max_vel_m_s: 0.02
+  hold_max_omega_rad_s: 0.10
+  hold_accel_m_s2: 0.3
+
+frames:
+  euler_order: xyz
+  control_frame: tool
+
+velocity_canfd:
+  frame_type: 0
+  avoid_singularity: 0
+  follow: true
+  trajectory_mode: 0
+  radio: 0
+
+force:
+  phi_source: phi_recommended
+  buffer_s: 2.0
+  min_samples: 22
+  use_inertia: false
+  desired_z_n: 3.0
+  causal_fc_hz: 6.0
+  causal_order: 2
+  causal_history: 5
+
+trajectory_demo:
+  type: slot_transfer_sin_tool_y
+  from_slot: d
+  to_slot: a
+  transfer_s: 12.0          # d→a smoothstep duration (s), before sin starts
+  scan_mode: sin_tool_y      # sin at pose a after transfer
+  y_peak_to_peak_cm: 16.0
+  y_max_vel_cm_s: 3.0
+  soft_start: true
+  ramp_s: 2.0
+
+hybrid_motion:
+  force_axes: [0, 0, 1, 0, 0, 0]
+  open_loop: false
+  track_axes: [1, 1, 0, 1, 1, 1]
+  kp_pos: [0.30, 0.60, 0.0, 0.4, 0.4, 0.4]
+  deadband_n: 0.3
+  deadband_width_n: 0.2
+  system_delay_s: 0.015
+  pos_err_deadband_m: 0.0005
+  pos_correction_max_m_s: 0.05
+  admittance_mass_z: 3.0
+  admittance_damping_z: 60.0
+  var_damping_enabled: true
+  var_damping_omega_c_hz: 3.5
+  var_damping_lambda: 0.99
+  var_damping_f_max_n: 30.0
+  var_damping_d_u: 60.0
+  var_damping_m_u: 0.0
+  var_damping_dc_alpha: 0.02
+  max_vz_tool_m_s: 0.15
+  approach_vz_tool_m_s: 0.02
+  max_velocity: [0.03, 0.10, 0.15, 0.12, 0.12, 0.12]
+  max_acceleration: [0.5, 1.0, 3.0, 0.5, 0.5, 0.5]
+  enable_normal_tracking: false
+  k_align: 0.02
+  k_fp_press: 0.035
+  k_fp_release: 0.030
+  k_fi: 0.001
+  integral_limit: 0.015
+
+monitor:
+  log: false
+  log_every: 1

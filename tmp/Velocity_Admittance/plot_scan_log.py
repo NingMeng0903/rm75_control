@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.spatial.transform import Rotation as Rsc
 
-from rm75_control.control.velocity_admittance.scan_log import (
+from rm75_control.control.hybrid_motion.scan_log import (
     load_scan_log,
     scan_tracking_world_mm,
 )

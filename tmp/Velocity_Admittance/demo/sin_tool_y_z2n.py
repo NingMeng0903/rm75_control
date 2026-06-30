@@ -12,10 +12,16 @@ Demo: 6D trajectory plugin + tool-frame force/motion hybrid.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from rm75_control.control.velocity_admittance.loop import load_yaml, run_velocity_admittance
-from rm75_control.control.velocity_admittance.paths import CONFIG_SIN_TOOL_Y_Z2N
+from rm75_control.control.hybrid_motion.loop import load_yaml, run_hybrid_motion_loop
+from rm75_control.control.hybrid_motion.paths import CONFIG_SIN_TOOL_Y_Z2N
+
+_VA_DIR = Path(__file__).resolve().parents[1]
+if str(_VA_DIR) not in sys.path:
+    sys.path.insert(0, str(_VA_DIR))
+from demo_stack import build_demo_shaper, build_demo_source_factory, demo_trajectory_summary
 
 
 def main() -> int:
@@ -25,7 +31,7 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_SIN_TOOL_Y_Z2N)
     parser.add_argument(
         "--trajectory", type=str, default=None,
-        help="trajectory.type: hold | sin_base_y | sin_base_y_tool_rz | sin_tool_y",
+        help="trajectory_demo.type: hold | sin_base_y | sin_base_y_tool_rz | sin_tool_y",
     )
     parser.add_argument("--desired-z", type=float, default=None, help="tool-Z force target (N)")
     parser.add_argument("--y-pp-cm", type=float, default=None, help="world-Y peak-to-peak (cm)")
@@ -36,7 +42,9 @@ def main() -> int:
     args = parser.parse_args()
 
     raw = load_yaml(args.config)
-    traj = raw.setdefault("trajectory", {})
+    traj = raw.setdefault("trajectory_demo", raw.get("trajectory", {}))
+    if "trajectory" in raw and "trajectory_demo" not in raw:
+        raw["trajectory_demo"] = traj
     if args.trajectory:
         traj["type"] = args.trajectory
     if args.y_pp_cm is not None:
@@ -46,8 +54,11 @@ def main() -> int:
     if args.desired_z is not None:
         raw.setdefault("force", {})["desired_z_n"] = args.desired_z
 
-    return run_velocity_admittance(
+    return run_hybrid_motion_loop(
         raw,
+        source_factory=build_demo_source_factory(raw),
+        shaper=build_demo_shaper(raw),
+        reference_summary=demo_trajectory_summary(raw),
         title="Demo 6D traj + tool-Z force",
         duration_s=args.duration,
         log_enabled=args.log or args.log_path is not None,

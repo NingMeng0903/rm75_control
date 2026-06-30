@@ -1,40 +1,4 @@
-"""Velocity-resolved admittance control loop and trajectory."""
+"""Deprecated package — use rm75_control.control.hybrid_motion."""
 
-from rm75_control.control.velocity_admittance.controller import (
-    AdmittanceConfig,
-    AdmittanceController,
-)
-from rm75_control.control.velocity_admittance.loop import load_yaml, run_velocity_admittance
-from rm75_control.control.velocity_admittance.observer import CompensatedForceObserver
-from rm75_control.control.velocity_admittance.scan_log import (
-    ScanLogRecorder,
-    load_scan_log,
-    print_jerk_summary,
-    scan_tracking_world_mm,
-)
-from rm75_control.control.velocity_admittance.trajectory import (
-    Trajectory6D,
-    TrajectoryGenerator,
-    TrajectorySample,
-)
-from rm75_control.control.velocity_admittance.paths import (
-    CONFIG_ADMITTANCE,
-    CONFIG_SIN_TOOL_Y_Z2N,
-)
-
-__all__ = [
-    "AdmittanceConfig",
-    "AdmittanceController",
-    "CompensatedForceObserver",
-    "ScanLogRecorder",
-    "load_scan_log",
-    "print_jerk_summary",
-    "scan_tracking_world_mm",
-    "Trajectory6D",
-    "TrajectoryGenerator",
-    "TrajectorySample",
-    "CONFIG_ADMITTANCE",
-    "CONFIG_SIN_TOOL_Y_Z2N",
-    "load_yaml",
-    "run_velocity_admittance",
-]
+from rm75_control.control.hybrid_motion import *  # noqa: F403
+from rm75_control.control.hybrid_motion import __all__  # noqa: F401
