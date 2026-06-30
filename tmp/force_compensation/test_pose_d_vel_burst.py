@@ -281,17 +281,11 @@ def vel_burst_cmd(
 
 
 def prepare_movev_session(bot) -> dict:
-    """Clear stale force / CANFD modes before rm_set_movev_canfd_init."""
-    diag = bot.prepare_for_force_stream(settle_s=1.0)
-    diag["delete_traj"] = bot.robot.rm_set_arm_delete_trajectory()
-    diag["slow_stop"] = bot.robot.rm_set_arm_slow_stop()
-    time.sleep(0.5)
-    traj = bot.robot.rm_get_arm_current_trajectory()
-    diag["trajectory_type"] = traj.get("trajectory_type", -1)
-    ret, st = bot.robot.rm_get_current_arm_state()
-    if ret == 0:
-        diag["err"] = st.get("err", {})
-    return diag
+    """Unified CANFD exit before movev init."""
+    from rm75_control.motion.canfd import exit_canfd_session
+
+    bot.prepare_for_force_stream(settle_s=0.0)
+    return exit_canfd_session(bot.robot, print_diag=False)
 
 
 def init_velocity_canfd(robot, *, frame_type: int, avoid_singularity: int, dt_ms: float) -> int:
@@ -481,14 +475,25 @@ def run_diag(bot, args, pose0: np.ndarray) -> int:
     ]
 
     for label, frame_type, avoid, vel_fn in cases:
+        from rm75_control.motion.canfd import enter_movev_session
+
         if not args.no_prepare:
-            prepare_movev_session(bot)
-        init_ret = init_velocity_canfd(
-            bot.robot,
-            frame_type=frame_type,
-            avoid_singularity=avoid,
-            dt_ms=args.dt_ms,
-        )
+            enter_movev_session(
+                bot.robot,
+                frame_type=frame_type,
+                avoid_singularity=avoid,
+                dt_ms=args.dt_ms,
+                follow=args.follow,
+                settle_frames=30,
+                print_diag=True,
+            )
+        else:
+            init_velocity_canfd(
+                bot.robot,
+                frame_type=frame_type,
+                avoid_singularity=avoid,
+                dt_ms=args.dt_ms,
+            )
         n, stats, _, pose_log, _ = run_stream(
             bot,
             duration_s=dur,
@@ -504,23 +509,34 @@ def run_diag(bot, args, pose0: np.ndarray) -> int:
             follow=args.follow, trajectory_mode=trajectory_mode, radio=radio,
         )
         if n < 2:
-            print(f"  {label}: no samples (init={init_ret})")
+            print(f"  {label}: no samples")
             continue
         eul = stats.get("euler_deg_s_max", (0, 0, 0))
         jmax = max(stats.get("joint_deg_s_max", (0,) * 7))
         y_drift = float(np.max(np.abs(pose_log[:, 1] - pose_log[0, 1])) * 1000)
         z_drift = float((pose_log[-1, 2] - pose_log[0, 2]) * 1000)
         print(
-            f"  {label}: init={init_ret}  drift_xyz={stats.get('pos_drift_mm', 0):.1f}mm  "
+            f"  {label}: drift_xyz={stats.get('pos_drift_mm', 0):.1f}mm  "
             f"dy={y_drift:.1f}mm  dz_end={z_drift:+.1f}mm  euler_max={max(eul):.2f} deg/s  "
             f"joint_max={jmax:.2f} deg/s  movev_err={stats.get('movev_errors', 0)}"
         )
 
     # D: sin_y-style tool-Y with position closure (known-good pattern in this repo)
     print("\n  D sin_y-style tool Y (position loop, 20mm amp)...")
+    from rm75_control.motion.canfd import enter_movev_session
+
     if not args.no_prepare:
-        prepare_movev_session(bot)
-    init_ret = init_velocity_canfd(bot.robot, frame_type=0, avoid_singularity=0, dt_ms=args.dt_ms)
+        enter_movev_session(
+            bot.robot,
+            frame_type=0,
+            avoid_singularity=0,
+            dt_ms=args.dt_ms,
+            follow=args.follow,
+            settle_frames=30,
+            print_diag=True,
+        )
+    else:
+        init_velocity_canfd(bot.robot, frame_type=0, avoid_singularity=0, dt_ms=args.dt_ms)
     from rm75_control.control.cartesian_velocity import (
         CartesianVelocityController,
         CartesianVelocityStreamConfig,
@@ -578,7 +594,7 @@ def run_diag(bot, args, pose0: np.ndarray) -> int:
     y_drift = abs(last_fb[1] - y0) * 1000
     xyz_drift = float(np.linalg.norm(np.array(last_fb[:3]) - pose_start) * 1000)
     print(
-        f"  D sin_y-style: init={init_ret}  tool_y_drift={y_drift:.1f}mm  "
+        f"  D sin_y-style: tool_y_drift={y_drift:.1f}mm  "
         f"tool_xyz_drift={xyz_drift:.1f}mm"
     )
 
@@ -827,11 +843,45 @@ def run_burst_once(args: argparse.Namespace) -> int:
         if args.diag:
             return run_diag(bot, args, pose0)
 
+        next_tick = time.monotonic()
         if not args.no_prepare:
-            prep = prepare_movev_session(bot)
+            from rm75_control.motion.canfd import enter_movev_session
+
+            next_tick, prep = enter_movev_session(
+                bot.robot,
+                frame_type=burst_vb.frame_type if use_shared_burst else args.frame_type,
+                avoid_singularity=(
+                    burst_vb.avoid_singularity if use_shared_burst else args.avoid_singularity
+                ),
+                dt_ms=args.dt_ms,
+                follow=args.follow,
+                settle_frames=30,
+                print_diag=True,
+            )
             print(f"  movev prep: {prep}")
-            if ERR_4119 in str(prep.get("err", {})):
+            if ERR_4119 in str(prep.get("system_err", [])):
                 print(f"  {ERR_4119_HELP}", file=sys.stderr)
+        else:
+            init_velocity_canfd(
+                bot.robot,
+                frame_type=burst_vb.frame_type if use_shared_burst else args.frame_type,
+                avoid_singularity=(
+                    burst_vb.avoid_singularity if use_shared_burst else args.avoid_singularity
+                ),
+                dt_ms=args.dt_ms,
+            )
+            if use_shared_burst:
+                next_tick = ex.settle_movev_after_init(
+                    bot.robot, vb=burst_vb, dt_ms=args.dt_ms, next_tick=next_tick,
+                )
+            else:
+                next_tick = ex.settle_movev_stream(
+                    bot.robot,
+                    dt_ms=args.dt_ms,
+                    follow=args.follow,
+                    next_tick=next_tick,
+                )
+        print("Streaming… (Ctrl+C to abort)\n")
 
         n_cmd = int(args.duration / dt_s) + 1
         n_log = (n_cmd + args.log_every - 1) // args.log_every
@@ -871,28 +921,6 @@ def run_burst_once(args: argparse.Namespace) -> int:
             print(
                 "  NOTE: frame=tool — collection preset pose_d_vel_burst uses frame=base (1)."
             )
-
-        init_velocity_canfd(
-            bot.robot,
-            frame_type=burst_vb.frame_type if use_shared_burst else args.frame_type,
-            avoid_singularity=burst_vb.avoid_singularity if use_shared_burst else args.avoid_singularity,
-            dt_ms=args.dt_ms,
-        )
-        next_tick = time.monotonic()
-        if use_shared_burst:
-            next_tick = ex.settle_movev_after_init(
-                bot.robot, vb=burst_vb, dt_ms=args.dt_ms, next_tick=next_tick,
-            )
-        else:
-            next_tick = ex.settle_movev_stream(
-                bot.robot,
-                dt_ms=args.dt_ms,
-                follow=args.follow,
-                trajectory_mode=trajectory_mode,
-                radio=radio,
-                next_tick=next_tick,
-            )
-        print("Streaming… (Ctrl+C to abort)\n")
 
         log_i = 0
         prev_euler = pose0[3:6].copy()

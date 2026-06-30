@@ -16,6 +16,7 @@ from rm75_control.control.cartesian_pose import (
 from rm75_control.core.exceptions import ControlModeError, MotionError
 from rm75_control.core.types import ControlMode
 from rm75_control.force.scan import ForceScanConfig, ForceScanController
+from rm75_control.motion.canfd import exit_canfd_session
 
 Pose6 = Sequence[float]
 
@@ -166,12 +167,9 @@ class RobotSession:
         if not self.dry_run and self._backend is not None:
             self.stop_all(hard=False)
         diag.update(self.prepare_for_force_stream(settle_s=0.0))
-        try:
-            diag["delete_traj"] = self.robot.rm_set_arm_delete_trajectory()
-        except Exception:
-            diag["delete_traj"] = -999
-        diag["slow_stop"] = self.robot.rm_set_arm_slow_stop()
-        diag["planning_idle"] = self._wait_planning_idle(timeout_s=8.0)
+        handoff = exit_canfd_session(self.robot, print_diag=False)
+        diag.update(handoff)
+        diag["planning_idle"] = handoff.get("planning_idle", False)
 
         if probe_force_stream and not self.dry_run:
             try:
@@ -187,7 +185,7 @@ class RobotSession:
             time.sleep(settle_s)
 
         traj = self.robot.rm_get_arm_current_trajectory()
-        diag["trajectory_type_final"] = traj.get("trajectory_type", -1)
+        diag["trajectory_type_final"] = traj.get("trajectory_type", handoff.get("trajectory_type", -1))
         ret, st = self.robot.rm_get_current_arm_state()
         if ret == 0:
             diag["pose_euler_deg"] = [

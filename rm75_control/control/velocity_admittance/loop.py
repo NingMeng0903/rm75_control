@@ -12,7 +12,13 @@ from scipy.spatial.transform import Rotation as Rsc
 from rm75_control.force.compensation.collection import load_slot, move_j, wait_settle
 from rm75_control.force.compensation.id_config import load_config
 from rm75_control.force.compensation.paths import CONFIG_ID
-from rm75_control.motion.canfd import send_velocity_canfd
+from rm75_control.motion.canfd import (
+    enter_movev_session,
+    exit_canfd_session,
+    send_velocity_canfd,
+    settle_movev_after_init,
+    wait_movev_quiescent,
+)
 
 from .async_state import AsyncStateObserver
 from .controller import AdmittanceConfig, AdmittanceController, pose_error, wrap_pi
@@ -32,40 +38,25 @@ def prepare_canfd_velocity_session(
     settle_s: float = 0.5,
     clear_errors: bool = False,
 ) -> dict:
-    """Full recover_controller before movev init — use only when stuck in force/plan mode."""
-    return bot.recover_controller(
-        settle_s=settle_s,
-        clear_errors=clear_errors,
-        probe_force_stream=False,
-    )
-
-
-def idle_before_movev_init(
-    robot,
-    *,
-    mode: str = "light",
-    extra_settle_s: float = 0.0,
-) -> None:
-    """
-    Idle before rm_set_movev_canfd_init.
-
-    Modes (see tmp/Velocity_control/run_sin_tool_y.py):
-      skip     — init immediately (lowest snap if already idle after move_j)
-      minimal  — delete_traj only, no slow_stop (after move_j settle)
-      light    — slow_stop + delete_traj (run_sin_tool_y default)
-      full     — use prepare_canfd_velocity_session instead (avoid after move_j)
-    """
-    m = mode.lower()
-    if m in ("skip", "none", "false", "0"):
-        return
-    if m in ("light", "slow_stop"):
-        robot.rm_set_arm_slow_stop()
+    """Full recover before movev — force stream exit + unified CANFD exit."""
+    diag = bot.prepare_for_force_stream(settle_s=0.0)
+    if clear_errors:
+        try:
+            diag["clear_system_err"] = bot.robot.rm_clear_system_err()
+        except Exception:
+            diag["clear_system_err"] = -999
         time.sleep(0.3)
-    try:
-        robot.rm_set_arm_delete_trajectory()
-    except Exception:
-        pass
-    time.sleep(0.2)
+    handoff = exit_canfd_session(bot.robot, print_diag=False)
+    diag.update(handoff)
+    if settle_s > 0.0:
+        time.sleep(settle_s)
+    return diag
+
+
+def idle_before_movev_init(robot, *, mode: str = "full", extra_settle_s: float = 0.0) -> None:
+    """Deprecated — always runs full exit_canfd_session."""
+    del mode
+    exit_canfd_session(robot, print_diag=False)
     if extra_settle_s > 0.0:
         time.sleep(extra_settle_s)
 
@@ -78,86 +69,6 @@ def init_velocity_canfd(robot, vc: dict, dt_ms: float) -> None:
     )
     if ret != 0:
         raise RuntimeError(f"rm_set_movev_canfd_init failed: {ret}")
-
-
-def settle_movev_after_init(
-    robot,
-    *,
-    dt_ms: float,
-    follow: bool,
-    trajectory_mode: int,
-    radio: int,
-    n_frames: int = 10,
-) -> None:
-    """Zero-velocity frames after rm_set_movev_canfd_init — cuts mode-switch jerk."""
-    dt_s = dt_ms / 1000.0
-    zero = [0.0] * 6
-    next_tick = time.monotonic()
-    for _ in range(n_frames):
-        now = time.monotonic()
-        if now < next_tick:
-            time.sleep(min(0.002, next_tick - now))
-        next_tick += dt_s
-        send_velocity_canfd(
-            robot, zero,
-            follow=follow, trajectory_mode=trajectory_mode, radio=radio,
-        )
-
-
-def wait_movev_quiescent(
-    robot,
-    *,
-    dt_ms: float,
-    follow: bool,
-    trajectory_mode: int,
-    radio: int,
-    settle_mm: float = 0.3,
-    need_consecutive: int = 5,
-    max_frames: int = 200,
-) -> tuple[np.ndarray | None, float, int]:
-    """
-    Stream zero velocity until the TCP stops moving, THEN anchor.
-
-    Switching into rm_movev_canfd carries a non-deterministic mode-switch transient:
-    even with v=0 the controller can coast a few mm before the internal velocity
-    reference settles (observed 0.05 mm one run, 9.4 mm the next, same config). Rather
-    than anchor a fixed N frames after init, we watch frame-to-frame motion and only
-    anchor once it is < settle_mm for need_consecutive ticks (or max_frames timeout).
-
-    Returns (last_pose, max_step_mm_observed, frames_used).
-    """
-    dt_s = dt_ms / 1000.0
-    zero = [0.0] * 6
-    next_tick = time.monotonic()
-    prev_xyz: np.ndarray | None = None
-    last_pose: np.ndarray | None = None
-    quiet = 0
-    max_step_mm = 0.0
-    for k in range(max_frames):
-        now = time.monotonic()
-        if now < next_tick:
-            time.sleep(min(0.002, next_tick - now))
-        next_tick += dt_s
-        send_velocity_canfd(
-            robot, zero,
-            follow=follow, trajectory_mode=trajectory_mode, radio=radio,
-        )
-        ret, st = robot.rm_get_current_arm_state()
-        if ret != 0:
-            continue
-        pose = np.asarray(st["pose"][:6], dtype=float)
-        last_pose = pose
-        if prev_xyz is not None:
-            step_mm = float(np.linalg.norm((pose[:3] - prev_xyz) * 1000.0))
-            max_step_mm = max(max_step_mm, step_mm)
-            if step_mm < settle_mm:
-                quiet += 1
-                if quiet >= need_consecutive:
-                    return last_pose, max_step_mm, k + 1
-            else:
-                quiet = 0
-        prev_xyz = pose[:3].copy()
-    return last_pose, max_step_mm, max_frames
 
 
 def hold_velocity_command(
@@ -299,14 +210,10 @@ def velocity_realign_to_pose(
                 v_out[i], last_v[i] - dv_ang, last_v[i] + dv_ang,
             ))
         last_v = v_out.copy()
-        send_velocity_canfd(
-            robot, v_out.tolist(),
-            follow=follow, trajectory_mode=trajectory_mode, radio=radio,
-        )
+        send_velocity_canfd(robot, v_out.tolist(), follow=follow)
 
     settle_movev_after_init(
-        robot, dt_ms=dt_ms, follow=follow,
-        trajectory_mode=trajectory_mode, radio=radio, n_frames=settle_frames,
+        robot, dt_ms=dt_ms, follow=follow, n_frames=settle_frames,
     )
     snap = async_obs.read()
     if snap.pose is not None:
@@ -465,8 +372,7 @@ def run_velocity_admittance(
             flush=True,
         )
     print(
-        f"  pre-movev prep: {pre_movev_prep} "
-        f"(minimal/skip after move_j; light = run_sin_tool_y)",
+        f"  pre-movev: enter_movev_session (unified exit + init + quiescence)",
         flush=True,
     )
     if tool_hint:
@@ -494,14 +400,23 @@ def run_velocity_admittance(
                 print("  (cleared latched controller errors on connect)", flush=True)
 
         pose_slot_cartesian: np.ndarray | None = None
+        q_resync: np.ndarray | None = None
         if pose_slot:
             fid = load_config(CONFIG_ID)
             spd = int(move_speed) if move_speed is not None else fid.collect.move_speed
             q_tgt, pose_slot_cartesian, rec = load_slot(fid, pose_slot)
+            q_resync = np.asarray(q_tgt, dtype=float)
             pose_slot_cartesian = np.asarray(pose_slot_cartesian, dtype=float)
             print(
                 f"  move_j → {pose_slot} ({rec.get('label', '')}) speed={spd}",
                 flush=True,
+            )
+            exit_canfd_session(
+                bot.robot,
+                q_resync=q_resync,
+                move_speed=spd,
+                settle_timeout_s=fid.collect.settle_timeout_s,
+                print_diag=True,
             )
             move_j(bot.robot, q_tgt, speed=spd)
             pose_act, q_act = wait_settle(
@@ -525,21 +440,27 @@ def run_velocity_admittance(
         traj = TrajectoryGenerator.from_dict(raw, pose0, bot.robot)
         pose_before_prep = pose0.copy()
 
-        if pre_movev_prep == "full":
-            prep = prepare_canfd_velocity_session(bot, settle_s=0.5)
-            print(
-                f"  CANFD prep (full recover): idle={prep.get('planning_idle')}  "
-                f"traj={prep.get('trajectory_type_final')}  "
-                f"euler_deg={prep.get('pose_euler_deg', [])}",
-                flush=True,
-            )
-            if not prep.get("planning_idle", False):
-                print("  WARN: planner not idle before movev init — snap more likely", flush=True)
-        else:
-            idle_before_movev_init(
-                bot.robot, mode=pre_movev_prep, extra_settle_s=pre_movev_settle_s,
-            )
-            print(f"  CANFD prep: {pre_movev_prep}", flush=True)
+        fid_cfg = load_config(CONFIG_ID)
+        spd = int(move_speed) if move_speed is not None else fid_cfg.collect.move_speed
+        init_settle_frames = max(30, settle_frames)
+
+        bot.prepare_for_force_stream(settle_s=0.0)
+        _, prep = enter_movev_session(
+            bot.robot,
+            frame_type=frame_type,
+            avoid_singularity=int(vc_run.get("avoid_singularity", 0)),
+            dt_ms=dt_ms,
+            follow=follow,
+            q_resync=q_resync,
+            settle_frames=init_settle_frames,
+            quiescent_mm=0.3,
+            move_speed=spd,
+            settle_timeout_s=fid_cfg.collect.settle_timeout_s,
+            print_diag=True,
+        )
+        quiesce_step_mm = float(prep.get("quiescent_max_step_mm", 0.0))
+        quiesce_frames = int(prep.get("quiescent_frames", 0))
+        pose_quiet_raw = prep.get("quiescent_pose")
 
         ret_pre, st_pre = bot.robot.rm_get_current_arm_state()
         pose_pre = pose_before_prep.copy()
@@ -555,58 +476,32 @@ def run_velocity_admittance(
                 flush=True,
             )
 
-        init_velocity_canfd(bot.robot, vc_run, dt_ms)
-        init_settle_frames = max(1, settle_frames)
-        settle_movev_after_init(
-            bot.robot, dt_ms=dt_ms, follow=follow,
-            trajectory_mode=traj_mode, radio=radio, n_frames=init_settle_frames,
-        )
-        # Anchor only AFTER the switch-in transient has actually died out: stream zero
-        # velocity and watch frame-to-frame motion until the TCP is quiescent. This
-        # removes the non-deterministic "init snap" (the arm coasting mm under v=0
-        # right after CANFD switch-in) from biasing pose0 / traj origin.
-        pose_quiet, quiesce_step_mm, quiesce_frames = wait_movev_quiescent(
-            bot.robot, dt_ms=dt_ms, follow=follow,
-            trajectory_mode=traj_mode, radio=radio,
-            settle_mm=0.3, need_consecutive=5, max_frames=200,
-        )
+        pose_post = pose0.copy()
+        if pose_quiet_raw is not None:
+            pose_post = np.asarray(pose_quiet_raw, dtype=float)
+        elif ret_pre == 0:
+            pose_post = np.asarray(st_pre["pose"][:6], dtype=float)
+
+        deuler = np.degrees(pose_post[3:6] - pose_pre[3:6])
+        deuler = (deuler + 180.0) % 360.0 - 180.0
+        dpos_mm = (pose_post[:3] - pose_pre[:3]) * 1000.0
         print(
-            f"  movev quiescence: settled after {quiesce_frames} frames "
-            f"(max step {quiesce_step_mm:.2f}mm/tick)",
+            f"  post-init settle Δpos_mm="
+            f"[{dpos_mm[0]:+.2f},{dpos_mm[1]:+.2f},{dpos_mm[2]:+.2f}]  "
+            f"Δeuler_deg=[{deuler[0]:+.2f},{deuler[1]:+.2f},{deuler[2]:+.2f}]",
             flush=True,
         )
-        ret_post, st_post = bot.robot.rm_get_current_arm_state()
-        pose_post = pose0.copy()
-        if pose_quiet is not None:
-            pose_post = pose_quiet.copy()
-            ret_post = 0
-        if ret_post == 0:
-            if pose_quiet is None:
-                pose_post = np.asarray(st_post["pose"][:6], dtype=float)
-            deuler = np.degrees(pose_post[3:6] - pose_pre[3:6])
-            deuler = (deuler + 180.0) % 360.0 - 180.0
-            dpos_mm = (pose_post[:3] - pose_pre[:3]) * 1000.0
-            print(
-                f"  post-init settle Δpos_mm="
-                f"[{dpos_mm[0]:+.2f},{dpos_mm[1]:+.2f},{dpos_mm[2]:+.2f}]  "
-                f"Δeuler_deg=[{deuler[0]:+.2f},{deuler[1]:+.2f},{deuler[2]:+.2f}]",
-                flush=True,
-            )
-            snap_mm = float(np.linalg.norm(dpos_mm))
-            if snap_mm > 3.0:
-                print(
-                    f"  init snap |Δ|={snap_mm:.1f}mm — "
-                    f"try pre_movev_prep: skip or minimal after move_j",
-                    flush=True,
-                )
-            pose0 = pose_post.copy()
-            traj_origin = pose0.copy()
-            traj.set_origin(pose0)
-            print(
-                f"  anchored pose0 (post-init): "
-                f"xyz=[{pose0[0]:.3f},{pose0[1]:.3f},{pose0[2]:.3f}] m",
-                flush=True,
-            )
+        snap_mm = float(np.linalg.norm(dpos_mm))
+        if snap_mm > 3.0:
+            print(f"  init snap |Δ|={snap_mm:.1f}mm", flush=True)
+        pose0 = pose_post.copy()
+        traj_origin = pose0.copy()
+        traj.set_origin(pose0)
+        print(
+            f"  anchored pose0 (post-init): "
+            f"xyz=[{pose0[0]:.3f},{pose0[1]:.3f},{pose0[2]:.3f}] m",
+            flush=True,
+        )
 
         async_obs = AsyncStateObserver(bot.robot, poll_s=async_poll_ms / 1000.0)
         async_obs.start()
@@ -888,11 +783,7 @@ def run_velocity_admittance(
                 except Exception as exc:
                     print(f"  scan log save failed: {exc}", flush=True)
             try:
-                settle_movev_after_init(
-                    bot.robot, dt_ms=dt_ms, follow=follow,
-                    trajectory_mode=traj_mode, radio=radio, n_frames=15,
-                )
-                bot.robot.rm_set_arm_slow_stop()
+                exit_canfd_session(bot.robot, print_diag=False)
             except Exception:
                 pass
 

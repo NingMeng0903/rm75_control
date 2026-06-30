@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from rm75_control.motion.canfd import TRAJ0_MODE, TRAJ0_RADIO
+
 from .paths import CONFIG_ID, LOG_DIR, REPO, npz_for_slot
 
 
@@ -71,6 +73,8 @@ def load_velocity_burst(raw: dict) -> VelocityBurstConfig:
     if "freqs_hz" in overrides:
         overrides["freqs_hz"] = [float(x) for x in overrides["freqs_hz"]]
     p = {**base, **overrides}
+    p["trajectory_mode"] = TRAJ0_MODE
+    p["radio"] = TRAJ0_RADIO
     return VelocityBurstConfig(
         profile=name,
         amp_deg_s=float(p["amp_deg_s"]),
@@ -95,7 +99,9 @@ class CartesianConfig:
     amp_mm: np.ndarray
     amp_rot_deg: np.ndarray
     amp_rot_deg_slots: dict[str, np.ndarray]
+    amp_mm_slots: dict[str, np.ndarray]
     freqs_hz: list[list[float]]
+    ramp_down_s: float
 
     def max_deg_for_slot(self, slot: str) -> float:
         return float(self.max_orient_deg.get(slot, self.max_orient_deg.get("a", 18.0)))
@@ -104,6 +110,11 @@ class CartesianConfig:
         if slot in self.amp_rot_deg_slots:
             return self.amp_rot_deg_slots[slot]
         return self.amp_rot_deg
+
+    def amp_mm_for_slot(self, slot: str) -> np.ndarray:
+        if slot in self.amp_mm_slots:
+            return self.amp_mm_slots[slot]
+        return self.amp_mm
 
 
 @dataclass(frozen=True)
@@ -125,6 +136,9 @@ class CollectConfig:
     scale: float
     warmup_s: float
     follow: bool
+    cartesian_ramp_down_s: float
+    movev_settle_frames: int
+    movev_quiescent_mm: float
     cartesian: CartesianConfig
     pose_d: PoseDConfig
     sequence: tuple[str, ...]
@@ -185,6 +199,7 @@ def load_config(path: Path | None = None) -> ForceIdConfig:
     if not br:
         raise ValueError("pose_d.velocity_burst required (profile: pose_d_vel_burst)")
     rot_slots = cart.get("amp_rot_deg_slots", {})
+    mm_slots = cart.get("amp_mm_slots", {})
     f = raw.get("fit", {})
     m = raw.get("monitor", {})
 
@@ -203,6 +218,9 @@ def load_config(path: Path | None = None) -> ForceIdConfig:
             scale=float(c.get("scale", 1.0)),
             warmup_s=float(c.get("warmup_s", 3.0)),
             follow=bool(c.get("follow", False)),
+            cartesian_ramp_down_s=float(c.get("cartesian_ramp_down_s", cart.get("ramp_down_s", 2.5))),
+            movev_settle_frames=int(c.get("movev_settle_frames", 30)),
+            movev_quiescent_mm=float(c.get("movev_quiescent_mm", 0.3)),
             sequence=sequence,
             return_home=str(raw.get("return_home", "a")),
             cartesian=CartesianConfig(
@@ -215,7 +233,12 @@ def load_config(path: Path | None = None) -> ForceIdConfig:
                     str(k): np.asarray(v, dtype=float)
                     for k, v in rot_slots.items()
                 },
+                amp_mm_slots={
+                    str(k): np.asarray(v, dtype=float)
+                    for k, v in mm_slots.items()
+                },
                 freqs_hz=[list(map(float, row)) for row in cart.get("freqs_hz", [])],
+                ramp_down_s=float(cart.get("ramp_down_s", c.get("cartesian_ramp_down_s", 2.5))),
             ),
             pose_d=PoseDConfig(
                 joint_duration_s=float(pd.get("joint_duration_s", 30.0)),

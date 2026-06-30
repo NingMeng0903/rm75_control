@@ -15,17 +15,26 @@ collect:
   scale: 1.0
   warmup_s: 3.0
   follow: false
+  cartesian_ramp_down_s: 2.5
+  movev_settle_frames: 30
+  movev_quiescent_mm: 0.3
 
   cartesian:
     duration_s: 30.0
     max_delta_mm: 5.0
     max_orient_deg:
-      a: 18.0
+      a: 24.0
       b: 32.0
       c: 32.0
-    amp_mm: [3.0, 4.0, 2.0]
-    amp_rot_deg: [12.0, 15.0, 12.0]
+    amp_mm: [4.0, 4.0, 2.0]
+    amp_mm_slots:
+      # pose_a TCP ~horizontal: X-dominant linear + large Rx (gravity→Fx) at this pose.
+      a: [4.5, 2.5, 1.5]
+      b: [4.5, 4.0, 2.5]
+      c: [4.5, 4.0, 2.5]
+    amp_rot_deg: [14.0, 16.0, 12.0]
     amp_rot_deg_slots:
+      a: [24.0, 14.0, 12.0]
       b: [16.0, 20.0, 16.0]
       c: [16.0, 20.0, 16.0]
     freqs_hz:
@@ -37,7 +46,7 @@ collect:
       - [0.24, 0.31]
 
   pose_d:
-    # Phase 0: joint 45s. Phase 1: pose_d_vel_burst 45s (resync to q0 before burst).
+    # Phase 0: joint 45s. Phase 1: pose_d_vel_burst 45s (enter_movev_session handoff).
     joint_duration_s: 45.0
     burst_duration_s: 45.0
     joint_amp_deg: [10.0, 8.0, 8.0, 14.0, 16.0, 14.0, 32.0]
@@ -52,7 +61,9 @@ collect:
       - [0.20, 0.29]
     velocity_burst:
       profile: pose_d_vel_burst
-      # base wx→wy→wz 12°/s 0.28Hz traj=0; init settle 100ms (see excitation.settle_movev_after_init)
+      # base wx→wy→wz; peak angle ≈ amp_deg_s / (360*freq_hz) deg per tone
+      amp_deg_s: 18.0
+      freqs_hz: [0.22]
       ramp_down_s: 4.0
 
 fit:

@@ -198,8 +198,17 @@ def print_summary(
     print(f"  biasF = [{phi[10]:+.3f}, {phi[11]:+.3f}, {phi[12]:+.3f}] N")
     print(f"  biasM = [{phi[13]:+.4f}, {phi[14]:+.4f}, {phi[15]:+.4f}] N·m")
     print(f"  RMS   = {rms_all:.4f}")
+    axis_names = ("Fx", "Fy", "Fz", "Mx", "My", "Mz")
     for slot, st in per_pose.items():
-        print(f"  {slot}: F={st['rms_force']:.3f} N  M={st['rms_moment']:.4f} N·m")
+        line = f"  {slot}: F={st['rms_force']:.3f} N  M={st['rms_moment']:.4f} N·m"
+        per_axis = st.get("per_axis")
+        if per_axis is not None:
+            pa = np.asarray(per_axis, dtype=float)
+            if pa.size >= 6:
+                line += (
+                    f"  per_axis=[{', '.join(f'{axis_names[i]}={pa[i]:.3f}' for i in range(6))}]"
+                )
+        print(line)
     print(f"  {out_json}")
 
 

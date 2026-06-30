@@ -11,6 +11,15 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from rm75_control.motion.canfd import (
+    TRAJ0_MODE,
+    TRAJ0_RADIO,
+    enter_movev_session,
+    exit_canfd_session,
+    send_pose_canfd,
+    send_velocity_canfd,
+)
+
 from .id_config import CartesianConfig, PoseDConfig, VelocityBurstConfig
 
 DEG2RAD = math.pi / 180.0
@@ -86,16 +95,8 @@ def vel_burst_cmd(
 
 
 def prepare_movev_session(bot) -> dict:
-    diag = bot.prepare_for_force_stream(settle_s=1.0)
-    diag["delete_traj"] = bot.robot.rm_set_arm_delete_trajectory()
-    diag["slow_stop"] = bot.robot.rm_set_arm_slow_stop()
-    time.sleep(0.5)
-    traj = bot.robot.rm_get_arm_current_trajectory()
-    diag["trajectory_type"] = traj.get("trajectory_type", -1)
-    ret, st = bot.robot.rm_get_current_arm_state()
-    if ret == 0:
-        diag["err"] = st.get("err", {})
-    return diag
+    """Deprecated alias — use exit_canfd_session / enter_movev_session."""
+    return exit_canfd_session(bot.robot, print_diag=False)
 
 
 def init_velocity_canfd(robot, *, vb: VelocityBurstConfig, dt_ms: float) -> None:
@@ -110,25 +111,15 @@ def settle_movev_after_init(
     vb: VelocityBurstConfig,
     dt_ms: float,
     next_tick: float | None = None,
-    n_frames: int = 10,
+    n_frames: int = 30,
 ) -> float:
     """Zero velocity hold after rm_set_movev_canfd_init — cuts mode-switch jerk before burst."""
-    from rm75_control.motion.canfd import send_velocity_canfd
+    from rm75_control.motion.canfd import settle_movev_after_init as _settle
 
-    dt_s = dt_ms / 1000.0
-    if next_tick is None:
-        next_tick = time.monotonic()
-    zero = [0.0] * 6
-    for _ in range(n_frames):
-        now = time.monotonic()
-        if now < next_tick:
-            time.sleep(min(0.002, next_tick - now))
-        next_tick += dt_s
-        send_velocity_canfd(
-            robot, zero,
-            follow=vb.follow, trajectory_mode=vb.trajectory_mode, radio=vb.radio,
-        )
-    return next_tick
+    return _settle(
+        robot, dt_ms=dt_ms, follow=vb.follow,
+        n_frames=n_frames, next_tick=next_tick,
+    )
 
 
 def settle_movev_stream(
@@ -136,28 +127,19 @@ def settle_movev_stream(
     *,
     dt_ms: float,
     follow: bool,
-    trajectory_mode: int,
-    radio: int,
+    trajectory_mode: int = 0,
+    radio: int = 0,
     next_tick: float | None = None,
-    n_frames: int = 10,
+    n_frames: int = 30,
 ) -> float:
-    """Same as settle_movev_after_init for test paths without VelocityBurstConfig."""
-    from rm75_control.motion.canfd import send_velocity_canfd
+    """Zero-velocity settle for test paths (traj0 enforced in send layer)."""
+    del trajectory_mode, radio
+    from rm75_control.motion.canfd import settle_movev_after_init as _settle
 
-    dt_s = dt_ms / 1000.0
-    if next_tick is None:
-        next_tick = time.monotonic()
-    zero = [0.0] * 6
-    for _ in range(n_frames):
-        now = time.monotonic()
-        if now < next_tick:
-            time.sleep(min(0.002, next_tick - now))
-        next_tick += dt_s
-        send_velocity_canfd(
-            robot, zero,
-            follow=follow, trajectory_mode=trajectory_mode, radio=radio,
-        )
-    return next_tick
+    return _settle(
+        robot, dt_ms=dt_ms, follow=follow,
+        n_frames=n_frames, next_tick=next_tick,
+    )
 
 
 def begin_pose_d_vel_burst(
@@ -166,34 +148,46 @@ def begin_pose_d_vel_burst(
     vb: VelocityBurstConfig,
     dt_ms: float,
     next_tick: float | None = None,
+    q_resync: np.ndarray | None = None,
+    settle_frames: int = 30,
+    quiescent_mm: float = 0.3,
+    move_speed: int = 15,
+    settle_timeout_s: float = 15.0,
 ) -> float:
-    """prepare → init → zero-velocity settle; same handoff as test_pose_d_vel_burst.py."""
-    prepare_movev_session(bot)
-    init_velocity_canfd(bot.robot, vb=vb, dt_ms=dt_ms)
-    return settle_movev_after_init(
-        bot.robot, vb=vb, dt_ms=dt_ms,
-        next_tick=next_tick if next_tick is not None else time.monotonic(),
+    """Full movev handoff via enter_movev_session."""
+    next_tick, diag = enter_movev_session(
+        bot.robot,
+        frame_type=vb.frame_type,
+        avoid_singularity=vb.avoid_singularity,
+        dt_ms=dt_ms,
+        follow=vb.follow,
+        q_resync=q_resync,
+        settle_frames=settle_frames,
+        quiescent_mm=quiescent_mm,
+        move_speed=move_speed,
+        settle_timeout_s=settle_timeout_s,
+        next_tick=next_tick,
+        print_diag=True,
     )
+    return next_tick
 
 
-def ramp_down_velocity(
+def ramp_down_cartesian(
     robot,
-    start_vel: np.ndarray,
+    pose0: np.ndarray,
+    start_delta: np.ndarray,
     *,
-    vb: VelocityBurstConfig,
+    follow: bool,
     dt_ms: float,
+    ramp_s: float,
     next_tick: float | None = None,
 ) -> float:
-    from rm75_control.motion.canfd import send_velocity_canfd
-
-    start_vel = np.asarray(start_vel, dtype=float)
-    ramp_s = vb.ramp_down_s
+    """Cosine fade of pose delta to zero before exit_canfd_session."""
+    start_delta = np.asarray(start_delta, dtype=float)
+    pose0 = np.asarray(pose0, dtype=float)
     dt_s = dt_ms / 1000.0
-    if ramp_s <= 0 or float(np.max(np.abs(start_vel))) < 1e-9:
-        send_velocity_canfd(
-            robot, [0.0] * 6,
-            follow=vb.follow, trajectory_mode=vb.trajectory_mode, radio=vb.radio,
-        )
+    if ramp_s <= 0 or float(np.max(np.abs(start_delta))) < 1e-9:
+        send_pose_canfd(robot, pose0.tolist(), follow=follow)
         return next_tick if next_tick is not None else time.monotonic()
 
     n = max(2, int(ramp_s / dt_s) + 1)
@@ -205,15 +199,38 @@ def ramp_down_velocity(
             time.sleep(min(0.002, next_tick - now))
         next_tick += dt_s
         scale = 0.5 * (1.0 + math.cos(math.pi * i / (n - 1)))
-        send_velocity_canfd(
-            robot, (start_vel * scale).tolist(),
-            follow=vb.follow, trajectory_mode=vb.trajectory_mode, radio=vb.radio,
-        )
+        send_pose_canfd(robot, (pose0 + start_delta * scale).tolist(), follow=follow)
+    send_pose_canfd(robot, pose0.tolist(), follow=follow)
+    return next_tick
+
+
+def ramp_down_velocity(
+    robot,
+    start_vel: np.ndarray,
+    *,
+    vb: VelocityBurstConfig,
+    dt_ms: float,
+    next_tick: float | None = None,
+) -> float:
+    start_vel = np.asarray(start_vel, dtype=float)
+    ramp_s = vb.ramp_down_s
+    dt_s = dt_ms / 1000.0
+    if ramp_s <= 0 or float(np.max(np.abs(start_vel))) < 1e-9:
+        send_velocity_canfd(robot, [0.0] * 6, follow=vb.follow)
+        return next_tick if next_tick is not None else time.monotonic()
+
+    n = max(2, int(ramp_s / dt_s) + 1)
+    if next_tick is None:
+        next_tick = time.monotonic()
+    for i in range(n):
+        now = time.monotonic()
+        if now < next_tick:
+            time.sleep(min(0.002, next_tick - now))
+        next_tick += dt_s
+        scale = 0.5 * (1.0 + math.cos(math.pi * i / (n - 1)))
+        send_velocity_canfd(robot, (start_vel * scale).tolist(), follow=vb.follow)
     for _ in range(3):
-        send_velocity_canfd(
-            robot, [0.0] * 6,
-            follow=vb.follow, trajectory_mode=vb.trajectory_mode, radio=vb.radio,
-        )
+        send_velocity_canfd(robot, [0.0] * 6, follow=vb.follow)
         now = time.monotonic()
         if now < next_tick:
             time.sleep(min(0.002, next_tick - now))
@@ -230,9 +247,10 @@ class CartesianExcitation:
 
     @classmethod
     def from_config(cls, cart: CartesianConfig, scale: float, slot: str) -> "CartesianExcitation":
-        amp_rot = cart.amp_rot_deg_slots.get(slot, cart.amp_rot_deg) * scale
+        amp_rot = cart.amp_rot_for_slot(slot) * scale
+        amp_mm = cart.amp_mm_for_slot(slot) * scale
         return cls(
-            amp_mm=cart.amp_mm * scale,
+            amp_mm=amp_mm,
             amp_rot_deg=amp_rot,
             freqs_hz=cart.freqs_hz,
             slot=slot,
@@ -306,6 +324,6 @@ def preview_pose_d(q0: np.ndarray, pd: PoseDConfig, *, scale: float) -> dict:
         "burst_omega_deg_s_peak": omega_peak,
         "burst_profile": (
             f"{vb.profile} movev frame={vb.frame_type} amp={vb.amp_deg_s}°/s "
-            f"order={list(vb.axis_order)} traj={vb.trajectory_mode} radio={vb.radio}"
+            f"order={list(vb.axis_order)} traj={TRAJ0_MODE} radio={TRAJ0_RADIO}"
         ),
     }

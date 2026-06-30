@@ -1,12 +1,12 @@
 poses:
   a:
     label: pose_a
-    note: 2026-06-27 verified
+    note: rx snapped to -180° for horizontal TCP Fx excitation (2026-06-30)
     pose_base:
     - 0.284324
     - -0.002917
     - 0.332434
-    - -3.083
+    - -3.141593
     - 0.043
     - 2.892
     q_deg:

@@ -38,6 +38,12 @@ def move_j(robot, q_deg: np.ndarray, *, speed: int) -> None:
         raise RuntimeError(f"rm_movej failed: {ret}")
 
 
+def move_j_p(robot, pose: np.ndarray, *, speed: int) -> None:
+    ret = robot.rm_movej_p(pose.tolist(), speed, 0, 0, 1)
+    if ret != 0:
+        raise RuntimeError(f"rm_movej_p failed: {ret}")
+
+
 def wait_settle(robot, target_q: np.ndarray, *, timeout_s: float) -> tuple[np.ndarray, np.ndarray]:
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout_s:
@@ -54,14 +60,39 @@ def wait_settle(robot, target_q: np.ndarray, *, timeout_s: float) -> tuple[np.nd
     return np.asarray(st["pose"][:6], dtype=float), np.asarray(st["joint"][:7], dtype=float)
 
 
+def wait_settle_pose(
+    robot,
+    target_pose: np.ndarray,
+    *,
+    timeout_s: float,
+    tol_mm: float = 1.0,
+    tol_deg: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        ret, st = robot.rm_get_current_arm_state()
+        if ret == 0:
+            pose = np.asarray(st["pose"][:6], dtype=float)
+            d_mm, d_deg = ex.pose_drift_mm_deg(pose, target_pose)
+            if d_mm < tol_mm and d_deg < tol_deg:
+                time.sleep(0.5)
+                return pose, np.asarray(st["joint"][:7], dtype=float)
+        time.sleep(0.1)
+    ret, st = robot.rm_get_current_arm_state()
+    if ret != 0:
+        raise RuntimeError("get state failed after movej_p")
+    return np.asarray(st["pose"][:6], dtype=float), np.asarray(st["joint"][:7], dtype=float)
+
+
 def run_cartesian(bot, cfg: ForceIdConfig, slot: str) -> Path:
-    from rm75_control.motion.canfd import send_pose_canfd
+    from rm75_control.motion.canfd import exit_canfd_session, send_pose_canfd
 
     c = cfg.collect
     cart = c.cartesian
     max_deg = cart.max_deg_for_slot(slot)
     dt_s = c.dt_ms / 1000.0
     duration = cart.duration_s
+    ramp_down_s = c.cartesian_ramp_down_s
     out = npz_for_slot(slot)
     exc = ex.CartesianExcitation.from_config(cart, c.scale, slot)
 
@@ -79,9 +110,9 @@ def run_cartesian(bot, cfg: ForceIdConfig, slot: str) -> Path:
     f_log = np.zeros((n_log, 6))
     delta_log = np.zeros((n_log, 6))
 
-    print(f"\n  {slot}", flush=True)
     next_tick = time.monotonic()
     log_i = 0
+    t_end = (n_cmd - 1) * dt_s
     try:
         for i in range(n_cmd):
             now = time.monotonic()
@@ -98,7 +129,7 @@ def run_cartesian(bot, cfg: ForceIdConfig, slot: str) -> Path:
             )
             send_pose_canfd(
                 bot.robot, (pose0 + delta).tolist(),
-                follow=c.follow, trajectory_mode=0, radio=0,
+                follow=c.follow,
             )
             if i % c.log_every == 0:
                 ret_s, st = bot.robot.rm_get_current_arm_state()
@@ -111,12 +142,25 @@ def run_cartesian(bot, cfg: ForceIdConfig, slot: str) -> Path:
                 delta_log[log_i] = delta
                 t_log[log_i] = t_cmd
                 log_i += 1
+        ramp_end = min(1.0, t_end / c.warmup_s) if c.warmup_s > 0 else 1.0
+        delta_end = ex.clamp_delta(
+            exc.delta_pose(t_end) * ramp_end,
+            max_mm=cart.max_delta_mm,
+            max_rot_deg=max_deg,
+        )
+        next_tick = ex.ramp_down_cartesian(
+            bot.robot, pose0, delta_end,
+            follow=c.follow, dt_ms=c.dt_ms, ramp_s=ramp_down_s,
+            next_tick=next_tick,
+        )
     finally:
-        bot.stop_all()
-        try:
-            send_pose_canfd(bot.robot, pose0.tolist(), follow=c.follow, trajectory_mode=0, radio=0)
-        except Exception:
-            pass
+        exit_canfd_session(
+            bot.robot,
+            q_resync=q0,
+            move_speed=c.move_speed,
+            settle_timeout_s=c.settle_timeout_s,
+            print_diag=True,
+        )
 
     if out.exists():
         out.unlink()
@@ -133,7 +177,7 @@ def run_cartesian(bot, cfg: ForceIdConfig, slot: str) -> Path:
 
 
 def run_pose_d(bot, cfg: ForceIdConfig) -> Path:
-    from rm75_control.motion.canfd import send_velocity_canfd
+    from rm75_control.motion.canfd import exit_canfd_session, send_velocity_canfd
 
     c = cfg.collect
     pd = c.pose_d
@@ -180,20 +224,24 @@ def run_pose_d(bot, cfg: ForceIdConfig) -> Path:
                 phase = 0
             else:
                 if not movev_ready:
+                    print("  joint→movev handoff…", flush=True)
+                    burst_pose0 = pose0.copy()
                     if pd.joint_duration_s > 0:
-                        print("  resync pose d before burst…", flush=True)
-                        # Joint movej_canfd must stop before planned movej + movev init.
-                        bot.stop_all()
-                        time.sleep(0.5)
-                        move_j(bot.robot, q0, speed=c.move_speed)
-                        burst_pose0, _ = wait_settle(
-                            bot.robot, q0, timeout_s=c.settle_timeout_s,
-                        )
-                    else:
-                        burst_pose0 = pose0.copy()
+                        ret_s, st = bot.robot.rm_get_current_arm_state()
+                        if ret_s == 0:
+                            burst_pose0 = np.asarray(st["pose"][:6], dtype=float)
                     next_tick = ex.begin_pose_d_vel_burst(
                         bot, vb=vb, dt_ms=c.dt_ms,
+                        q_resync=q0,
+                        settle_frames=c.movev_settle_frames,
+                        quiescent_mm=c.movev_quiescent_mm,
+                        move_speed=c.move_speed,
+                        settle_timeout_s=c.settle_timeout_s,
+                        next_tick=next_tick,
                     )
+                    ret_s, st = bot.robot.rm_get_current_arm_state()
+                    if ret_s == 0:
+                        burst_pose0 = np.asarray(st["pose"][:6], dtype=float)
                     movev_ready = True
                 t_burst = t_cmd - pd.joint_duration_s
                 vel_cmd, _ = ex.vel_burst_cmd(t_burst, vb, scale=c.scale)
@@ -201,8 +249,6 @@ def run_pose_d(bot, cfg: ForceIdConfig) -> Path:
                 send_velocity_canfd(
                     bot.robot, vel_cmd.tolist(),
                     follow=vb.follow,
-                    trajectory_mode=vb.trajectory_mode,
-                    radio=vb.radio,
                 )
                 phase = 1
                 ret = 0
@@ -233,17 +279,13 @@ def run_pose_d(bot, cfg: ForceIdConfig) -> Path:
                 ex.ramp_down_velocity(bot.robot, last_vel, vb=vb, dt_ms=c.dt_ms)
             except Exception:
                 pass
-        if movev_ready:
-            try:
-                bot.robot.rm_set_arm_slow_stop()
-            except Exception:
-                pass
-        else:
-            bot.stop_all()
-        try:
-            bot.robot.rm_movej_canfd(q0.tolist(), False, 0, 0, 0)
-        except Exception:
-            pass
+        exit_canfd_session(
+            bot.robot,
+            q_resync=q0,
+            move_speed=c.move_speed,
+            settle_timeout_s=c.settle_timeout_s,
+            print_diag=True,
+        )
 
     burst_pose0_save = burst_pose0.copy()
     if log_i > 0 and np.any(phase_log[:log_i] == 1) and pd.joint_duration_s <= 0:
@@ -333,20 +375,48 @@ def main(argv: list[str] | None = None) -> int:
     with RobotSession(config=CONFIG_ROBOT) as bot:
         saved = []
         for slot in seq:
-            q_tgt, _, rec = slots[slot]
+            q_tgt, pose_tgt, rec = slots[slot]
             print(f"\nMove {slot}")
-            move_j(bot.robot, q_tgt, speed=c.move_speed)
-            wait_settle(bot.robot, q_tgt, timeout_s=c.settle_timeout_s)
+            from rm75_control.motion.canfd import exit_canfd_session
+
+            exit_canfd_session(
+                bot.robot,
+                q_resync=q_tgt if slot == "d" else None,
+                move_speed=c.move_speed,
+                settle_timeout_s=c.settle_timeout_s,
+                print_diag=True,
+            )
+            if slot == "d":
+                move_j(bot.robot, q_tgt, speed=c.move_speed)
+                wait_settle(bot.robot, q_tgt, timeout_s=c.settle_timeout_s)
+            else:
+                move_j_p(bot.robot, pose_tgt, speed=c.move_speed)
+                wait_settle_pose(bot.robot, pose_tgt, timeout_s=c.settle_timeout_s)
             if slot == "d":
                 saved.append(run_pose_d(bot, cfg))
             else:
                 saved.append(run_cartesian(bot, cfg, slot))
 
         home = c.return_home
-        q_h, _, _ = slots[home]
+        q_h, pose_h, _ = slots[home]
         print(f"\nReturn {home}")
-        move_j(bot.robot, q_h, speed=c.move_speed)
-        wait_settle(bot.robot, q_h, timeout_s=c.settle_timeout_s)
+        from rm75_control.motion.canfd import exit_canfd_session
+
+        exit_canfd_session(
+            bot.robot,
+            q_resync=q_h if home == "d" else None,
+            move_speed=c.move_speed,
+            settle_timeout_s=c.settle_timeout_s,
+            print_diag=True,
+        )
+        if home == "d":
+            move_j(bot.robot, q_h, speed=c.move_speed)
+        else:
+            move_j_p(bot.robot, pose_h, speed=c.move_speed)
+        if home == "d":
+            wait_settle(bot.robot, q_h, timeout_s=c.settle_timeout_s)
+        else:
+            wait_settle_pose(bot.robot, pose_h, timeout_s=c.settle_timeout_s)
         print("\nCollection done:")
         for p in saved:
             print(f"  {p}")
