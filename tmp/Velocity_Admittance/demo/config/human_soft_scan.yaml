@@ -1,7 +1,4 @@
-# Human soft-tissue scan — scan-safe adaptive critical damping.
-#
-# Yanan Li K_e=ΔF/Δx needs the *normal admittance axis* (not TCP pose during sweep).
-# Keemink G4: fixed m_d sets max normal accel = |F_err|/m_d.
+# Human soft-tissue scan — adaptive ζ + Dimeas; df spike gate; no v_r (A/B fixes).
 #
 # Run:
 #   python tmp/Velocity_Admittance/demo/d_to_a_sin_tool_y.py \
@@ -79,29 +76,37 @@ hybrid_motion:
   system_delay_s: 0.015
   pos_err_deadband_m: 0.001
   pos_correction_max_m_s: 0.05
-  # Keemink G4: m_d=3 → a_max≈|F_err|/3 ≈ 0.8 m/s² at 2.5N (smoother vz than m_d=2)
   admittance_mass_z: 3.0
   admittance_damping_z: 50.0
-  force_derivative_gain_z: 0.06   # Li 2022 proactive: damp Ḟ from scan geometry ripple
-  var_damping_enabled: false
+  force_derivative_gain_z: 0.06   # damp Ḟ from scan geometry ripple
+  var_damping_enabled: true
+  var_damping_omega_c_hz: 3.5
+  var_damping_lambda: 0.99
+  var_damping_f_max_n: 30.0
+  var_damping_d_u: 60.0
+  var_damping_m_u: 0.0
+  var_damping_dc_alpha: 0.02
+  proactive_feedforward: false       # v_r amplifies scan ripple; off until cap/notch fixed
+  alpha_proactive: 0.012
   adaptive_ke:
     enabled: true
-    zeta: 0.95                     # slightly overdamped on flesh (viscoelastic, not pure spring)
-    ke_initial: 200.0              # soft-tissue prior [N/m]
-    ke_min: 120.0                  # floor — prevents D collapse during Fz dips
-    ke_max: 8000.0                 # cap — reject bone-like spikes from ΔF/Δx outliers
-    ke_forgetting: 0.97            # slower — body site changes over seconds not ms
-    displacement_source: admittance # ∫v_force_z dt (NOT TCP pose during scan)
-    scan_vel_gate_m_s: 0.002       # hold K̂_e when |v_scan_tool_y| > 2 mm/s
-    df_spike_n: 5.0                # reject 67N-style Fz glitches
-    f_err_gate_n: 3.5              # only learn K_e near force setpoint
+    zeta: 1.1
+    ke_initial: 200.0
+    ke_min: 120.0
+    ke_max: 8000.0
+    ke_forgetting: 0.995
+    ke_forgetting_inc: 0.80
+    displacement_source: admittance
+    gate_scan_velocity: false
+    gate_df_spike: true              # reject |ΔF|>5N glitches (keep scan K̂_e updates)
+    df_spike_n: 5.0
+    f_err_gate_n: 3.5
     dx_threshold_m: 0.00008
     contact_force_n: 1.0
-    bd_min: 38.0                   # 2ζ√(m·ke_min) with m=3, ke_min=120, ζ=0.95
-    bd_max: 220.0
-    bd_slew_max: 800.0
+    bd_min: 42.0
+    bd_max: 350.0                    # 2ζ√(m·ke_max) ≈ 341 with m=3, ke_max=8000, ζ=1.1
+    bd_slew_max: 1200.0              # faster D track when K̂_e rises on hard patches
     ke_slew_max: 2000.0
-  # Keemink G6: tool-Z bandwidth must follow surface during lateral sweep
   max_vz_tool_m_s: 0.12
   approach_vz_tool_m_s: 0.015
   max_velocity: [0.025, 0.10, 0.12, 0.10, 0.10, 0.10]

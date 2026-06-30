@@ -8,9 +8,9 @@ Damping ratio ζ = b_d / (2√(m_d K_e)).  Holding ζ fixed while K_e changes re
 
     b_d(t) = 2 ζ √(m_d · K̂_e(t))
 
-**Scan caveat:** K_e = ΔF/Δx is only valid on the *normal admittance coordinate*.
-During lateral sweeps, raw TCP Δx and Fz ripple are geometry-coupled — use integrated
-admittance displacement and gate updates when scan velocity is high.
+**Scan caveat:** K_e = ΔF/Δx is only valid on the *normal admittance coordinate*
+(∫v_force_z dt). Optional gates (scan velocity, ΔF spike) default off so K̂_e can
+track stiffness during lateral sweeps; EWMA + asymmetric forgetting filter ripple.
 
 References:
   - Yanan Li & Ge, IEEE T-CST 2014 — impedance learning
@@ -32,7 +32,8 @@ class AdaptiveKeConfig:
     enabled: bool = False
     zeta: float = 1.0
     ke_initial: float = 500.0
-    ke_forgetting: float = 0.92
+    ke_forgetting: float = 0.995       # λ when surface softens (slow forget)
+    ke_forgetting_inc: float = 0.80    # λ when surface stiffens (fast track)
     ke_min: float = 0.0
     ke_max: float = 50000.0
     dx_threshold_m: float = 1e-4
@@ -42,9 +43,11 @@ class AdaptiveKeConfig:
     bd_slew_max: float = 2000.0
     ke_slew_max: float = 8000.0
     displacement_source: str = "admittance"
-    scan_vel_gate_m_s: float = 0.002
-    df_spike_n: float = 6.0
+    scan_vel_gate_m_s: float = 0.002   # ignored when gate_scan_velocity=false
+    df_spike_n: float = 6.0            # ignored when gate_df_spike=false
     f_err_gate_n: float = 4.0
+    gate_scan_velocity: bool = False   # if true, freeze K̂_e during lateral scan
+    gate_df_spike: bool = False        # if true, reject |ΔF| spikes
 
     @classmethod
     def from_dict(cls, raw: dict, parent: dict) -> AdaptiveKeConfig:
@@ -55,7 +58,10 @@ class AdaptiveKeConfig:
             enabled=bool(a.get("enabled", parent.get("adaptive_ke_enabled", False))),
             zeta=float(a.get("zeta", parent.get("adaptive_zeta", 1.0))),
             ke_initial=float(a.get("ke_initial", parent.get("ke_initial", 500.0))),
-            ke_forgetting=float(a.get("ke_forgetting", parent.get("ke_forgetting", 0.92))),
+            ke_forgetting=float(a.get("ke_forgetting", parent.get("ke_forgetting", 0.995))),
+            ke_forgetting_inc=float(
+                a.get("ke_forgetting_inc", parent.get("ke_forgetting_inc", 0.80))
+            ),
             ke_min=float(a.get("ke_min", parent.get("ke_min", 0.0))),
             ke_max=float(a.get("ke_max", parent.get("ke_max", 50000.0))),
             dx_threshold_m=float(a.get("dx_threshold_m", parent.get("ke_dx_threshold_m", 1e-4))),
@@ -74,6 +80,8 @@ class AdaptiveKeConfig:
             ),
             df_spike_n=float(a.get("df_spike_n", parent.get("ke_df_spike_n", 6.0))),
             f_err_gate_n=float(a.get("f_err_gate_n", parent.get("ke_f_err_gate_n", 4.0))),
+            gate_scan_velocity=bool(a.get("gate_scan_velocity", False)),
+            gate_df_spike=bool(a.get("gate_df_spike", False)),
         )
 
 
@@ -148,9 +156,9 @@ class EnvironmentStiffnessEstimator:
             return False
         if abs(f_err_z) > cfg.f_err_gate_n:
             return False
-        if abs(v_scan_tool_y) > cfg.scan_vel_gate_m_s:
+        if cfg.gate_scan_velocity and abs(v_scan_tool_y) > cfg.scan_vel_gate_m_s:
             return False
-        if abs(df) > cfg.df_spike_n:
+        if cfg.gate_df_spike and abs(df) > cfg.df_spike_n:
             return False
         return True
 
@@ -207,7 +215,9 @@ class EnvironmentStiffnessEstimator:
             if not gated and abs(dx) >= cfg.dx_threshold_m:
                 ke_inst = abs(df / dx)
                 ke_inst = float(np.clip(ke_inst, cfg.ke_min, cfg.ke_max))
-                lam = cfg.ke_forgetting
+                lam = (
+                    cfg.ke_forgetting_inc if ke_inst > self.ke_est else cfg.ke_forgetting
+                )
                 ke_target = lam * self.ke_est + (1.0 - lam) * ke_inst
                 self.ke_est = self._slew_ke(ke_target)
 

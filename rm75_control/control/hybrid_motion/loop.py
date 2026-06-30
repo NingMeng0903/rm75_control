@@ -143,6 +143,28 @@ def _pose_tracking_error_mm_deg(
     return pos_mm, rot_deg
 
 
+def _controller_scan_log_fields(controller: AdmittanceController) -> dict[str, float | bool]:
+    """Adaptive / Dimeas state for high-rate scan logs."""
+    cfg = controller.cfg
+    if cfg.adaptive_ke.enabled:
+        return {
+            "ke_est": float(controller.ke_est),
+            "adaptive_bd": float(controller.adaptive_bd),
+            "zeta_eff": float(controller.zeta_eff),
+            "instability_index": float(controller.instability_index),
+            "v_r_z": float(controller.v_r_z),
+            "update_gated": bool(controller._ke_estimator.update_gated),
+        }
+    return {
+        "ke_est": float("nan"),
+        "adaptive_bd": float(controller.damping_z_eff),
+        "zeta_eff": float("nan"),
+        "instability_index": float(controller.instability_index),
+        "v_r_z": float(controller.v_r_z),
+        "update_gated": False,
+    }
+
+
 def velocity_realign_to_pose(
     robot,
     async_obs: AsyncStateObserver,
@@ -755,6 +777,7 @@ def run_hybrid_motion_loop(
                                 pose_act=pose, q_deg=q_fb, pose_d=pose_d_log,
                                 vel_ff=vel_ff_log, v_cmd=v_cmd, f_ext=f_ext,
                                 f_des_z=f_des_z,
+                                **_controller_scan_log_fields(controller),
                             )
                     continue
 
@@ -794,6 +817,7 @@ def run_hybrid_motion_loop(
                             v_cmd=v_cmd,
                             f_ext=f_ext,
                             f_des_z=f_des_z,
+                            **_controller_scan_log_fields(controller),
                         )
 
                 send_velocity_canfd(

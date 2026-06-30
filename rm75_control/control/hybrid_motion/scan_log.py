@@ -30,6 +30,12 @@ class ScanLogRecorder:
         self.v_cmd = np.zeros((capacity, 6), dtype=float)
         self.f_ext = np.zeros((capacity, 6), dtype=float)
         self.f_des_z = np.zeros(capacity, dtype=float)
+        self.ke_est = np.full(capacity, np.nan, dtype=float)
+        self.adaptive_bd = np.full(capacity, np.nan, dtype=float)
+        self.zeta_eff = np.full(capacity, np.nan, dtype=float)
+        self.instability_index = np.full(capacity, np.nan, dtype=float)
+        self.v_r_z = np.full(capacity, np.nan, dtype=float)
+        self.update_gated = np.zeros(capacity, dtype=np.int8)
 
     def __len__(self) -> int:
         return self._n
@@ -38,13 +44,20 @@ class ScanLogRecorder:
         new_cap = self._cap + _GROW
         for name in (
             "t_s", "t_scan", "phase", "f_des_z",
+            "ke_est", "adaptive_bd", "zeta_eff", "instability_index", "v_r_z",
         ):
             old = getattr(self, name)
             ext = np.zeros(new_cap, dtype=old.dtype)
             ext[: self._cap] = old
             if name == "t_scan":
                 ext[self._cap :] = np.nan
+            elif name in ("ke_est", "adaptive_bd", "zeta_eff", "instability_index", "v_r_z"):
+                ext[self._cap :] = np.nan
             setattr(self, name, ext)
+        old_g = self.update_gated
+        ext_g = np.zeros(new_cap, dtype=old_g.dtype)
+        ext_g[: self._cap] = old_g
+        self.update_gated = ext_g
         for name in ("pose_act", "pose_d", "vel_ff", "v_cmd", "f_ext"):
             old = getattr(self, name)
             ext = np.zeros((new_cap, 6), dtype=float)
@@ -69,6 +82,12 @@ class ScanLogRecorder:
         v_cmd: np.ndarray,
         f_ext: np.ndarray,
         f_des_z: float,
+        ke_est: float = float("nan"),
+        adaptive_bd: float = float("nan"),
+        zeta_eff: float = float("nan"),
+        instability_index: float = float("nan"),
+        v_r_z: float = float("nan"),
+        update_gated: bool = False,
     ) -> None:
         if self._n >= self._cap:
             self._grow()
@@ -83,6 +102,12 @@ class ScanLogRecorder:
         self.v_cmd[i] = v_cmd
         self.f_ext[i] = f_ext
         self.f_des_z[i] = f_des_z
+        self.ke_est[i] = ke_est
+        self.adaptive_bd[i] = adaptive_bd
+        self.zeta_eff[i] = zeta_eff
+        self.instability_index[i] = instability_index
+        self.v_r_z[i] = v_r_z
+        self.update_gated[i] = 1 if update_gated else 0
         self._n += 1
 
     def save(self, path: Path, *, meta: dict | None = None) -> Path:
@@ -102,6 +127,12 @@ class ScanLogRecorder:
             "v_cmd": self.v_cmd[:n].copy(),
             "f_ext": self.f_ext[:n].copy(),
             "f_des_z": self.f_des_z[:n].copy(),
+            "ke_est": self.ke_est[:n].copy(),
+            "adaptive_bd": self.adaptive_bd[:n].copy(),
+            "zeta_eff": self.zeta_eff[:n].copy(),
+            "instability_index": self.instability_index[:n].copy(),
+            "v_r_z": self.v_r_z[:n].copy(),
+            "update_gated": self.update_gated[:n].copy(),
         }
         if meta:
             pack["meta_json"] = np.array([str(meta)])
@@ -251,6 +282,32 @@ def print_jerk_summary(path: Path, *, dt_s: float) -> None:
             "  (large world track err + smooth v_cmd tool-Y → execution/contact slip)",
             flush=True,
         )
+    if "ke_est" in data and np.any(scan_mask):
+        ke = data["ke_est"][scan_mask]
+        bd = data["adaptive_bd"][scan_mask]
+        zeta = data["zeta_eff"][scan_mask]
+        is_ = data["instability_index"][scan_mask]
+        vr = data["v_r_z"][scan_mask]
+        gated = data["update_gated"][scan_mask] if "update_gated" in data else None
+        finite = np.isfinite(ke)
+        if np.any(finite):
+            print(
+                f"  adaptive: K̂_e [{float(np.nanmin(ke)):.0f}, {float(np.nanmax(ke)):.0f}]  "
+                f"p50={float(np.nanmedian(ke)):.0f}  "
+                f"D [{float(np.nanmin(bd)):.0f}, {float(np.nanmax(bd)):.0f}]  "
+                f"ζ p50={float(np.nanmedian(zeta)):.2f}",
+                flush=True,
+            )
+            print(
+                f"  Dimeas Is max={float(np.nanmax(is_)):.3f} p95={float(np.nanpercentile(is_, 95)):.3f}  "
+                f"|v_r| max={float(np.nanmax(np.abs(vr))):.4f} m/s",
+                flush=True,
+            )
+            if gated is not None:
+                print(
+                    f"  K̂_e gated {100.0 * float(np.mean(gated)):.1f}% of scan ticks",
+                    flush=True,
+                )
     for axis, name in enumerate(["vx", "vy", "vz", "wx", "wy", "wz"]):
         col = v[scan_mask, axis] if np.any(scan_mask) else v[:, axis]
         col = col[np.isfinite(col)]

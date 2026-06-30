@@ -131,6 +131,10 @@ class AdmittanceConfig:
     var_damping_d_u: float = 60.0       # additive D at Is=1 [N·s/m]
     var_damping_m_u: float = 0.0        # additive M at Is=1 [kg] (0 = damping only)
     var_damping_dc_alpha: float = 0.02  # slow EWMA splitting DC bias from AC
+    # Li 2022 Eq. (23) proactive velocity reference on tool-Z: v_r = α·F_err.
+    # M·v̇ + D·(v − v_r) + Kdf·Ḟ = F_err — lowers apparent inertia / improves force feel.
+    proactive_feedforward: bool = False
+    alpha_proactive: float = 0.012  # [m/s/N]
     # Position-loop conditioning (PBAC). Small deadband kills FT/encoder-noise jitter
     # on the velocity-controlled (tracking) directions; the correction clamp keeps a
     # transient contact slip from surging the velocity command independent of vel_ff.
@@ -201,6 +205,8 @@ class AdmittanceConfig:
             var_damping_d_u=float(c.get("var_damping_d_u", 60.0)),
             var_damping_m_u=float(c.get("var_damping_m_u", 0.0)),
             var_damping_dc_alpha=float(c.get("var_damping_dc_alpha", 0.02)),
+            proactive_feedforward=bool(c.get("proactive_feedforward", False)),
+            alpha_proactive=float(c.get("alpha_proactive", 0.012)),
             pos_err_deadband_m=float(c.get("pos_err_deadband_m", 0.0)),
             pos_correction_max_m_s=float(c.get("pos_correction_max_m_s", 0.0)),
             adaptive_ke=AdaptiveKeConfig.from_dict(raw, c),
@@ -244,6 +250,7 @@ class AdmittanceController:
         self.ke_est = float(self.cfg.adaptive_ke.ke_initial)
         self.adaptive_bd = float(self.cfg.admittance_damping_z)
         self.zeta_eff = float(self.cfg.adaptive_ke.zeta)
+        self.v_r_z = 0.0
         self._init_hp_filter()
 
     def _init_hp_filter(self) -> None:
@@ -258,6 +265,7 @@ class AdmittanceController:
         self._contact_ticks = 0
         self.filtered_vz = 0.0
         self.v_force_z = 0.0
+        self.v_r_z = 0.0
         self.instability_index = 0.0
         self.damping_z_eff = float(self.cfg.admittance_damping_z)
         self._f_dc = 0.0
@@ -510,7 +518,8 @@ class AdmittanceController:
         """
         Discrete 2nd-order velocity admittance on tool-Z (Peirastic + Keemink G4):
 
-            M·v̇ + D·v + Kdf·Ḟ_ext = F_err
+            M·v̇ + D·(v − v_r) + Kdf·Ḟ_ext = F_err
+            v_r = α·F_err   (optional Li 2022 proactive reference)
 
         Ḟ_ext is the finite difference of compensated f_ext[2] (N/s); Kdf [s]
         adds damping against rapid force transients (scan ripple on soft tissue).
@@ -523,6 +532,8 @@ class AdmittanceController:
         if cfg.adaptive_ke.enabled:
             # b_d(t) = 2ζ√(m_d K̂_e): replaces static yaml D on contact (Li/Ge impedance learning).
             d = float(self.adaptive_bd)
+            if cfg.var_damping_enabled:
+                d += cfg.var_damping_d_u * self.instability_index
         else:
             d_base = self._directional_damping_z()
             if cfg.var_damping_enabled:
@@ -531,7 +542,9 @@ class AdmittanceController:
                 d = d_base
         self.damping_z_eff = float(d)
         kdf = float(cfg.admittance_force_derivative_gain_z)
-        v = self.v_force_z + (self.dt / m) * (eff - kdf * f_dot_z - d * self.v_force_z)
+        v_r = cfg.alpha_proactive * eff if (cfg.proactive_feedforward and in_contact) else 0.0
+        self.v_r_z = float(v_r)
+        v = self.v_force_z + (self.dt / m) * (eff - kdf * f_dot_z - d * (self.v_force_z - v_r))
 
         cap = cfg.max_vz_tool_m_s if in_contact else cfg.approach_vz_tool_m_s
         if cap > 0.0:

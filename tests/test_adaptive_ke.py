@@ -48,3 +48,37 @@ def test_ewma_stiffness_converges():
     assert 400.0 < est.ke_est < 1200.0
     zeta = est.zeta_eff
     assert 0.85 < zeta <= 1.05
+
+
+def test_asymmetric_ke_rises_faster_than_symmetric():
+    base = dict(
+        enabled=True,
+        zeta=1.0,
+        ke_initial=200.0,
+        ke_forgetting=0.995,
+        ke_min=0.0,
+        ke_max=10000.0,
+        dx_threshold_m=1e-5,
+        contact_force_n=0.1,
+        bd_slew_max=1e6,
+        ke_slew_max=1e6,
+        gate_scan_velocity=False,
+        gate_df_spike=False,
+    )
+    cfg_asym = AdaptiveKeConfig(**base, ke_forgetting_inc=0.80)
+    cfg_sym = AdaptiveKeConfig(**base, ke_forgetting_inc=0.995)
+    pose = np.zeros(6)
+    v_z = 0.00005 / 0.01
+
+    def run_ramp(est: EnvironmentStiffnessEstimator, true_ke: float, n: int) -> float:
+        f = 0.0
+        for _ in range(n):
+            f += true_ke * 0.00005
+            est.update(
+                f, pose, in_contact=True, mass_z=2.0, v_force_z=v_z, f_err_z=0.0
+            )
+        return est.ke_est
+
+    ke_asym = run_ramp(EnvironmentStiffnessEstimator(cfg_asym, dt=0.01, mass_z=2.0), 1200.0, 40)
+    ke_sym = run_ramp(EnvironmentStiffnessEstimator(cfg_sym, dt=0.01, mass_z=2.0), 1200.0, 40)
+    assert ke_asym > ke_sym
