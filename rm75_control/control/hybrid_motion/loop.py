@@ -278,7 +278,12 @@ def run_hybrid_motion_loop(
     # Zero-vel bridge after handoff while async observer starts (closes the gap
     # between enter_movev_session and the main loop that caused residual twitch).
     post_handoff_zero_s = float(startup.get("post_handoff_zero_s", 1.0))
-    realign_min_snap_mm = float(startup.get("realign_min_snap_mm", 0.5))
+    follow_warmup_s = float(startup.get("follow_warmup_s", 0.0))
+    quiescent_warmup_frames = int(startup.get("quiescent_warmup_frames", 20))
+    quiescent_reject_step_mm = float(startup.get("quiescent_reject_step_mm", 2.0))
+    skip_resync_after_movej = bool(startup.get("skip_resync_after_movej", True))
+    auto_realign_on_snap = bool(startup.get("auto_realign_on_snap", True))
+    realign_min_snap_mm = float(startup.get("realign_min_snap_mm", 3.0))
     realign_pos_tol_mm = float(startup.get("realign_pos_tol_mm", 1.5))
     realign_rot_tol_deg = float(startup.get("realign_rot_tol_deg", 0.8))
     realign_timeout_s = float(startup.get("realign_timeout_s", 15.0))
@@ -459,9 +464,12 @@ def run_hybrid_motion_loop(
             dt_ms=dt_ms,
             follow=follow,
             q_resync=q_resync,
+            skip_resync=skip_resync_after_movej and q_resync is not None,
             settle_frames=init_settle_frames,
             quiescent_mm=movev_quiescent_mm,
             quiescent_consecutive=movev_quiescent_consecutive,
+            quiescent_warmup_frames=quiescent_warmup_frames,
+            quiescent_reject_step_mm=quiescent_reject_step_mm,
             move_speed=spd,
             settle_timeout_s=fid_cfg.collect.settle_timeout_s,
             pre_init_settle_s=pre_movev_settle_s,
@@ -503,15 +511,11 @@ def run_hybrid_motion_loop(
         snap_mm = float(np.linalg.norm(dpos_mm))
         if snap_mm > 3.0:
             print(f"  init snap |Δ|={snap_mm:.1f}mm", flush=True)
+        init_drift_mm = prep_mm if prep_mm > 0.5 else snap_mm
         pose0 = pose_post.copy()
         traj_origin = pose0.copy()
         source.set_origin(pose0)
         ref_shaper.reset(pose0)
-        print(
-            f"  anchored pose0 (post-init): "
-            f"xyz=[{pose0[0]:.3f},{pose0[1]:.3f},{pose0[2]:.3f}] m",
-            flush=True,
-        )
 
         async_obs = AsyncStateObserver(bot.robot, poll_s=async_poll_ms / 1000.0)
         async_obs.start()
@@ -535,20 +539,29 @@ def run_hybrid_motion_loop(
             async_obs.stop()
             raise SystemExit("AsyncStateObserver: no pose after CANFD init")
         q_fb = np.zeros(7, dtype=float)
+        pose0 = pose_fb.copy()
+        hold_anchor = pose0.copy()
 
         controller.reset(clear_velocity=True)
 
-        if post_init_realign:
+        need_realign = post_init_realign or (
+            auto_realign_on_snap
+            and init_drift_mm >= realign_min_snap_mm
+            and pose_slot_cartesian is not None
+        )
+        if need_realign:
             if realign_target_mode == "pose_slot" and pose_slot_cartesian is not None:
                 realign_target = pose_slot_cartesian.copy()
+            elif pose_slot_cartesian is not None and auto_realign_on_snap:
+                realign_target = pose_slot_cartesian.copy()
             else:
-                realign_target = pose_pre.copy()
+                realign_target = pose_before_prep.copy()
             snap_to_target_mm, snap_rot_deg = _pose_tracking_error_mm_deg(
                 pose0, realign_target, ctrl_cfg.euler_order,
             )
             if snap_to_target_mm >= realign_min_snap_mm or snap_rot_deg >= realign_rot_tol_deg:
                 print(
-                    f"  realign start: offset vs target "
+                    f"  realign start: offset vs slot "
                     f"{snap_to_target_mm:.1f}mm / {snap_rot_deg:.2f}°",
                     flush=True,
                 )
@@ -557,7 +570,7 @@ def run_hybrid_motion_loop(
                     async_obs,
                     realign_target,
                     dt_ms=dt_ms,
-                    follow=follow,
+                    follow=False,
                     trajectory_mode=traj_mode,
                     radio=radio,
                     control_frame=control_frame,
@@ -574,6 +587,7 @@ def run_hybrid_motion_loop(
                     settle_frames=max(10, settle_frames // 2),
                 )
                 pose0 = pose_realigned.copy()
+                hold_anchor = pose0.copy()
                 traj_origin = pose0.copy()
                 source.set_origin(pose0)
                 ref_shaper.reset(pose0)
@@ -594,6 +608,18 @@ def run_hybrid_motion_loop(
                     flush=True,
                 )
 
+        print(
+            f"  anchored pose0 (post-init): "
+            f"xyz=[{pose0[0]:.3f},{pose0[1]:.3f},{pose0[2]:.3f}] m",
+            flush=True,
+        )
+        if follow_warmup_s > 0.0:
+            print(
+                f"  follow warmup: low-follow for first {follow_warmup_s:.1f}s "
+                f"(pre-scan hold)",
+                flush=True,
+            )
+
         print("Velocity CANFD initialized. Ctrl+C to stop.", flush=True)
 
         scan_log = ScanLogRecorder() if log_enabled else None
@@ -608,8 +634,9 @@ def run_hybrid_motion_loop(
         t_scan0: float | None = None if wait_contact else t0
         f_ext = f_zero.copy()
         last_wait_msg = 0.0
-        hold_anchor: np.ndarray | None = None
         hold_drift_warned = False
+        if hold_anchor is None:
+            hold_anchor = pose0.copy()
 
         def _fz_smooth() -> float:
             # The observer's causal biquad LPF already smooths f_ext, so the
@@ -685,9 +712,8 @@ def run_hybrid_motion_loop(
                     # directly. phase 0 = observer warm-up; phase 1 = locked, waiting for
                     # contact. Both just hold (lock) the captured anchor.
                     phase = 0 if (t_s < hold_s or (require_observer and not observer.ready_causal())) else 1
-                    if hold_anchor is None:
-                        hold_anchor = pose.copy()
                     pose_d_log = hold_anchor.copy()
+                    follow_cmd = follow
                     if hold_active:
                         v_cmd = hold_velocity_command(
                             pose, hold_anchor,
@@ -718,7 +744,7 @@ def run_hybrid_motion_loop(
                         )
                     send_velocity_canfd(
                         bot.robot, v_cmd.tolist(),
-                        follow=follow, trajectory_mode=traj_mode, radio=radio,
+                        follow=follow_cmd, trajectory_mode=traj_mode, radio=radio,
                     )
                     if scan_log is not None:
                         log_tick += 1

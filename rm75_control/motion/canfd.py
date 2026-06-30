@@ -247,6 +247,8 @@ def wait_movev_quiescent(
     settle_mm: float = 0.3,
     need_consecutive: int = 5,
     max_frames: int = 200,
+    warmup_frames: int = 15,
+    reject_max_step_mm: float = 2.0,
     next_tick: float | None = None,
 ) -> tuple[np.ndarray | None, float, int, float]:
     """
@@ -255,6 +257,11 @@ def wait_movev_quiescent(
     Uses follow=False (低跟随) to match settle_movev_after_init — quiescence is
     measured under the same gentle-servo conditions the arm will settle in.
     The actual session's follow mode takes effect from the first real command.
+
+    warmup_frames: ignore motion for the first N ticks after init (init snap).
+    reject_max_step_mm: the quiet streak's peak step must stay below this limit;
+        prevents declaring quiescence when an early 9 mm snap is followed by
+        sub-mm creep (global max_step was misleading).
 
     Returns (last_pose, max_step_mm, frames_used, next_tick).
     """
@@ -267,6 +274,7 @@ def wait_movev_quiescent(
     last_pose: np.ndarray | None = None
     quiet = 0
     max_step_mm = 0.0
+    streak_max_mm = 0.0
     for k in range(max_frames):
         now = time.monotonic()
         if now < next_tick:
@@ -278,15 +286,25 @@ def wait_movev_quiescent(
             continue
         pose = np.asarray(st["pose"][:6], dtype=float)
         last_pose = pose
+        if k < warmup_frames:
+            prev_xyz = pose[:3].copy()
+            quiet = 0
+            streak_max_mm = 0.0
+            continue
         if prev_xyz is not None:
             step_mm = float(np.linalg.norm((pose[:3] - prev_xyz) * 1000.0))
             max_step_mm = max(max_step_mm, step_mm)
             if step_mm < settle_mm:
                 quiet += 1
-                if quiet >= need_consecutive:
+                streak_max_mm = max(streak_max_mm, step_mm)
+                if (
+                    quiet >= need_consecutive
+                    and streak_max_mm <= reject_max_step_mm
+                ):
                     return last_pose, max_step_mm, k + 1, next_tick
             else:
                 quiet = 0
+                streak_max_mm = 0.0
         prev_xyz = pose[:3].copy()
     return last_pose, max_step_mm, max_frames, next_tick
 
@@ -299,9 +317,12 @@ def enter_movev_session(
     dt_ms: float,
     follow: bool,
     q_resync: np.ndarray | None = None,
+    skip_resync: bool = False,
     settle_frames: int = 50,
     quiescent_mm: float = 0.25,
     quiescent_consecutive: int = 10,
+    quiescent_warmup_frames: int = 15,
+    quiescent_reject_step_mm: float = 2.0,
     move_speed: int = 15,
     settle_timeout_s: float = 15.0,
     pre_init_settle_s: float = 1.5,
@@ -316,11 +337,14 @@ def enter_movev_session(
     total static time before init = 0.3 + pre_init_settle_s.  Default 1.5s
     gives 1.8s total — arm must be fully static before init captures FK.
 
+    skip_resync: when True, exit CANFD without joint resync (use after move_j
+    already placed the arm at the target slot).
+
     Returns (next_tick, diag).
     """
     diag = exit_canfd_session(
         robot,
-        q_resync=q_resync,
+        q_resync=None if skip_resync else q_resync,
         move_speed=move_speed,
         settle_timeout_s=settle_timeout_s,
         print_diag=False,
@@ -359,6 +383,8 @@ def enter_movev_session(
     pose_quiet, max_step_mm, q_frames, next_tick = wait_movev_quiescent(
         robot, dt_ms=dt_ms, follow=follow,
         settle_mm=quiescent_mm, need_consecutive=quiescent_consecutive,
+        warmup_frames=quiescent_warmup_frames,
+        reject_max_step_mm=quiescent_reject_step_mm,
         next_tick=next_tick,
     )
     diag["quiescent_max_step_mm"] = max_step_mm
