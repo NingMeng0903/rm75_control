@@ -383,17 +383,21 @@ class AdmittanceController:
         self._update_instability_index(float(f_ext[2]))
 
         m_z = max(cfg.admittance_mass_z + cfg.var_damping_m_u * self.instability_index, 1e-3)
+        f_ext_z = float(f_ext[2])
+        f_err_z = float(desired_force[2] - f_ext[2])
+        v_scan_tool_y = float((r_mat.T @ np.asarray(vel_ff[:3], dtype=float))[1])
         if cfg.adaptive_ke.enabled:
             self.ke_est, self.adaptive_bd = self._ke_estimator.update(
-                float(f_ext[2]),
+                f_ext_z,
                 current_pose,
                 in_contact=bool(in_contact),
                 mass_z=m_z,
+                v_force_z=self.v_force_z,
+                v_scan_tool_y=v_scan_tool_y,
+                f_err_z=f_err_z,
                 euler_order=cfg.euler_order,
             )
             self.zeta_eff = self._ke_estimator.zeta_eff
-
-        f_ext_z = float(f_ext[2])
         f_dot_z = 0.0
         if self._f_ext_z_valid and self.dt > 0.0:
             f_dot_z = (f_ext_z - self._f_ext_z_prev) / self.dt

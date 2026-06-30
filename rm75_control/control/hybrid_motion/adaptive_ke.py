@@ -8,16 +8,14 @@ Damping ratio ζ = b_d / (2√(m_d K_e)).  Holding ζ fixed while K_e changes re
 
     b_d(t) = 2 ζ √(m_d · K̂_e(t))
 
-References (environment / human impedance learning & variable admittance):
-  - Yanan Li, S.S. Ge, "Impedance Learning for Robots Interacting With Unknown
-    Environments", IEEE T-CST 22(4):1422-1432, 2014.
-  - Yanan Li, S.S. Ge, C. Yang, "Learning impedance control for physical
-    robot-environment interaction", Int. J. Control 85(2):182-193, 2011.
-  - Yanan Li, S.S. Ge, C. Wang, "Impedance adaptation for optimal robot-
-    environment interaction", Int. J. Control 87(2):249-263, 2013.
-  - Hsieh-Yu Li et al., "Stable and Compliant Motion of pHRI Coupled With a
-    Moving Environment Using Variable Admittance and Adaptive Control",
-    IEEE RA-L 3(3):2493-2500, 2018 (cited in Li/Ge line of work).
+**Scan caveat:** K_e = ΔF/Δx is only valid on the *normal admittance coordinate*.
+During lateral sweeps, raw TCP Δx and Fz ripple are geometry-coupled — use integrated
+admittance displacement and gate updates when scan velocity is high.
+
+References:
+  - Yanan Li & Ge, IEEE T-CST 2014 — impedance learning
+  - Yanan Li et al., IEEE TSMC 2022 — proactive HRI (Ḟ as intention; complements Kdf)
+  - Keemink et al., IJRR 2018 — fixed M/D admittance tuning (G4 virtual mass)
 """
 
 from __future__ import annotations
@@ -40,7 +38,13 @@ class AdaptiveKeConfig:
     dx_threshold_m: float = 1e-4
     contact_force_n: float = 0.5
     bd_max: float = 800.0
-    bd_slew_max: float = 2000.0  # max |Δb_d/Δt| [N·s/m²]
+    bd_min: float = 0.0
+    bd_slew_max: float = 2000.0
+    ke_slew_max: float = 8000.0
+    displacement_source: str = "admittance"
+    scan_vel_gate_m_s: float = 0.002
+    df_spike_n: float = 6.0
+    f_err_gate_n: float = 4.0
 
     @classmethod
     def from_dict(cls, raw: dict, parent: dict) -> AdaptiveKeConfig:
@@ -59,16 +63,22 @@ class AdaptiveKeConfig:
                 a.get("contact_force_n", parent.get("adaptive_contact_force_n", 0.5))
             ),
             bd_max=float(a.get("bd_max", parent.get("adaptive_bd_max", 800.0))),
+            bd_min=float(a.get("bd_min", parent.get("adaptive_bd_min", 0.0))),
             bd_slew_max=float(a.get("bd_slew_max", parent.get("adaptive_bd_slew_max", 2000.0))),
+            ke_slew_max=float(a.get("ke_slew_max", parent.get("ke_slew_max", 8000.0))),
+            displacement_source=str(
+                a.get("displacement_source", parent.get("ke_displacement_source", "admittance"))
+            ).lower(),
+            scan_vel_gate_m_s=float(
+                a.get("scan_vel_gate_m_s", parent.get("ke_scan_vel_gate_m_s", 0.002))
+            ),
+            df_spike_n=float(a.get("df_spike_n", parent.get("ke_df_spike_n", 6.0))),
+            f_err_gate_n=float(a.get("f_err_gate_n", parent.get("ke_f_err_gate_n", 4.0))),
         )
 
 
 class EnvironmentStiffnessEstimator:
-    """
-    EWMA stiffness from ΔF/Δx along tool-Z; outputs b_d for target ζ.
-
-    x is tool-frame normal penetration relative to the pose captured at contact.
-    """
+    """EWMA stiffness from ΔF/Δx on the normal admittance axis; outputs b_d for target ζ."""
 
     def __init__(self, cfg: AdaptiveKeConfig, *, dt: float, mass_z: float = 3.0) -> None:
         self.cfg = cfg
@@ -76,25 +86,30 @@ class EnvironmentStiffnessEstimator:
         self._mass_z = max(mass_z, 1e-3)
         self.ke_est = float(cfg.ke_initial)
         self.bd = self._critical_bd(self._mass_z)
+        self._x_adm = 0.0
         self._last_f_z = 0.0
-        self._last_x_z = 0.0
+        self._last_x = 0.0
         self._have_prev = False
         self._contact_ref_pose: np.ndarray | None = None
         self._in_contact = False
+        self._update_gated = False
 
     def reset(self) -> None:
         self.ke_est = float(self.cfg.ke_initial)
         self.bd = self._critical_bd(self._mass_z)
+        self._x_adm = 0.0
         self._last_f_z = 0.0
-        self._last_x_z = 0.0
+        self._last_x = 0.0
         self._have_prev = False
         self._contact_ref_pose = None
         self._in_contact = False
+        self._update_gated = False
 
     def _critical_bd(self, mass_z: float) -> float:
         ke = max(self.ke_est, self.cfg.ke_min)
         bd = 2.0 * self.cfg.zeta * math.sqrt(max(mass_z, 1e-3) * ke)
-        return min(bd, self.cfg.bd_max)
+        lo = self.cfg.bd_min if self.cfg.bd_min > 0.0 else 0.0
+        return float(np.clip(bd, lo, self.cfg.bd_max))
 
     @staticmethod
     def tool_z_displacement_m(
@@ -109,6 +124,41 @@ class EnvironmentStiffnessEstimator:
         r_mat = Rsc.from_euler(euler_order, pose[3:6], degrees=False).as_matrix()
         return float((r_mat.T @ d_base)[2])
 
+    def _normal_displacement_m(
+        self,
+        pose: np.ndarray,
+        *,
+        v_force_z: float,
+        euler_order: str = "xyz",
+    ) -> float:
+        if self.cfg.displacement_source == "pose" and self._contact_ref_pose is not None:
+            return self.tool_z_displacement_m(pose, self._contact_ref_pose, euler_order=euler_order)
+        self._x_adm += float(v_force_z) * self.dt
+        return self._x_adm
+
+    def _should_update_ke(
+        self,
+        f_ext_z: float,
+        f_err_z: float,
+        v_scan_tool_y: float,
+        df: float,
+    ) -> bool:
+        cfg = self.cfg
+        if abs(f_ext_z) < cfg.contact_force_n:
+            return False
+        if abs(f_err_z) > cfg.f_err_gate_n:
+            return False
+        if abs(v_scan_tool_y) > cfg.scan_vel_gate_m_s:
+            return False
+        if abs(df) > cfg.df_spike_n:
+            return False
+        return True
+
+    def _slew_ke(self, ke_target: float) -> float:
+        max_dke = self.cfg.ke_slew_max * self.dt
+        delta = float(np.clip(ke_target - self.ke_est, -max_dke, max_dke))
+        return self.ke_est + delta
+
     def update(
         self,
         f_ext_z: float,
@@ -116,6 +166,9 @@ class EnvironmentStiffnessEstimator:
         *,
         in_contact: bool,
         mass_z: float,
+        v_force_z: float = 0.0,
+        v_scan_tool_y: float = 0.0,
+        f_err_z: float = 0.0,
         euler_order: str = "xyz",
     ) -> tuple[float, float]:
         """Return (ke_est, bd) after one tick."""
@@ -126,13 +179,16 @@ class EnvironmentStiffnessEstimator:
 
         if in_contact and not self._in_contact:
             self._contact_ref_pose = np.asarray(pose, dtype=float).copy()
+            self._x_adm = 0.0
             self._have_prev = False
 
         if not in_contact:
             self._in_contact = False
             self._contact_ref_pose = None
+            self._x_adm = 0.0
             self._have_prev = False
-            self.ke_est = max(cfg.ke_min, 0.0)
+            self._update_gated = False
+            self.ke_est = max(cfg.ke_min, cfg.ke_initial * 0.5)
             bd_target = self._critical_bd(mass_z)
             self.bd = self._slew_damping(bd_target)
             return self.ke_est, self.bd
@@ -141,19 +197,23 @@ class EnvironmentStiffnessEstimator:
         if self._contact_ref_pose is None:
             self._contact_ref_pose = np.asarray(pose, dtype=float).copy()
 
-        x_z = self.tool_z_displacement_m(pose, self._contact_ref_pose, euler_order=euler_order)
+        x = self._normal_displacement_m(pose, v_force_z=v_force_z, euler_order=euler_order)
 
-        if abs(f_ext_z) >= cfg.contact_force_n and self._have_prev:
-            dx = x_z - self._last_x_z
+        gated = True
+        if self._have_prev:
             df = f_ext_z - self._last_f_z
-            if abs(dx) >= cfg.dx_threshold_m:
+            dx = x - self._last_x
+            gated = not self._should_update_ke(f_ext_z, f_err_z, v_scan_tool_y, df)
+            if not gated and abs(dx) >= cfg.dx_threshold_m:
                 ke_inst = abs(df / dx)
                 ke_inst = float(np.clip(ke_inst, cfg.ke_min, cfg.ke_max))
                 lam = cfg.ke_forgetting
-                self.ke_est = lam * self.ke_est + (1.0 - lam) * ke_inst
+                ke_target = lam * self.ke_est + (1.0 - lam) * ke_inst
+                self.ke_est = self._slew_ke(ke_target)
 
+        self._update_gated = gated
         self._last_f_z = f_ext_z
-        self._last_x_z = x_z
+        self._last_x = x
         self._have_prev = True
 
         bd_target = self._critical_bd(mass_z)
@@ -167,8 +227,11 @@ class EnvironmentStiffnessEstimator:
 
     @property
     def zeta_eff(self) -> float:
-        """Achieved ζ given current ke_est, bd, and mass."""
         denom = 2.0 * math.sqrt(max(self._mass_z, 1e-3) * max(self.ke_est, self.cfg.ke_min))
         if denom < 1e-9:
             return 0.0
         return self.bd / denom
+
+    @property
+    def update_gated(self) -> bool:
+        return self._update_gated

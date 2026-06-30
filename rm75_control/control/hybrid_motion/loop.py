@@ -784,8 +784,9 @@ def run_hybrid_motion_loop(
                     ])
                     ke_str = ""
                     if controller.cfg.adaptive_ke.enabled:
+                        gate = "G" if controller._ke_estimator.update_gated else "U"
                         ke_str = (
-                            f" K̂_e={controller.ke_est:.0f} ζ={controller.zeta_eff:.2f}"
+                            f" K̂_e={controller.ke_est:.0f} ζ={controller.zeta_eff:.2f}{gate}"
                         )
                     print(
                         f"  t={t_s:.1f}s  ΔY_world={dy_mm:+.1f}mm  "

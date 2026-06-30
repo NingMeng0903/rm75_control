@@ -1,6 +1,7 @@
-# Human soft-tissue scan — adaptive critical damping (Yanan Li / Ge impedance learning).
+# Human soft-tissue scan — scan-safe adaptive critical damping.
 #
-# b_d(t)=2ζ√(m_d·K̂_e): online K_e from tool-Z ΔF/Δx; static press/release D ignored when adaptive on.
+# Yanan Li K_e=ΔF/Δx needs the *normal admittance axis* (not TCP pose during sweep).
+# Keemink G4: fixed m_d sets max normal accel = |F_err|/m_d.
 #
 # Run:
 #   python tmp/Velocity_Admittance/demo/d_to_a_sin_tool_y.py \
@@ -48,8 +49,8 @@ force:
   buffer_s: 2.0
   min_samples: 22
   use_inertia: false
-  desired_z_n: 2.5          # gentler setpoint on flesh
-  causal_fc_hz: 4.5          # Keemink G2: smooth but not too laggy
+  desired_z_n: 2.5
+  causal_fc_hz: 4.5
   causal_order: 2
   causal_history: 5
 
@@ -57,45 +58,49 @@ trajectory_demo:
   type: slot_transfer_sin_tool_y
   from_slot: d
   to_slot: a
-  transfer_s: 15.0          # slow approach onto scan site
+  transfer_s: 15.0
   scan_mode: sin_tool_y
   y_peak_to_peak_cm: 12.0
-  y_max_vel_cm_s: 1.5       # slower scan → less Fz ripple from lateral motion
+  y_max_vel_cm_s: 1.5
   soft_start: true
   ramp_s: 3.0
 
 hybrid_motion:
   force_axes: [0, 0, 1, 0, 0, 0]
   track_axes: [1, 1, 0, 1, 1, 1]
-  # Softer lateral PBAC — scan axis still tracked, but less Fz disturbance
   kp_pos: [0.18, 0.32, 0.0, 0.25, 0.25, 0.25]
-  deadband_n: 0.6
-  deadband_width_n: 0.35
+  deadband_n: 0.5
+  deadband_width_n: 0.3
   system_delay_s: 0.015
   pos_err_deadband_m: 0.001
   pos_correction_max_m_s: 0.04
-  # 2nd-order admittance (Keemink G4/G6): fixed M; D from adaptive K_e when enabled
-  admittance_mass_z: 2.0
+  # Keemink G4: m_d=3 → a_max≈|F_err|/3 ≈ 0.8 m/s² at 2.5N (smoother vz than m_d=2)
+  admittance_mass_z: 3.0
   admittance_damping_z: 50.0
-  admittance_damping_z_press: 90.0      # used only if adaptive_ke.enabled=false
-  admittance_damping_z_release: 25.0
-  force_derivative_gain_z: 0.02
+  force_derivative_gain_z: 0.06   # Li 2022 proactive: damp Ḟ from scan geometry ripple
   var_damping_enabled: false
   adaptive_ke:
     enabled: true
-    zeta: 1.0
-    ke_initial: 250.0
-    ke_forgetting: 0.93
-    ke_min: 40.0
-    ke_max: 25000.0
-    dx_threshold_m: 0.0001
-    contact_force_n: 0.8
-    bd_max: 450.0
-    bd_slew_max: 1200.0
-  max_vz_tool_m_s: 0.06
+    zeta: 0.95                     # slightly overdamped on flesh (viscoelastic, not pure spring)
+    ke_initial: 200.0              # soft-tissue prior [N/m]
+    ke_min: 120.0                  # floor — prevents D collapse during Fz dips
+    ke_max: 8000.0                 # cap — reject bone-like spikes from ΔF/Δx outliers
+    ke_forgetting: 0.97            # slower — body site changes over seconds not ms
+    displacement_source: admittance # ∫v_force_z dt (NOT TCP pose during scan)
+    scan_vel_gate_m_s: 0.002       # hold K̂_e when |v_scan_tool_y| > 2 mm/s
+    df_spike_n: 5.0                # reject 67N-style Fz glitches
+    f_err_gate_n: 3.5              # only learn K_e near force setpoint
+    dx_threshold_m: 0.00008
+    contact_force_n: 1.0
+    bd_min: 38.0                   # 2ζ√(m·ke_min) with m=3, ke_min=120, ζ=0.95
+    bd_max: 220.0
+    bd_slew_max: 800.0
+    ke_slew_max: 2000.0
+  # Keemink G6: tool-Z bandwidth must follow surface during lateral sweep
+  max_vz_tool_m_s: 0.12
   approach_vz_tool_m_s: 0.015
-  max_velocity: [0.025, 0.06, 0.06, 0.10, 0.10, 0.10]
-  max_acceleration: [0.4, 0.8, 1.5, 0.4, 0.4, 0.4]
+  max_velocity: [0.025, 0.06, 0.12, 0.10, 0.10, 0.10]
+  max_acceleration: [0.4, 0.8, 2.0, 0.4, 0.4, 0.4]
   enable_normal_tracking: false
 
 monitor:

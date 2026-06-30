@@ -29,17 +29,22 @@ def test_ewma_stiffness_converges():
         dx_threshold_m=1e-5,
         contact_force_n=0.1,
         bd_slew_max=1e6,
+        ke_slew_max=1e6,
+        df_spike_n=100.0,
+        f_err_gate_n=100.0,
+        scan_vel_gate_m_s=10.0,
     )
     est = EnvironmentStiffnessEstimator(cfg, dt=0.01, mass_z=2.0)
     ref = np.zeros(6)
-    ref[2] = 0.52
     true_ke = 800.0
     pose = ref.copy()
     f = 0.0
+    v_force_z = 0.00005 / 0.01  # 0.05 mm per 10 ms tick
     for _ in range(300):
-        pose[2] -= 0.00005  # 0.05 mm per tick along base Z
         f += true_ke * 0.00005
-        est.update(f, pose, in_contact=True, mass_z=2.0)
+        est.update(
+            f, pose, in_contact=True, mass_z=2.0, v_force_z=v_force_z, v_scan_tool_y=0.0, f_err_z=0.0
+        )
     assert 400.0 < est.ke_est < 1200.0
     zeta = est.zeta_eff
     assert 0.85 < zeta <= 1.05
