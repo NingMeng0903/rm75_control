@@ -1,38 +1,20 @@
 #!/usr/bin/env python3
 """On-robot bring-up test: Cartesian move to pose D, then tool-Y sin scan at D -
-both driven by OUR joint-position cascade (CLIK/QP inner loop -> rm_movej_canfd),
+both driven by OUR joint-position cascade (CLIK inner loop -> rm_movej_canfd),
 never rm_movev_canfd / MoveV. One continuous run, no mode switch at the D handoff.
 
-  Phase 1  current pose -> scan pose D   (CartesianTrackOuterLoop, no force)
+  Phase 1  current pose -> scan pose D   (CartesianTrackOuterLoop + CLIK, no force)
   Phase 2  hold D, sin sweep tool-Y       (AdmittanceOuterLoop, force-position hybrid)
 
 ``poses.yaml`` slot ``d`` is the **force-ID Arm_Tip teach pose** (contact tip).
-Scan pose **D** = that ``pose_base`` + **220 mm along tool +Z outward** — NOT
-``FK(q_deg)`` with gripper (that puts the TCP tip on the ID point).
-
-This is a SPECIFIC test script (hardcodes pose slot "d" from poses.yaml) - the
-generic, config-driven entry point lives at apps/joint_admittance/run_joint_admittance.py.
+Scan pose **D** = that ``pose_base`` + **220 mm along tool +Z outward**.
 
 Usage:
   source env.sh
-  # 0) FIRST prove FK matches the robot (<1mm / <0.1deg):
   python -m rm75_control.control.joint_admittance.validation --ip 192.168.1.18
-
-  # 1) dry run (builds everything, no robot connection):
   python tmp/joint_admittance/d_sin_tool_y.py --dry-run
-
-  # 2) move to D only, no scan (prove Cartesian trajectory tracking in isolation):
   python tmp/joint_admittance/d_sin_tool_y.py --scan-duration 0
-
-  # 3) full test: move to D, then 30s of tool-Y sin scan with 3N tool-Z force hold
-  #    (requires a calibrated tmp/force_compensation/logs/force_id_phi.json):
   python tmp/joint_admittance/d_sin_tool_y.py --enable-force --desired-z 3.0 --scan-duration 30
-
-  # 4) tune the move and the sweep:
-  python tmp/joint_admittance/d_sin_tool_y.py --move-duration 10 \
-      --y-pp-cm 10 --max-vel-cm-s 2 --enable-force --desired-z 3.0 --scan-duration 60
-
-Ctrl+C stops cleanly (watchdog holds the last q, RobotSession releases the arm).
 """
 
 from __future__ import annotations
@@ -56,10 +38,7 @@ from rm75_control.control.joint_admittance.loop import (
     run_joint_admittance_phases,
 )
 from rm75_control.control.joint_admittance.model import RobotKinematics
-from rm75_control.control.joint_admittance.reference import (
-    CartesianMoveReference,
-    SinToolYReference,
-)
+from rm75_control.control.joint_admittance.reference import CartesianMoveReference, SinToolYReference
 from rm75_control.core.session import RobotSession
 from rm75_control.force.compensation.collection import load_slot
 from rm75_control.force.compensation.id_config import load_config as load_force_id_config
@@ -101,16 +80,10 @@ def resolve_scan_pose_d(
 
     if use_force_id_pose:
         pose_d = _fk_pose.copy()
-        print(
-            f"  scan target: force-ID FK pose (legacy) pose={np.round(pose_d, 4)}",
-            flush=True,
-        )
+        print(f"  scan target: force-ID FK pose (legacy) pose={np.round(pose_d, 4)}", flush=True)
     else:
         pose_d = slot_scan_approach_pose(robot, pose_id, approach_dz_m=approach_dz_m)
-        print(
-            f"  force-ID slot {slot!r} Arm_Tip teach: pose={np.round(pose_id, 4)}",
-            flush=True,
-        )
+        print(f"  force-ID slot {slot!r} Arm_Tip teach: pose={np.round(pose_id, 4)}", flush=True)
         print(
             f"  scan pose D (+{approach_dz_m * 1000:.0f} mm tool-Z): "
             f"pose={np.round(pose_d, 4)}",
@@ -122,28 +95,19 @@ def resolve_scan_pose_d(
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, default=Path("configs/joint_admittance.yaml"))
-    ap.add_argument("--slot", type=str, default="d", help="poses.yaml slot (default: d)")
-    ap.add_argument(
-        "--approach-dz-mm",
-        type=float,
-        default=DEFAULT_SCAN_APPROACH_DZ_M * 1000.0,
-        help="scan D = Arm_Tip teach pose + this offset along tool +Z (mm); default 220",
-    )
-    ap.add_argument(
-        "--use-force-id-pose",
-        action="store_true",
-        help="legacy: track FK(q_deg) tip pose instead of teach+220mm standoff",
-    )
+    ap.add_argument("--slot", type=str, default="d")
+    ap.add_argument("--approach-dz-mm", type=float, default=DEFAULT_SCAN_APPROACH_DZ_M * 1000.0)
+    ap.add_argument("--use-force-id-pose", action="store_true")
     ap.add_argument("--solver", choices=["clik", "qp"], default=None)
-    ap.add_argument("--move-duration", type=float, default=8.0, help="phase 1 smoothstep duration (s)")
+    ap.add_argument("--move-duration", type=float, default=8.0)
     ap.add_argument("--move-kp", type=float, default=1.5, help="phase 1 Cartesian tracking gain (1/s)")
-    ap.add_argument("--y-pp-cm", type=float, default=6.0, help="tool-Y sin peak-to-peak amplitude (cm)")
-    ap.add_argument("--max-vel-cm-s", type=float, default=2.0, help="tool-Y sin peak velocity (cm/s)")
-    ap.add_argument("--period-s", type=float, default=None, help="override sin period (s); default from max-vel")
-    ap.add_argument("--desired-z", type=float, default=None, help="tool-Z force setpoint (N); default from config")
-    ap.add_argument("--scan-duration", type=float, default=30.0, help="phase 2 duration (s); 0 = skip phase 2")
-    ap.add_argument("--enable-force", action="store_true", default=None, help="force-enable phase 2 (default: config startup.enable_force)")
-    ap.add_argument("--dry-run", action="store_true", help="build everything, do not connect")
+    ap.add_argument("--y-pp-cm", type=float, default=6.0)
+    ap.add_argument("--max-vel-cm-s", type=float, default=2.0)
+    ap.add_argument("--period-s", type=float, default=None)
+    ap.add_argument("--desired-z", type=float, default=None)
+    ap.add_argument("--scan-duration", type=float, default=30.0)
+    ap.add_argument("--enable-force", action="store_true", default=None)
+    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     raw = load_yaml(args.config)
@@ -172,21 +136,20 @@ def main() -> int:
 
     robot_cfg = raw.get("robot", {})
     with RobotSession(ip=robot_cfg.get("ip"), port=robot_cfg.get("port"), config=args.config) as sess:
-        q_d_deg, pose_d, _pose_id = resolve_scan_pose_d(
+        _q_slot_deg, pose_d, _pose_id = resolve_scan_pose_d(
             args.slot,
             sess.robot,
             approach_dz_m=float(args.approach_dz_mm) * 0.001,
             use_force_id_pose=bool(args.use_force_id_pose),
         )
 
-        # --- Phase 1: Cartesian move current -> pose D (pure tracking, no force) ---
         move_ref = CartesianMoveReference(pose_d, args.move_duration, euler_order=inner_cfg.euler_order)
         move_outer = CartesianTrackOuterLoop(
             move_ref,
             CartesianTrackConfig(
                 k_task=np.full(6, args.move_kp),
                 euler_order=inner_cfg.euler_order,
-                control_frame=inner_cfg.control_frame,  # MUST match the inner loop
+                control_frame=inner_cfg.control_frame,
             ),
         )
         phase1 = Phase(
@@ -194,14 +157,14 @@ def main() -> int:
             label=f"move -> {args.slot}",
             duration_s=None,
             max_duration_s=args.move_duration + 5.0,
-            wait_until=lambda pose: arrived(pose, pose_d, tol_mm=2.0, tol_deg=1.0, euler_order=inner_cfg.euler_order),
+            wait_until=lambda pose: arrived(
+                pose, pose_d, tol_mm=2.0, tol_deg=1.0, euler_order=inner_cfg.euler_order
+            ),
         )
-
         phases = [phase1]
 
         force_observer = None
         if args.scan_duration > 0.0:
-            # --- Phase 2: hold D, tool-Y sin sweep (force-position hybrid via OUR inner loop) ---
             outer_ctrl = AdmittanceController(dt, AdmittanceConfig.from_dict(raw))
             desired_force = np.zeros(6)
             desired_force[2] = desired_z
@@ -221,15 +184,16 @@ def main() -> int:
                 force_observer = CompensatedForceObserver.from_yaml(raw)
                 print("  force observer: enabled (requires calibrated phi)", flush=True)
             else:
-                print("  force observer: DISABLED (--enable-force not set) - Fz feedback is zero", flush=True)
+                print("  force observer: DISABLED (--enable-force not set)", flush=True)
 
-            phase2 = Phase(
-                outer=scan_outer,
-                label="sin_tool_y @ D",
-                duration_s=args.scan_duration,
-                force_observer=force_observer,
+            phases.append(
+                Phase(
+                    outer=scan_outer,
+                    label="sin_tool_y @ D",
+                    duration_s=args.scan_duration,
+                    force_observer=force_observer,
+                )
             )
-            phases.append(phase2)
             print(
                 f"Phase 2: tool-Y sin amp={args.y_pp_cm:.1f}cm p-p, v_peak={args.max_vel_cm_s:.1f}cm/s, "
                 f"desired_z={desired_z:.1f}N, duration={args.scan_duration:.1f}s",
@@ -252,7 +216,7 @@ def main() -> int:
             sess,
             phases,
             inner,
-            q_start_deg=None,  # start wherever the arm currently is
+            q_start_deg=None,
             dt=dt,
             follow=bool(startup.get("follow", True)),
             move_speed=int(startup.get("move_speed", 20)),

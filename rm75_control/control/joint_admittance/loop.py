@@ -176,6 +176,56 @@ class JointIkController:
             pos_clamped=rep.pos_clamped,
         )
 
+    def update_joint(
+        self,
+        q_target: np.ndarray,
+        qdot_ff: np.ndarray,
+        dt: float | None = None,
+        k_joint: float = 2.0,
+    ) -> JointIkStep:
+        """Joint-space PD+feedforward tracking of a moving joint target.
+
+        Bypasses CLIK/QP entirely - no Cartesian error, no Jacobian, no nullspace
+        projection.  Use for point-to-point repositioning when ``q_target(t)`` is
+        already known (e.g. one-shot vendor IK + JointSmoothMoveReference
+        smoothstep) - this reproduces MoveJ-like coordinated joint motion exactly,
+        with none of the redundant-DOF nullspace drift a Cartesian-tracking CLIK
+        reference has on a 7-DOF arm (see reference.py JointSmoothMoveReference).
+        Still runs through the same friction/smoothing/safety pipeline as
+        ``update()``, so it is equally safe to stream via ``rm_movej_canfd``.
+        """
+        dt = self.cfg.dt if dt is None else dt
+        q_prev = self.q_cmd
+        q_target = np.asarray(q_target, dtype=float)
+        qdot_ff = np.asarray(qdot_ff, dtype=float)
+        qdot = qdot_ff + k_joint * (q_target - q_prev)
+        q_next = q_prev + qdot * dt
+
+        if self.cfg.friction.enabled:
+            q_next = q_next + self.friction(qdot) * dt
+        if self.smoother is not None:
+            q_next = self.smoother(q_next)
+
+        rep = self.safety.clamp(q_prev, q_next, dt)
+        if self.smoother is not None:
+            self.smoother.sync(rep.q_safe)
+
+        self.q_cmd = rep.q_safe
+        x_cur = self.kin.fk_pose(rep.q_safe)
+        x_tgt = self.kin.fk_pose(q_target)
+        return JointIkStep(
+            q_send=rep.q_safe.copy(),
+            qdot=qdot,
+            twist_base=np.zeros(6),
+            sigma_min=float("nan"),
+            lam=0.0,
+            manip=float("nan"),
+            cart_err_mm=float(np.linalg.norm(x_tgt[:3] - x_cur[:3]) * 1000.0),
+            vel_clamped=rep.vel_clamped,
+            acc_clamped=rep.acc_clamped,
+            pos_clamped=rep.pos_clamped,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Outer loop adapter
@@ -282,6 +332,54 @@ class CartesianTrackOuterLoop:
         return v
 
 
+class JointPathOuterLoop:
+    """Execute a pre-planned joint-space path through CLIK/QP without Cartesian PD.
+
+    The path's ``q_ref(t)`` / ``qdot_ff(t)`` come from e.g.
+    ``JointSmoothMoveReference.sample_q``.  This outer loop deliberately emits
+    **zero** Cartesian twist - all motion is via ``qdot_ff`` + CLIK/QP closed-loop
+    feedback toward ``FK(q_ref(t))`` (``x_ref`` synced each tick in
+    ``run_joint_admittance_phases``).  Using ``CartesianTrackOuterLoop`` here
+    adds a separate Cartesian PD that fights ``qdot_ff`` and integrates ``x_ref``
+    away from the joint path -> ``cart_err`` explodes (100+ mm diverge).
+    """
+
+    def __init__(self, reference) -> None:
+        self.reference = reference
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        if hasattr(self.reference, "set_origin"):
+            self.reference.set_origin(pose0)
+
+    def sample(self, t_s: float, current_pose: np.ndarray, f_ext: np.ndarray) -> np.ndarray:
+        del t_s, current_pose, f_ext
+        return np.zeros(6, dtype=float)
+
+    def sample_path(self, t_s: float) -> tuple[np.ndarray, np.ndarray]:
+        return self.reference.sample_q(t_s)
+
+
+class JointSpaceMoveOuterLoop:
+    """Optional bypass outer loop (``Phase.mode == "joint"``) feeding
+    ``JointIkController.update_joint`` - NO CLIK, NO nullspace.
+
+    Not for production point-to-point moves: use ``JointSmoothMoveReference`` +
+    ``CartesianTrackOuterLoop`` + ``Phase.q_ref_provider`` instead so nullspace
+    (centering, ``q_ref`` tracking, obstacle avoidance) stays live.
+    """
+
+    def __init__(self, reference, k_joint: float = 2.0) -> None:
+        self.reference = reference
+        self.k_joint = k_joint
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        if hasattr(self.reference, "set_origin"):
+            self.reference.set_origin(pose0)
+
+    def sample_joint(self, t_s: float) -> tuple[np.ndarray, np.ndarray]:
+        return self.reference.sample_q(t_s)
+
+
 def arrived(
     current_pose: np.ndarray,
     target_pose: np.ndarray,
@@ -327,9 +425,23 @@ class Phase:
 
     outer: OuterLoop
     label: str = ""
+    mode: str = "cartesian"                  # "cartesian" (outer.sample -> twist) | "joint"
+                                              # (outer.sample_joint -> (q_target, qdot_ff), see
+                                              # JointSpaceMoveOuterLoop - bypasses Cartesian IK)
     duration_s: float | None = None          # None -> run until wait_until (or max_duration_s)
     max_duration_s: float | None = None      # safety cap when duration_s is None
     wait_until: object | None = None         # Callable[[np.ndarray], bool] on current pose
+    q_ref_provider: object | None = None     # Callable[[float], q_ref_rad], mild nullspace
+                                              # trim only (centering-style) - NOT the primary
+                                              # mechanism for tracking a planned joint path,
+                                              # see qdot_ff_provider for that (avoids fighting
+                                              # the primary term's own redundancy resolution -
+                                              # ClikController.step docstring)
+    qdot_ff_provider: object | None = None   # Callable[[float], qdot_ff_rad_s]: joint-space
+                                              # feedforward from a planned path (e.g.
+                                              # JointSmoothMoveReference.sample_q); preferred
+                                              # way to keep a joint path's own coordinated
+                                              # redundancy resolution while CLIK/nullspace stay live
     force_observer: object | None = None     # None -> reuse the loop-level force_observer
     on_enter: object | None = None           # Callable[[], None], fired right after set_origin
 
@@ -428,8 +540,14 @@ def run_joint_admittance_phases(
                     if obs is not None:
                         _signed, f_ext = obs.update(now - total_t0, pose, snap.force_raw)
 
-                    twist = np.asarray(phase.outer.sample(t_phase, pose, f_ext), dtype=float)
-                    step = inner.update(twist, dt)
+                    if phase.mode == "joint":
+                        q_tgt, qdot_ff = phase.outer.sample_joint(t_phase)
+                        step = inner.update_joint(
+                            q_tgt, qdot_ff, dt, k_joint=getattr(phase.outer, "k_joint", 2.0)
+                        )
+                    else:
+                        twist = np.asarray(phase.outer.sample(t_phase, pose, f_ext), dtype=float)
+                        step = inner.update(twist, dt)
                     send_joint_canfd(robot, rad2deg(step.q_send), follow=follow)
                     wd.beat()
 

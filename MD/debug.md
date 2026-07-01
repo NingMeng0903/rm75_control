@@ -1,7 +1,7 @@
 # Joint-Position QP-CLIK Controller — Full Source Dump
 
-Auto-generated snapshot of the new cascaded joint-position controller.
-Architecture: task-space admittance outer loop → joint-space CLIK/QP inner loop → `rm_movej_canfd`.
+Auto-generated snapshot. Phase-1 point-to-point: our pose_ik (Pinocchio DLS)
++ joint smoothstep + live CLIK/nullspace q_ref tracking. No vendor IK.
 
 ---
 
@@ -271,6 +271,7 @@ def build_joint_ik_config(raw: dict) -> JointIkConfig:
     nullspace = NullspaceTaskConfig(
         k_center=float(n.get("k_center", 0.5)),
         k_limit=float(n.get("k_limit", 2.0)),
+        k_joint_ref=float(n.get("k_joint_ref", 2.0)),
         activation=float(n.get("activation", 0.85)),
         weights=(np.asarray(n["weights"], dtype=float) if n.get("weights") is not None else None),
     )
@@ -477,6 +478,69 @@ class RobotKinematics:
         return np.clip(q_rad, self.q_lower + margin, self.q_upper - margin)
 ```
 
+## FILE: `rm75_control/control/joint_admittance/pose_ik.py`
+
+```py
+"""One-shot pose inverse kinematics using our Pinocchio model + DLS-CLIK.
+
+Planning-only helper: resolves ``q_target`` for a desired TCP pose without any
+vendor ``rm_algo_inverse_kinematics`` call.  The resolved ``q_target`` is then
+fed to ``JointSmoothMoveReference`` for a joint-space smoothstep; execution still
+runs through the live CLIK/QP inner loop with nullspace (centering, ``q_ref``
+tracking, future obstacle gradients).
+
+References: Wampler 1986 / Nakamura & Hanafusa 1986 (DLS); Sciavicco & Siciliano
+1988 (pose error feedback).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from rm75_control.control.joint_admittance.clik import (
+    ClikConfig,
+    damping_from_sigma,
+    dls_pinv,
+)
+from rm75_control.control.joint_admittance.model import RobotKinematics, pose_error
+
+
+def solve_pose_ik(
+    kin: RobotKinematics,
+    q_seed: np.ndarray,
+    pose_target: np.ndarray,
+    *,
+    max_iters: int = 500,
+    pos_tol_m: float = 1e-3,
+    rot_tol_rad: float = 0.02,
+    dt: float = 0.02,
+    clik_cfg: ClikConfig | None = None,
+) -> tuple[np.ndarray, bool]:
+    """Iterative damped-least-squares IK: ``q_seed`` -> ``q`` with ``fk(q) ≈ pose_target``.
+
+    Returns ``(q_sol_rad, converged)``.  ``converged`` is False if iteration
+    budget is exhausted before tolerances are met (caller should abort or retry
+    with a different seed / relaxed tolerances).
+    """
+    cfg = clik_cfg or ClikConfig()
+    k = np.asarray(cfg.k_task, dtype=float)
+    q = np.clip(np.asarray(q_seed, dtype=float).copy(), kin.q_lower, kin.q_upper)
+    pose_target = np.asarray(pose_target, dtype=float)
+
+    for _ in range(max_iters):
+        err = pose_error(pose_target, kin.fk_pose(q), cfg.euler_order)
+        if np.linalg.norm(err[:3]) < pos_tol_m and np.linalg.norm(err[3:6]) < rot_tol_rad:
+            return q, True
+
+        J = kin.jacobian(q)
+        sigma_min = float(kin.singular_values(J).min())
+        lam = damping_from_sigma(sigma_min, cfg.sigma_thresh, cfg.lambda_max)
+        qdot = dls_pinv(J, lam) @ (k * err)
+        q = np.clip(q + qdot * dt, kin.q_lower, kin.q_upper)
+
+    return q, False
+```
+
 ## FILE: `rm75_control/control/joint_admittance/reference.py`
 
 ```py
@@ -489,7 +553,15 @@ Provided here, self-contained (no robot handle needed - pure kinematics/scipy):
 
 * HoldReference          - hold the start pose (bring-up default).
 * CartesianMoveReference - smoothstep point-to-point Cartesian move (position +
-  Slerp orientation), analytic vel_ff.  Drives the "walk to pose D" phase.
+  Slerp orientation), analytic vel_ff.  Forces a STRAIGHT Cartesian line - only
+  appropriate very close to the target or away from singularities, since a
+  straight-line Cartesian constraint can force awkward joint reconfiguration.
+* JointSmoothMoveReference - smoothstep interpolation IN JOINT SPACE from q_start
+  to q_target (from our pose_ik.solve_pose_ik, NOT vendor IK).  Exposed to the
+  loop as FK/J(q_ref) Cartesian references via sample(), plus sample_q() for
+  nullspace q_ref tracking.  Execute through CartesianTrackOuterLoop +
+  Phase.q_ref_provider + inner.update(..., q_ref=...) so CLIK/nullspace stay live.
+  Do NOT use update_joint() for this - that bypasses nullspace entirely.
 * SinToolYReference      - tool-frame Y sinusoid about a fixed origin (analogue
   of the tmp/Velocity_Admittance BuiltinTrajectorySource "sin_tool_y" mode, but
   computed directly instead of via robot.rm_algo_pose_move).
@@ -597,6 +669,67 @@ class CartesianMoveReference:
         pose, vel = interpolate_pose_smoothstep(
             self._pose0, self.pose_target, t_s, self.duration_s, euler_order=self.euler_order
         )
+        return MotionReference(pose, vel, t_ref=t_s)
+
+    def done(self, t_s: float) -> bool:
+        return t_s >= self.duration_s
+
+
+def smoothstep_scalar(t_s: float, duration_s: float) -> tuple[float, float]:
+    """s(u) in [0,1] and ds/dt, u = clip(t/T, 0, 1), s = 3u^2 - 2u^3 (zero end-vel)."""
+    if duration_s <= 0.0:
+        return 1.0, 0.0
+    u = float(np.clip(t_s / duration_s, 0.0, 1.0))
+    s = u * u * (3.0 - 2.0 * u)
+    ds_dt = 6.0 * u * (1.0 - u) / duration_s
+    return s, ds_dt
+
+
+class JointSmoothMoveReference:
+    """Smoothstep move in JOINT SPACE (q_start -> q_target), exposed as a Cartesian
+    MotionReferenceSource via FK/Jacobian - i.e. the "free-planned, natural motion"
+    analogue of MoveJ (smooth joint interpolation, whatever curved Cartesian path
+    that implies), rather than CartesianMoveReference's forced straight line.
+
+    Feeding (pose(t), vel_ff(t) = J(q(t)) @ qdot(t)) into the CLIK/QP inner loop
+    makes it track a target that is EXACTLY consistent with smooth joint motion,
+    so the resulting q_cmd closely follows q(t) itself - the CLIK correction only
+    has to cancel small linearization residuals, not fight a Cartesian constraint.
+    Requires q_target to already be resolved (e.g. via the vendor IK or an offline
+    CLIK solve) - this class itself does no IK, it only interpolates.
+    """
+
+    def __init__(
+        self,
+        kin,
+        q_start_rad: np.ndarray,
+        q_target_rad: np.ndarray,
+        duration_s: float,
+    ) -> None:
+        self.kin = kin
+        self.q_start = np.asarray(q_start_rad, dtype=float).copy()
+        self.q_target = np.asarray(q_target_rad, dtype=float).copy()
+        self.duration_s = float(duration_s)
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        # q_start already anchors this reference; pose0 is implied by FK(q_start).
+        del pose0
+
+    def sample_q(self, t_s: float) -> tuple[np.ndarray, np.ndarray]:
+        """Joint-space (q_ref(t), qdot_ff(t)) - pass to Phase.q_ref_provider so the
+        CLIK/QP nullspace pins the redundant DOF to this smoothstep (no drift)."""
+        s, ds_dt = smoothstep_scalar(t_s, self.duration_s)
+        dq = self.q_target - self.q_start
+        q = self.q_start + s * dq
+        qdot = ds_dt * dq
+        return q, qdot
+
+    def sample(self, t_s: float) -> MotionReference:
+        """Cartesian (pose, vel_ff) view via FK/Jacobian - feed through
+        CartesianTrackOuterLoop; pair with q_ref_provider for nullspace tracking."""
+        q, qdot = self.sample_q(t_s)
+        pose = self.kin.fk_pose(q)
+        vel = self.kin.jacobian(q) @ qdot
         return MotionReference(pose, vel, t_ref=t_s)
 
     def done(self, t_s: float) -> bool:
@@ -1107,12 +1240,12 @@ class JointIkController:
         out[3:6] = R @ twist[3:6]
         return out
 
-    def update(self, twist: np.ndarray, dt: float | None = None) -> JointIkStep:
+    def update(self, twist: np.ndarray, dt: float | None = None, q_ref: np.ndarray | None = None) -> JointIkStep:
         dt = self.cfg.dt if dt is None else dt
         q_prev = self.q_cmd
         twist_base = self._twist_to_base(twist, q_prev)
 
-        secondary = self.task(q_prev)
+        secondary = self.task(q_prev, q_ref=q_ref)
         r = self.core.step(q_prev, twist_base, dt, secondary_qdot=secondary)
 
         q_target = r.q_next
@@ -1134,6 +1267,56 @@ class JointIkController:
             lam=r.lam,
             manip=r.manip,
             cart_err_mm=float(np.linalg.norm(r.cart_err[:3]) * 1000.0),
+            vel_clamped=rep.vel_clamped,
+            acc_clamped=rep.acc_clamped,
+            pos_clamped=rep.pos_clamped,
+        )
+
+    def update_joint(
+        self,
+        q_target: np.ndarray,
+        qdot_ff: np.ndarray,
+        dt: float | None = None,
+        k_joint: float = 2.0,
+    ) -> JointIkStep:
+        """Joint-space PD+feedforward tracking of a moving joint target.
+
+        Bypasses CLIK/QP entirely - no Cartesian error, no Jacobian, no nullspace
+        projection.  Use for point-to-point repositioning when ``q_target(t)`` is
+        already known (e.g. one-shot vendor IK + JointSmoothMoveReference
+        smoothstep) - this reproduces MoveJ-like coordinated joint motion exactly,
+        with none of the redundant-DOF nullspace drift a Cartesian-tracking CLIK
+        reference has on a 7-DOF arm (see reference.py JointSmoothMoveReference).
+        Still runs through the same friction/smoothing/safety pipeline as
+        ``update()``, so it is equally safe to stream via ``rm_movej_canfd``.
+        """
+        dt = self.cfg.dt if dt is None else dt
+        q_prev = self.q_cmd
+        q_target = np.asarray(q_target, dtype=float)
+        qdot_ff = np.asarray(qdot_ff, dtype=float)
+        qdot = qdot_ff + k_joint * (q_target - q_prev)
+        q_next = q_prev + qdot * dt
+
+        if self.cfg.friction.enabled:
+            q_next = q_next + self.friction(qdot) * dt
+        if self.smoother is not None:
+            q_next = self.smoother(q_next)
+
+        rep = self.safety.clamp(q_prev, q_next, dt)
+        if self.smoother is not None:
+            self.smoother.sync(rep.q_safe)
+
+        self.q_cmd = rep.q_safe
+        x_cur = self.kin.fk_pose(rep.q_safe)
+        x_tgt = self.kin.fk_pose(q_target)
+        return JointIkStep(
+            q_send=rep.q_safe.copy(),
+            qdot=qdot,
+            twist_base=np.zeros(6),
+            sigma_min=float("nan"),
+            lam=0.0,
+            manip=float("nan"),
+            cart_err_mm=float(np.linalg.norm(x_tgt[:3] - x_cur[:3]) * 1000.0),
             vel_clamped=rep.vel_clamped,
             acc_clamped=rep.acc_clamped,
             pos_clamped=rep.pos_clamped,
@@ -1245,6 +1428,27 @@ class CartesianTrackOuterLoop:
         return v
 
 
+class JointSpaceMoveOuterLoop:
+    """Optional bypass outer loop (``Phase.mode == "joint"``) feeding
+    ``JointIkController.update_joint`` - NO CLIK, NO nullspace.
+
+    Not for production point-to-point moves: use ``JointSmoothMoveReference`` +
+    ``CartesianTrackOuterLoop`` + ``Phase.q_ref_provider`` instead so nullspace
+    (centering, ``q_ref`` tracking, obstacle avoidance) stays live.
+    """
+
+    def __init__(self, reference, k_joint: float = 2.0) -> None:
+        self.reference = reference
+        self.k_joint = k_joint
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        if hasattr(self.reference, "set_origin"):
+            self.reference.set_origin(pose0)
+
+    def sample_joint(self, t_s: float) -> tuple[np.ndarray, np.ndarray]:
+        return self.reference.sample_q(t_s)
+
+
 def arrived(
     current_pose: np.ndarray,
     target_pose: np.ndarray,
@@ -1290,9 +1494,14 @@ class Phase:
 
     outer: OuterLoop
     label: str = ""
+    mode: str = "cartesian"                  # "cartesian" (outer.sample -> twist) | "joint"
+                                              # (outer.sample_joint -> (q_target, qdot_ff), see
+                                              # JointSpaceMoveOuterLoop - bypasses Cartesian IK)
     duration_s: float | None = None          # None -> run until wait_until (or max_duration_s)
     max_duration_s: float | None = None      # safety cap when duration_s is None
     wait_until: object | None = None         # Callable[[np.ndarray], bool] on current pose
+    q_ref_provider: object | None = None     # Callable[[float], q_ref_rad] for nullspace
+                                              # joint-reference tracking during this phase
     force_observer: object | None = None     # None -> reuse the loop-level force_observer
     on_enter: object | None = None           # Callable[[], None], fired right after set_origin
 
@@ -1391,8 +1600,15 @@ def run_joint_admittance_phases(
                     if obs is not None:
                         _signed, f_ext = obs.update(now - total_t0, pose, snap.force_raw)
 
-                    twist = np.asarray(phase.outer.sample(t_phase, pose, f_ext), dtype=float)
-                    step = inner.update(twist, dt)
+                    if phase.mode == "joint":
+                        q_tgt, qdot_ff = phase.outer.sample_joint(t_phase)
+                        step = inner.update_joint(
+                            q_tgt, qdot_ff, dt, k_joint=getattr(phase.outer, "k_joint", 2.0)
+                        )
+                    else:
+                        twist = np.asarray(phase.outer.sample(t_phase, pose, f_ext), dtype=float)
+                        q_ref = phase.q_ref_provider(t_phase) if phase.q_ref_provider else None
+                        step = inner.update(twist, dt, q_ref=q_ref)
                     send_joint_canfd(robot, rad2deg(step.q_send), follow=follow)
                     wd.beat()
 
@@ -1493,6 +1709,7 @@ from rm75_control.control.joint_admittance.model import RobotKinematics
 class NullspaceTaskConfig:
     k_center: float = 1.0        # centering velocity gain (rad/s per normalized unit)
     k_limit: float = 2.0         # extra repulsion gain near a limit
+    k_joint_ref: float = 2.0     # pull redundant DOF toward q_ref(t) in nullspace (rad/s per rad)
     activation: float = 0.8      # |u| beyond which limit repulsion ramps in (u in [-1,1])
     weights: np.ndarray | None = None   # optional per-joint weighting (len 7)
 
@@ -1525,7 +1742,7 @@ class JointCenteringTask:
     ) -> "JointCenteringTask":
         return cls(kin.q_lower, kin.q_upper, cfg)
 
-    def __call__(self, q_rad: np.ndarray) -> np.ndarray:
+    def __call__(self, q_rad: np.ndarray, q_ref: np.ndarray | None = None) -> np.ndarray:
         cfg = self.cfg
         q = np.asarray(q_rad, dtype=float)
         u = (q - self.q_mid) / self.half              # normalized position in [-1, 1]
@@ -1538,7 +1755,30 @@ class JointCenteringTask:
             span = max(1.0 - cfg.activation, 1e-6)
             over = np.clip((np.abs(u) - cfg.activation) / span, 0.0, 1.0)
             qdot0 = qdot0 - cfg.k_limit * np.sign(u) * (over * over)
+
+        # track a time-varying joint reference in nullspace (pins redundant DOF
+        # during joint-space smoothstep moves; obstacle-avoidance gradients can
+        # be added the same way via CompositeNullspaceTask)
+        if q_ref is not None and cfg.k_joint_ref > 0.0:
+            qdot0 = qdot0 + cfg.k_joint_ref * (np.asarray(q_ref, dtype=float) - q)
         return qdot0
+
+
+class CompositeNullspaceTask:
+    """Sum of secondary tasks: ``sum_i task_i(q, **ctx)``.
+
+    Use to stack joint centering / ``q_ref`` tracking with future obstacle-
+    avoidance gradients without changing the CLIK/QP core.
+    """
+
+    def __init__(self, *tasks) -> None:
+        self.tasks = tasks
+
+    def __call__(self, q_rad: np.ndarray, **ctx) -> np.ndarray:
+        out = np.zeros_like(np.asarray(q_rad, dtype=float))
+        for task in self.tasks:
+            out = out + task(q_rad, **ctx)
+        return out
 ```
 
 ## FILE: `rm75_control/control/joint_admittance/solver/__init__.py`
@@ -2732,8 +2972,8 @@ robot:
   thread_mode: 2
 
 timing:
-  dt_ms: 10.0          # 100 Hz control loop
-  async_poll_ms: 10.0
+  dt_ms: 5.0          # 200 Hz control loop
+  async_poll_ms: 5.0
 
 # ---------------------------------------------------------------------------
 # Inner loop (joint-space IK)
@@ -2773,6 +3013,7 @@ inner:
 
   nullspace:
     k_center: 0.5         # pull joints toward mid-range (rad/s per normalized unit)
+    k_joint_ref: 2.0     # during joint-path moves: track q_ref(t) in nullspace (rad/s per rad)
     k_limit: 2.0          # extra repulsion near a joint limit
     activation: 0.85      # |normalized pos| beyond which repulsion ramps in
 
@@ -2938,7 +3179,10 @@ if __name__ == "__main__":
 both driven by OUR joint-position cascade (CLIK/QP inner loop -> rm_movej_canfd),
 never rm_movev_canfd / MoveV. One continuous run, no mode switch at the D handoff.
 
-  Phase 1  current pose -> scan pose D   (CartesianTrackOuterLoop, no force)
+  Phase 1  current q -> our CLIK pose-IK(pose D) once, then JOINT-SPACE smoothstep
+           executed THROUGH the live CLIK/QP inner loop (CartesianTrackOuterLoop on
+           FK/J(q_ref) path + nullspace q_ref tracking).  No vendor IK, no
+           Cartesian straight line, nullspace stays live for centering / obstacles.
   Phase 2  hold D, sin sweep tool-Y       (AdmittanceOuterLoop, force-position hybrid)
 
 ``poses.yaml`` slot ``d`` is the **force-ID Arm_Tip teach pose** (contact tip).
@@ -2990,9 +3234,11 @@ from rm75_control.control.joint_admittance.loop import (
     arrived,
     run_joint_admittance_phases,
 )
-from rm75_control.control.joint_admittance.model import RobotKinematics
+from rm75_control.control.joint_admittance.model import RobotKinematics, deg2rad
+from rm75_control.control.joint_admittance.pose_ik import solve_pose_ik
 from rm75_control.control.joint_admittance.reference import (
     CartesianMoveReference,
+    JointSmoothMoveReference,
     SinToolYReference,
 )
 from rm75_control.core.session import RobotSession
@@ -3071,7 +3317,18 @@ def main() -> int:
     )
     ap.add_argument("--solver", choices=["clik", "qp"], default=None)
     ap.add_argument("--move-duration", type=float, default=8.0, help="phase 1 smoothstep duration (s)")
-    ap.add_argument("--move-kp", type=float, default=1.5, help="phase 1 Cartesian tracking gain (1/s)")
+    ap.add_argument(
+        "--move-kp",
+        type=float,
+        default=1.5,
+        help="phase 1 Cartesian tracking gain on the joint-path reference (1/s)",
+    )
+    ap.add_argument(
+        "--legacy-cartesian-move",
+        action="store_true",
+        help="phase 1: force a straight Cartesian line instead of the default "
+        "joint-space smoothstep path (both still run through CLIK/nullspace)",
+    )
     ap.add_argument("--y-pp-cm", type=float, default=6.0, help="tool-Y sin peak-to-peak amplitude (cm)")
     ap.add_argument("--max-vel-cm-s", type=float, default=2.0, help="tool-Y sin peak velocity (cm/s)")
     ap.add_argument("--period-s", type=float, default=None, help="override sin period (s); default from max-vel")
@@ -3107,30 +3364,72 @@ def main() -> int:
 
     robot_cfg = raw.get("robot", {})
     with RobotSession(ip=robot_cfg.get("ip"), port=robot_cfg.get("port"), config=args.config) as sess:
-        q_d_deg, pose_d, _pose_id = resolve_scan_pose_d(
+        _q_slot_deg, pose_d, _pose_id = resolve_scan_pose_d(
             args.slot,
             sess.robot,
             approach_dz_m=float(args.approach_dz_mm) * 0.001,
             use_force_id_pose=bool(args.use_force_id_pose),
         )
 
-        # --- Phase 1: Cartesian move current -> pose D (pure tracking, no force) ---
-        move_ref = CartesianMoveReference(pose_d, args.move_duration, euler_order=inner_cfg.euler_order)
-        move_outer = CartesianTrackOuterLoop(
-            move_ref,
-            CartesianTrackConfig(
-                k_task=np.full(6, args.move_kp),
-                euler_order=inner_cfg.euler_order,
-                control_frame=inner_cfg.control_frame,  # MUST match the inner loop
-            ),
-        )
-        phase1 = Phase(
-            outer=move_outer,
-            label=f"move -> {args.slot}",
-            duration_s=None,
-            max_duration_s=args.move_duration + 5.0,
-            wait_until=lambda pose: arrived(pose, pose_d, tol_mm=2.0, tol_deg=1.0, euler_order=inner_cfg.euler_order),
-        )
+        # --- Phase 1: current -> pose D (pure tracking, no force) ---
+        ret0, st0 = sess.robot.rm_get_current_arm_state()
+        if ret0 != 0:
+            raise RuntimeError(f"rm_get_current_arm_state failed: {ret0}")
+        q0_deg = np.asarray(st0["joint"][:7], dtype=float)
+        q0_rad = deg2rad(q0_deg)
+
+        if args.legacy_cartesian_move:
+            move_ref = CartesianMoveReference(pose_d, args.move_duration, euler_order=inner_cfg.euler_order)
+            move_outer = CartesianTrackOuterLoop(
+                move_ref,
+                CartesianTrackConfig(
+                    k_task=np.full(6, args.move_kp),
+                    euler_order=inner_cfg.euler_order,
+                    control_frame=inner_cfg.control_frame,
+                ),
+            )
+            phase1 = Phase(
+                outer=move_outer,
+                label=f"move -> {args.slot} (Cartesian line)",
+                duration_s=None,
+                max_duration_s=args.move_duration + 5.0,
+                wait_until=lambda pose: arrived(
+                    pose, pose_d, tol_mm=2.0, tol_deg=1.0, euler_order=inner_cfg.euler_order
+                ),
+            )
+        else:
+            # Our Pinocchio DLS pose-IK (planning only) -> joint smoothstep ->
+            # live CLIK/QP execution with nullspace q_ref tracking.
+            q_target_rad, ok = solve_pose_ik(kin, q0_rad, pose_d, clik_cfg=inner_cfg.clik)
+            if not ok:
+                raise RuntimeError(
+                    f"pose IK did not converge for scan pose D "
+                    f"{np.round(pose_d, 4).tolist()} from q0={np.round(q0_deg, 2).tolist()}"
+                )
+            print(
+                f"  pose-IK(pose D): q0={np.round(q0_deg, 2).tolist()} -> "
+                f"q_target={np.round(np.degrees(q_target_rad), 2).tolist()} deg",
+                flush=True,
+            )
+            move_ref = JointSmoothMoveReference(kin, q0_rad, q_target_rad, args.move_duration)
+            move_outer = CartesianTrackOuterLoop(
+                move_ref,
+                CartesianTrackConfig(
+                    k_task=np.full(6, args.move_kp),
+                    euler_order=inner_cfg.euler_order,
+                    control_frame=inner_cfg.control_frame,
+                ),
+            )
+            phase1 = Phase(
+                outer=move_outer,
+                label=f"move -> {args.slot} (joint-path via CLIK)",
+                duration_s=None,
+                max_duration_s=args.move_duration + 5.0,
+                q_ref_provider=lambda t: move_ref.sample_q(t)[0],
+                wait_until=lambda pose: arrived(
+                    pose, pose_d, tol_mm=2.0, tol_deg=1.0, euler_order=inner_cfg.euler_order
+                ),
+            )
 
         phases = [phase1]
 
@@ -3328,6 +3627,74 @@ def test_smoothing_filter_stable_at_high_cutoff():
             s = ctrl.update(np.array([0.02, 0.0, 0.0, 0.0, 0.0, 0.1]))
         assert s.cart_err_mm < 100.0, (cutoff, s.cart_err_mm)  # bounded lag, not exploding
         assert np.all(np.isfinite(ctrl.q_cmd))
+
+
+def test_joint_smooth_move_via_clik_and_q_ref_nullspace():
+    """JointSmoothMoveReference + CartesianTrackOuterLoop + q_ref nullspace tracking
+    must follow the joint smoothstep (sub-degree) while keeping CLIK/nullspace live.
+    Without q_ref, the redundant DOF drifts tens of degrees even though Cartesian
+    error is small; with q_ref, joint coordination stays natural AND nullspace
+    remains available for centering / obstacle avoidance."""
+    from rm75_control.control.joint_admittance.loop import CartesianTrackConfig, CartesianTrackOuterLoop
+    from rm75_control.control.joint_admittance.reference import JointSmoothMoveReference
+    from rm75_control.control.joint_admittance.tasks.nullspace_task import NullspaceTaskConfig
+
+    kin = RobotKinematics()
+    cfg = JointIkConfig(
+        control_frame="tool",
+        clik=ClikConfig(k_task=np.full(6, 5.0)),
+        nullspace=NullspaceTaskConfig(k_center=0.3, k_limit=0.0, k_joint_ref=3.0),
+        v_scale=0.9,
+        a_max=50.0,
+    )
+    ctrl = JointIkController(kin, cfg)
+    dt = ctrl.cfg.dt
+    q_start = deg2rad(np.array([20.0, -30.0, 10.0, 70.0, 15.0, 50.0, -10.0]))
+    q_target = deg2rad(np.array([5.0, -20.0, -5.0, 75.0, 3.0, 65.0, 15.0]))
+    ctrl.reset(q_start)
+
+    move_ref = JointSmoothMoveReference(kin, q_start, q_target, duration_s=5.0)
+    move_outer = CartesianTrackOuterLoop(
+        move_ref, CartesianTrackConfig(control_frame="tool", k_task=np.full(6, 2.0))
+    )
+    move_outer.set_origin(kin.fk_pose(q_start))
+
+    t_s = 0.0
+    for _ in range(900):  # 5s move + 4s settle
+        cur = kin.fk_pose(ctrl.q_cmd)
+        twist = move_outer.sample(t_s, cur, np.zeros(6))
+        q_ref, _ = move_ref.sample_q(t_s)
+        ctrl.update(twist, dt, q_ref=q_ref)
+        t_s += dt
+
+    joint_err_deg = np.degrees(np.max(np.abs(ctrl.q_cmd - q_target)))
+    cart_err_mm = np.linalg.norm(kin.fk_pose(ctrl.q_cmd)[:3] - kin.fk_pose(q_target)[:3]) * 1000.0
+    assert joint_err_deg < 2.0, joint_err_deg
+    assert cart_err_mm < 3.0, cart_err_mm
+
+
+def test_update_joint_bypasses_clik():
+    """update_joint() is an optional bypass (no nullspace) - kept for diagnostics only."""
+    from rm75_control.control.joint_admittance.loop import JointSpaceMoveOuterLoop
+    from rm75_control.control.joint_admittance.reference import JointSmoothMoveReference
+
+    ctrl = _make(control_frame="tool", k_center=0.0)
+    dt = ctrl.cfg.dt
+    q_start = deg2rad(np.array([20.0, -30.0, 10.0, 70.0, 15.0, 50.0, -10.0]))
+    q_target = deg2rad(np.array([5.0, -20.0, -5.0, 75.0, 3.0, 65.0, 15.0]))
+    ctrl.reset(q_start)
+
+    move_ref = JointSmoothMoveReference(ctrl.kin, q_start, q_target, duration_s=5.0)
+    move_outer = JointSpaceMoveOuterLoop(move_ref, k_joint=3.0)
+
+    t_s = 0.0
+    for _ in range(900):
+        q_tgt, qdot_ff = move_outer.sample_joint(t_s)
+        ctrl.update_joint(q_tgt, qdot_ff, dt, k_joint=move_outer.k_joint)
+        t_s += dt
+
+    joint_err_deg = np.degrees(np.max(np.abs(ctrl.q_cmd - q_target)))
+    assert joint_err_deg < 1.0, joint_err_deg
 
 
 def test_cartesian_track_outer_loop_tool_frame_converges():

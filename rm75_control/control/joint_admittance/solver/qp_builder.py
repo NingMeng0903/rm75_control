@@ -168,7 +168,6 @@ class QpIkController:
         if not self._initialized:
             self.reset(q_prev)
 
-        # advance integrated Cartesian reference
         self.x_ref = integrate_pose(self.x_ref, twist_ref, dt, cfg.euler_order)
 
         J = self.kin.jacobian(q_prev)
@@ -182,7 +181,6 @@ class QpIkController:
 
         W = np.diag(cfg.task_weight)
         H = J.T @ W @ J + cfg.reg * np.eye(self.kin.nv)
-        # symmetrize for solver numerics
         H = 0.5 * (H + H.T)
         g = -(J.T @ (W @ v_task))
         if secondary_qdot is not None:

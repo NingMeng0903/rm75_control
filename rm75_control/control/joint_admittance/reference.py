@@ -7,7 +7,15 @@ Provided here, self-contained (no robot handle needed - pure kinematics/scipy):
 
 * HoldReference          - hold the start pose (bring-up default).
 * CartesianMoveReference - smoothstep point-to-point Cartesian move (position +
-  Slerp orientation), analytic vel_ff.  Drives the "walk to pose D" phase.
+  Slerp orientation), analytic vel_ff.  Forces a STRAIGHT Cartesian line - only
+  appropriate very close to the target or away from singularities, since a
+  straight-line Cartesian constraint can force awkward joint reconfiguration.
+* JointSmoothMoveReference - smoothstep interpolation IN JOINT SPACE from q_start
+  to q_target (from our pose_ik.solve_pose_ik, NOT vendor IK).  Exposed to the
+  loop as FK/J(q_ref) Cartesian references via sample(), plus sample_q() for
+  nullspace q_ref tracking.  Execute through CartesianTrackOuterLoop +
+  Phase.q_ref_provider + inner.update(..., q_ref=...) so CLIK/nullspace stay live.
+  Do NOT use update_joint() for this - that bypasses nullspace entirely.
 * SinToolYReference      - tool-frame Y sinusoid about a fixed origin (analogue
   of the tmp/Velocity_Admittance BuiltinTrajectorySource "sin_tool_y" mode, but
   computed directly instead of via robot.rm_algo_pose_move).
@@ -115,6 +123,67 @@ class CartesianMoveReference:
         pose, vel = interpolate_pose_smoothstep(
             self._pose0, self.pose_target, t_s, self.duration_s, euler_order=self.euler_order
         )
+        return MotionReference(pose, vel, t_ref=t_s)
+
+    def done(self, t_s: float) -> bool:
+        return t_s >= self.duration_s
+
+
+def smoothstep_scalar(t_s: float, duration_s: float) -> tuple[float, float]:
+    """s(u) in [0,1] and ds/dt, u = clip(t/T, 0, 1), s = 3u^2 - 2u^3 (zero end-vel)."""
+    if duration_s <= 0.0:
+        return 1.0, 0.0
+    u = float(np.clip(t_s / duration_s, 0.0, 1.0))
+    s = u * u * (3.0 - 2.0 * u)
+    ds_dt = 6.0 * u * (1.0 - u) / duration_s
+    return s, ds_dt
+
+
+class JointSmoothMoveReference:
+    """Smoothstep move in JOINT SPACE (q_start -> q_target), exposed as a Cartesian
+    MotionReferenceSource via FK/Jacobian - i.e. the "free-planned, natural motion"
+    analogue of MoveJ (smooth joint interpolation, whatever curved Cartesian path
+    that implies), rather than CartesianMoveReference's forced straight line.
+
+    Feeding (pose(t), vel_ff(t) = J(q(t)) @ qdot(t)) into the CLIK/QP inner loop
+    makes it track a target that is EXACTLY consistent with smooth joint motion,
+    so the resulting q_cmd closely follows q(t) itself - the CLIK correction only
+    has to cancel small linearization residuals, not fight a Cartesian constraint.
+    Requires q_target to already be resolved (e.g. via the vendor IK or an offline
+    CLIK solve) - this class itself does no IK, it only interpolates.
+    """
+
+    def __init__(
+        self,
+        kin,
+        q_start_rad: np.ndarray,
+        q_target_rad: np.ndarray,
+        duration_s: float,
+    ) -> None:
+        self.kin = kin
+        self.q_start = np.asarray(q_start_rad, dtype=float).copy()
+        self.q_target = np.asarray(q_target_rad, dtype=float).copy()
+        self.duration_s = float(duration_s)
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        # q_start already anchors this reference; pose0 is implied by FK(q_start).
+        del pose0
+
+    def sample_q(self, t_s: float) -> tuple[np.ndarray, np.ndarray]:
+        """Joint-space (q_ref(t), qdot_ff(t)) - pass to Phase.q_ref_provider so the
+        CLIK/QP nullspace pins the redundant DOF to this smoothstep (no drift)."""
+        s, ds_dt = smoothstep_scalar(t_s, self.duration_s)
+        dq = self.q_target - self.q_start
+        q = self.q_start + s * dq
+        qdot = ds_dt * dq
+        return q, qdot
+
+    def sample(self, t_s: float) -> MotionReference:
+        """Cartesian (pose, vel_ff) view via FK/Jacobian - feed through
+        CartesianTrackOuterLoop; pair with q_ref_provider for nullspace tracking."""
+        q, qdot = self.sample_q(t_s)
+        pose = self.kin.fk_pose(q)
+        vel = self.kin.jacobian(q) @ qdot
         return MotionReference(pose, vel, t_ref=t_s)
 
     def done(self, t_s: float) -> bool:

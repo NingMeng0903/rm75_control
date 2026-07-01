@@ -1,15 +1,16 @@
-# Joint-space inner-loop (QP/CLIK) + task-space admittance outer-loop config.
+# Joint-space inner-loop (CLIK) + task-space admittance outer-loop config.
 #
 # Cascade: the admittance outer loop (hybrid_motion.AdmittanceController) emits a
 # 6D Cartesian twist; the inner loop turns it into absolute joint angles streamed
 # via rm_movej_canfd (single interface, no MoveJ/MoveV mode switching).
 #
+# ProxQP (inner.solver: qp) is wired but OFF by default — enable when you add
+# hard inequality constraints later.  For now: CLIK + DLS + nullspace only.
+#
 # Run:  source env.sh
 #       python apps/joint_admittance/run_joint_admittance.py --config configs/joint_admittance.yaml
 #
-# For an on-robot test that also exercises Cartesian trajectory tracking (walk to
-# a pose) + force-position hybrid control (sin scan there), both through this same
-# cascade with no MoveJ/MoveV switch, see tmp/joint_admittance/d_sin_tool_y.py.
+# On-robot D-then-sin test: tmp/joint_admittance/d_sin_tool_y.py
 
 robot:
   ip: "192.168.1.18"
@@ -24,60 +25,59 @@ timing:
 # Inner loop (joint-space IK)
 # ---------------------------------------------------------------------------
 inner:
-  solver: clik          # "clik" (Phase 1 DLS) | "qp" (Phase 2 ProxQP, hard limits)
-  control_frame: tool   # frame the outer-loop twist is expressed in (match hybrid_motion.control_frame)
+  solver: clik          # "clik" (default) | "qp" (ProxQP — enable when constraints ready)
+  control_frame: tool   # MUST match hybrid_motion / CartesianTrackConfig
   euler_order: xyz
 
-  # safety (streaming q_cmd bypasses MoveJ's planner, so these MUST hold)
-  v_scale: 0.35         # fraction of URDF joint velocity limit allowed (start conservative)
-  a_max: 12.0           # rad/s^2 per-joint acceleration clamp
+  v_scale: 0.35
+  a_max: 12.0
   position_margin_deg: 2.0
   use_smoothing: true
-  # utils/smoothing.SecondOrderLowPass is now two cascaded 1st-order stages
-  # (unconditionally stable at any cutoff/dt - see MD/JOINT_ADMITTANCE.md).
-  # Ramp-tracking lag falls roughly with 1/cutoff; smoothing (jerk reduction)
-  # falls as you raise it. 20 Hz is a safe starting point at 100 Hz control;
-  # raise toward 30-40 Hz once bring-up confirms no current-spike faults.
   smooth_cutoff_hz: 20.0
 
   clik:
-    k_task: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]   # Cartesian error feedback gain (1/s)
-    sigma_thresh: 0.04    # DLS: below this smallest singular value, damping ramps in
-    lambda_max: 0.08      # DLS: max damping at a singularity
+    k_task: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+    sigma_thresh: 0.04
+    lambda_max: 0.08
     nullspace_gain: 1.0
-    max_pos_err_m: 0.05   # anti-windup cap on fed-back Cartesian error
+    max_pos_err_m: 0.05
     max_rot_err_rad: 0.20
 
-  qp:                     # used only when solver == qp
-    k_task: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+  qp:                     # inactive until solver: qp
+    k_task: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
     task_weight: [1.0, 1.0, 1.0, 0.5, 0.5, 0.5]
-    reg: 1.0e-3           # regularization / secondary-task weight
-    backend: proxqp       # proxqp (warm-started) | osqp
+    reg: 1.0e-3
+    backend: proxqp
     eps_abs: 1.0e-6
     max_iter: 200
 
   nullspace:
-    k_center: 0.5         # pull joints toward mid-range (rad/s per normalized unit)
-    k_limit: 2.0          # extra repulsion near a joint limit
-    activation: 0.85      # |normalized pos| beyond which repulsion ramps in
+    k_center: 0.5
+    k_limit: 2.0
+    activation: 0.85
 
 # ---------------------------------------------------------------------------
-# Outer loop (task-space admittance) - hybrid_motion.AdmittanceConfig keys
+# Outer loop (task-space admittance)
 # ---------------------------------------------------------------------------
 frames:
   euler_order: xyz
   control_frame: tool
 
 force:
-  desired_z_n: 3.0        # constant normal-force setpoint on tool-Z [N]
+  desired_z_n: 3.0
   phi_source: phi_recommended
   fc_hz: 6.0
-  min_samples: 35
+  min_samples: 22
+  causal_fc_hz: 6.0
+  causal_order: 2
+  causal_history: 5
 
 hybrid_motion:
   force_axes: [0, 0, 1, 0, 0, 0]
   track_axes: [1, 1, 0, 1, 1, 1]
-  kp_pos: [0.3, 0.6, 0.0, 0.4, 0.4, 0.4]
+  kp_pos: [0.30, 0.60, 0.0, 0.4, 0.4, 0.4]
+  pos_err_deadband_m: 0.0005
+  pos_correction_max_m_s: 0.05
   system_delay_s: 0.015
   contact_threshold_n: 0.5
   deadband_n: 0.3
@@ -88,16 +88,17 @@ hybrid_motion:
   admittance_damping_z: 60.0
   max_vz_tool_m_s: 0.05
   var_damping_enabled: true
+  var_damping_omega_c_hz: 3.5
+  var_damping_lambda: 0.99
+  var_damping_f_max_n: 30.0
+  var_damping_d_u: 60.0
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
 startup:
-  pose_slot_q_deg: null   # optional [7] MoveJ target before streaming; null = start where it is
+  pose_slot_q_deg: null
   duration_s: 20.0
   move_speed: 20
-  reference: hold         # "hold" = maintain the start pose (bring-up default)
-  enable_force: false     # true requires a calibrated force_id_phi.json
+  reference: hold
+  enable_force: false
   follow: true
-  realtime: false         # true attempts SCHED_FIFO (needs privileges)
+  realtime: false
   watchdog_timeout_s: 0.1

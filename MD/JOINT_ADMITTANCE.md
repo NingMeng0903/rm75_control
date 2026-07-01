@@ -16,11 +16,16 @@ rm75_control/control/joint_admittance/
 ├── validation.py       # FK-vs-robot check (<1mm / <0.1deg) — run FIRST
 ├── config.py           # yaml -> JointIkConfig
 ├── reference.py        # MotionReferenceSources: HoldReference, CartesianMoveReference
-│                       # (point-to-point smoothstep), SinToolYReference (tool-Y sin)
-├── loop.py             # JointIkController (inner); CartesianTrackOuterLoop (pure
-│                       # position tracking, no force) + AdmittanceOuterLoop (force-
-│                       # position hybrid); Phase + run_joint_admittance_phases
-│                       # (multi-phase on-robot orchestration, one continuous stream)
+│                       # (Cartesian-line smoothstep), JointSmoothMoveReference
+│                       # (JOINT-space smoothstep -> MoveJ-like, no nullspace drift),
+│                       # SinToolYReference (tool-Y sin)
+├── loop.py             # JointIkController (inner, .update()=Cartesian CLIK/QP,
+│                       # .update_joint()=joint-space PD+FF, bypasses IK entirely);
+│                       # CartesianTrackOuterLoop (pure position tracking, no force),
+│                       # JointSpaceMoveOuterLoop (feeds .update_joint()) + Admittance-
+│                       # OuterLoop (force-position hybrid); Phase(mode="cartesian"|
+│                       # "joint") + run_joint_admittance_phases (multi-phase on-robot
+│                       # orchestration, one continuous stream)
 ├── tasks/nullspace_task.py    # joint centering + limit avoidance (Liegeois)
 ├── solver/
 │   ├── constraint_mgr.py      # per-tick box bounds on qdot
@@ -92,16 +97,23 @@ Installed in the `rm75` env: `pin` (Pinocchio 4.x), `proxsuite`, `osqp`, `scipy`
    python tmp/joint_admittance/d_sin_tool_y.py --move-duration 10 \
        --y-pp-cm 10 --max-vel-cm-s 2 --enable-force --desired-z 3.0 --scan-duration 60
    ```
-   Phase 1 uses `CartesianTrackOuterLoop` (pure position tracking, no force) with a
-   `CartesianMoveReference` smoothstepping from the current pose to pose D; it ends
-   early once within 2 mm / 1° of D. Phase 2 switches (in-place, same inner loop, same
-   stream) to `AdmittanceOuterLoop` + `SinToolYReference` for the tool-Y sweep with
-   tool-Z force hold — i.e. the exact force-position hybrid behaviour, just routed
-   through `rm_movej_canfd` instead of `rm_movev_canfd`. Ctrl+C stops cleanly.
+   Phase 1 (default) does **not** force a Cartesian straight line and does **not**
+   call vendor IK.  It solves ``q_target = pose_ik.solve_pose_ik(pose D)`` once
+   using our Pinocchio DLS solver, smoothsteps ``q(t)`` in joint space, and
+   executes through the **live CLIK/QP inner loop** with nullspace ``q_ref``
+   tracking (``Phase.q_ref_provider`` + ``nullspace.k_joint_ref``) so redundant
+   DOF follows the planned joint path while nullspace remains available for
+   centering and future obstacle-avoidance gradients.  Use ``--legacy-cartesian-move``
+   only when you explicitly need a forced Cartesian line (comparison/debug). Phase 1
+   ends early once within 2 mm / 1° of D. Phase 2 switches (in-place, same inner loop,
+   same stream) to ``AdmittanceOuterLoop`` + ``SinToolYReference`` for the tool-Y sweep
+   with tool-Z force hold. Ctrl+C stops cleanly.
 
-6. **Add any other trajectory** by swapping in a different `MotionReferenceSource`
-   (e.g. the richer sin/scan demos under `tmp/Velocity_Admittance/demo/`, or write a
-   new one alongside `CartesianMoveReference`/`SinToolYReference` in `reference.py`).
+6. **Add any other trajectory** by swapping in a different ``MotionReferenceSource``.
+   Point-to-point repositioning: ``JointSmoothMoveReference`` + ``pose_ik.solve_pose_ik``
+   + ``CartesianTrackOuterLoop`` + ``Phase.q_ref_provider`` (NOT ``update_joint``).
+   Obstacle avoidance: add gradients via ``CompositeNullspaceTask`` in
+   ``tasks/nullspace_task.py``.
 
 7. **Upgrade to QP** (hard inequality limits): `inner.solver: qp`.  ProxQP is
    warm-started (full inner tick ~0.25 ms, well inside the 10 ms budget).  OSQP is
@@ -114,6 +126,7 @@ Installed in the `rm75` env: `pin` (Pinocchio 4.x), `proxsuite`, `osqp`, `scipy`
 | `inner.clik.k_task` | Cartesian error feedback gain (1/s). Higher = tighter tracking, less lag. |
 | `inner.clik.sigma_thresh` / `lambda_max` | DLS damping schedule: `lambda=0` above `sigma_thresh`, ramps to `lambda_max` at singularity. |
 | `inner.nullspace.k_center` / `k_limit` | Redundancy: pull to mid-range / repel from limits. |
+| `inner.nullspace.k_joint_ref` | During joint-path moves: track `q_ref(t)` in nullspace (pins redundant DOF). |
 | `inner.v_scale` / `a_max` | Fraction of URDF joint speed / accel clamp. Start low, raise gradually. |
 | `inner.smooth_cutoff_hz` | q_cmd low-pass cutoff. Implemented as two cascaded 1st-order stages (unconditionally stable at any cutoff/dt). Ramp-tracking lag falls ~1/cutoff; jerk reduction falls as you raise it. 20 Hz is a safe start at 100 Hz control; raise toward 30–40 Hz once bring-up confirms no current-spike faults. (An earlier explicit-Euler 2nd-order discretization was only conditionally stable and blew up above ~17 Hz at 100 Hz control — fixed; see `tests/test_joint_ik_offline.py::test_smoothing_filter_stable_at_high_cutoff`.) |
 | `inner.qp.reg` / `task_weight` | QP regularization / per-axis task weighting. |

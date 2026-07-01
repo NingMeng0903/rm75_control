@@ -123,6 +123,15 @@ def test_smoothing_filter_stable_at_high_cutoff():
         assert np.all(np.isfinite(ctrl.q_cmd))
 
 
+def test_qp_solver_runs_offline():
+    """ProxQP is wired but not default — smoke test only."""
+    ctrl = _make(solver="qp", k_center=0.0)
+    assert ctrl.core.backend_name == "proxqp"
+    for _ in range(50):
+        ctrl.update(np.zeros(6))
+    assert np.isfinite(ctrl.q_cmd).all()
+
+
 def test_cartesian_track_outer_loop_tool_frame_converges():
     """Regression guard: CartesianTrackOuterLoop(control_frame="tool") MUST return a
     twist expressed in tool-axis coordinates, matching JointIkConfig(control_frame=
