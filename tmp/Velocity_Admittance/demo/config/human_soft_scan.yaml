@@ -1,4 +1,4 @@
-# Human soft-tissue scan — adaptive ζ + Dimeas; df spike gate; no v_r (A/B fixes).
+# Human soft-tissue scan — adaptive ζ + Dimeas + band-limited retract v_r.
 #
 # Run:
 #   python tmp/Velocity_Admittance/demo/d_to_a_sin_tool_y.py \
@@ -51,7 +51,7 @@ force:
   buffer_s: 2.0
   min_samples: 22
   use_inertia: false
-  desired_z_n: 2.5
+  desired_z_n: 3.0
   causal_fc_hz: 4.5
   causal_order: 2
   causal_history: 5
@@ -86,8 +86,13 @@ hybrid_motion:
   var_damping_d_u: 60.0
   var_damping_m_u: 0.0
   var_damping_dc_alpha: 0.02
-  proactive_feedforward: false       # v_r amplifies scan ripple; off until cap/notch fixed
-  alpha_proactive: 0.012
+  proactive_feedforward: true
+  proactive_retract_only: true       # v_r only when F_ext>F_des — faster back-off, no press chatter
+  alpha_proactive: 0.018             # retract gain (eff<0), soft-capped at v_r_max_m_s
+  alpha_proactive_press: 0.0         # no v_r when under-force (press side stays damped)
+  v_r_max_m_s: 0.04                  # reference soft limit (do NOT use max_vz=0.12)
+  v_r_err_full_n: 4.0                # full v_r when |F_err|≤4N (near 3N setpoint)
+  v_r_err_zero_n: 10.0                # v_r off when |F_err|≥10N (large spikes: admittance only)
   adaptive_ke:
     enabled: true
     zeta: 1.1

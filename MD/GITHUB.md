@@ -56,7 +56,7 @@ git push -u origin main
 cd /media/camp/EXT_DRIVE/rm75_control
 git status
 git add .
-git commit -m "开头跳变，引入质量块和deos解决fzext抖动"
+git commit -m "可能还行，没有验证恒定力"
 git push origin main
 ```
 

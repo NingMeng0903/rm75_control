@@ -134,7 +134,12 @@ class AdmittanceConfig:
     # Li 2022 Eq. (23) proactive velocity reference on tool-Z: v_r = α·F_err.
     # M·v̇ + D·(v − v_r) + Kdf·Ḟ = F_err — lowers apparent inertia / improves force feel.
     proactive_feedforward: bool = False
-    alpha_proactive: float = 0.012  # [m/s/N]
+    alpha_proactive: float = 0.012  # [m/s/N] on retract (eff<0) when retract_only
+    alpha_proactive_press: float = 0.0  # [m/s/N] when eff>0; 0 = press uses admittance only
+    proactive_retract_only: bool = True  # v_r only when F_ext > F_des (need to back off)
+    v_r_max_m_s: float = 0.04  # soft cap on reference (NOT max_vz — avoids bang-bang)
+    v_r_err_full_n: float = 4.0  # |F_err| below: full v_r scale
+    v_r_err_zero_n: float = 10.0  # |F_err| above: v_r = 0 (large errors: pure admittance)
     # Position-loop conditioning (PBAC). Small deadband kills FT/encoder-noise jitter
     # on the velocity-controlled (tracking) directions; the correction clamp keeps a
     # transient contact slip from surging the velocity command independent of vel_ff.
@@ -207,6 +212,11 @@ class AdmittanceConfig:
             var_damping_dc_alpha=float(c.get("var_damping_dc_alpha", 0.02)),
             proactive_feedforward=bool(c.get("proactive_feedforward", False)),
             alpha_proactive=float(c.get("alpha_proactive", 0.012)),
+            alpha_proactive_press=float(c.get("alpha_proactive_press", 0.0)),
+            proactive_retract_only=bool(c.get("proactive_retract_only", True)),
+            v_r_max_m_s=float(c.get("v_r_max_m_s", 0.04)),
+            v_r_err_full_n=float(c.get("v_r_err_full_n", 4.0)),
+            v_r_err_zero_n=float(c.get("v_r_err_zero_n", 10.0)),
             pos_err_deadband_m=float(c.get("pos_err_deadband_m", 0.0)),
             pos_correction_max_m_s=float(c.get("pos_correction_max_m_s", 0.0)),
             adaptive_ke=AdaptiveKeConfig.from_dict(raw, c),
@@ -507,6 +517,35 @@ class AdmittanceController:
             return d_sym
         return d_release if self.v_force_z > 0.0 else d_press
 
+    def _proactive_v_r(self, eff: float, *, in_contact: bool) -> float:
+        """
+        Band-limited proactive reference: retract-only by default, fades out at large
+        |F_err| so v_r does not bang against max_vz (which caused contact chatter).
+        """
+        cfg = self.cfg
+        if not cfg.proactive_feedforward or not in_contact:
+            return 0.0
+        if cfg.proactive_retract_only and eff >= 0.0:
+            alpha = cfg.alpha_proactive_press
+            if alpha <= 0.0:
+                return 0.0
+        else:
+            alpha = cfg.alpha_proactive
+        abs_eff = abs(eff)
+        if abs_eff >= cfg.v_r_err_zero_n:
+            return 0.0
+        if abs_eff <= cfg.v_r_err_full_n:
+            scale = 1.0
+        else:
+            span = cfg.v_r_err_zero_n - cfg.v_r_err_full_n
+            scale = (cfg.v_r_err_zero_n - abs_eff) / span if span > 1e-9 else 0.0
+            scale = float(np.clip(scale, 0.0, 1.0))
+        v_r = alpha * eff * scale
+        v_max = cfg.v_r_max_m_s
+        if v_max > 0.0:
+            v_r = v_r / (1.0 + abs(v_r) / v_max)
+        return float(v_r)
+
     def _admittance_z(
         self,
         f_err: float,
@@ -519,7 +558,7 @@ class AdmittanceController:
         Discrete 2nd-order velocity admittance on tool-Z (Peirastic + Keemink G4):
 
             M·v̇ + D·(v − v_r) + Kdf·Ḟ_ext = F_err
-            v_r = α·F_err   (optional Li 2022 proactive reference)
+            v_r from _proactive_v_r (band-limited, retract-biased)
 
         Ḟ_ext is the finite difference of compensated f_ext[2] (N/s); Kdf [s]
         adds damping against rapid force transients (scan ripple on soft tissue).
@@ -542,11 +581,11 @@ class AdmittanceController:
                 d = d_base
         self.damping_z_eff = float(d)
         kdf = float(cfg.admittance_force_derivative_gain_z)
-        v_r = cfg.alpha_proactive * eff if (cfg.proactive_feedforward and in_contact) else 0.0
+        cap = cfg.max_vz_tool_m_s if in_contact else cfg.approach_vz_tool_m_s
+        v_r = self._proactive_v_r(eff, in_contact=in_contact)
         self.v_r_z = float(v_r)
         v = self.v_force_z + (self.dt / m) * (eff - kdf * f_dot_z - d * (self.v_force_z - v_r))
 
-        cap = cfg.max_vz_tool_m_s if in_contact else cfg.approach_vz_tool_m_s
         if cap > 0.0:
             v = float(np.clip(v, -cap, cap))
         self.v_force_z = v
