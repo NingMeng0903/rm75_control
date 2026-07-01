@@ -3,3 +3,8 @@
 numpy
 pyyaml
 ruckig==0.17.3
+scipy
+pin>=3.0
+# Phase 2 QP inner-loop solver: proxsuite (preferred, warm-started) with osqp fallback.
+proxsuite
+osqp

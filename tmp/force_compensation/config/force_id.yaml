@@ -1,8 +1,12 @@
 # Force compensation pipeline — config/force_id.yaml, config/poses.yaml
 # Library: rm75_control.force.compensation
 # Entry: tmp/force_compensation/force_calibrate.py, force_monitor.py
+#
+# Prerequisite for force_calibrate: active tool = pose_tool_frame (Arm_Tip) in Web UI.
+# Scan demo may use gripper: slot TCP is FK(q_deg) in the active tool automatically.
 
 poses_yaml: poses.yaml
+required_tool_frame: Arm_Tip
 
 sequence: [a, b, c, d]
 return_home: a
@@ -16,8 +20,13 @@ collect:
   warmup_s: 3.0
   follow: false
   cartesian_ramp_down_s: 2.5
-  movev_settle_frames: 30
-  movev_quiescent_mm: 0.3
+  movev_settle_frames: 50
+  movev_quiescent_mm: 0.25
+  movev_quiescent_consecutive: 10
+  quiescent_warmup_frames: 25
+  quiescent_reject_step_mm: 2.0
+  pre_movev_settle_s: 1.5
+  post_handoff_zero_s: 1.0
 
   cartesian:
     duration_s: 30.0
@@ -65,6 +74,7 @@ collect:
       amp_deg_s: 18.0
       freqs_hz: [0.22]
       ramp_down_s: 4.0
+      follow: false
 
 fit:
   force_sensor: configs/force_sensor.yaml

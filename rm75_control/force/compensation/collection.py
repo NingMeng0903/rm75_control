@@ -20,16 +20,26 @@ from .paths import CONFIG_ID, CONFIG_ROBOT, npz_for_slot
 from .progress import stage_progress
 
 
-def load_slot(cfg: ForceIdConfig, slot: str) -> tuple[np.ndarray, np.ndarray, dict]:
+from .tool_pose import get_active_tool_name, poses_calib_tool_frame, slot_tcp_pose
+
+
+def load_slot(
+    cfg: ForceIdConfig,
+    slot: str,
+    robot=None,
+    *,
+    calib_tool: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
     data = ex.load_poses_yaml(cfg.poses_yaml)
     rec = ex.get_slot_record(data, slot)
     if rec is None:
         raise SystemExit(f"Pose slot '{slot}' missing in {cfg.poses_yaml}")
-    return (
-        np.asarray(rec["q_deg"], dtype=float),
-        np.asarray(rec["pose_base"], dtype=float),
-        rec,
-    )
+    q = np.asarray(rec["q_deg"], dtype=float)
+    pose = np.asarray(rec["pose_base"], dtype=float)
+    tool = calib_tool if calib_tool is not None else poses_calib_tool_frame(data)
+    if robot is not None:
+        pose = slot_tcp_pose(robot, q, pose, calib_tool=tool)
+    return q, pose, rec
 
 
 def move_j(robot, q_deg: np.ndarray, *, speed: int) -> None:
@@ -42,6 +52,23 @@ def move_j_p(robot, pose: np.ndarray, *, speed: int) -> None:
     ret = robot.rm_movej_p(pose.tolist(), speed, 0, 0, 1)
     if ret != 0:
         raise RuntimeError(f"rm_movej_p failed: {ret}")
+
+
+def require_tool_frame(robot, *, required: str) -> None:
+    """Abort calibration unless the active TCP tool frame matches (default Arm_Tip)."""
+    ret, cur = robot.rm_get_current_tool_frame()
+    if ret != 0:
+        raise SystemExit(
+            f"ERROR: rm_get_current_tool_frame failed (code {ret}). "
+            "Cannot verify tool frame before calibration."
+        )
+    active = str(cur.get("name", ""))
+    if active != required:
+        raise SystemExit(
+            f"\nERROR: Active tool frame is {active!r}, but force calibration requires {required!r}.\n"
+            "Switch the tool coordinate to Arm_Tip in the RealMan Web UI / teach pendant, then re-run.\n"
+        )
+    print(f"  Tool frame OK: {active!r}", flush=True)
 
 
 def wait_settle(robot, target_q: np.ndarray, *, timeout_s: float) -> tuple[np.ndarray, np.ndarray]:
@@ -225,26 +252,36 @@ def run_pose_d(bot, cfg: ForceIdConfig) -> Path:
             else:
                 if not movev_ready:
                     print("  joint→movev handoff…", flush=True)
-                    burst_pose0 = pose0.copy()
-                    if pd.joint_duration_s > 0:
-                        ret_s, st = bot.robot.rm_get_current_arm_state()
-                        if ret_s == 0:
-                            burst_pose0 = np.asarray(st["pose"][:6], dtype=float)
-                    next_tick = ex.begin_pose_d_vel_burst(
+                    print("  joint hold + settle…", flush=True)
+                    _, pose_handoff = ex.stabilize_joint_canfd_hold(
+                        bot.robot,
+                        dt_ms=c.dt_ms,
+                        n_frames=80,
+                        dwell_s=c.pre_movev_settle_s,
+                    )
+                    burst_pose0 = pose_handoff
+                    next_tick, handoff_diag = ex.begin_pose_d_vel_burst(
                         bot, vb=vb, dt_ms=c.dt_ms,
-                        q_resync=q0,
+                        skip_resync=True,
                         settle_frames=c.movev_settle_frames,
                         quiescent_mm=c.movev_quiescent_mm,
+                        quiescent_consecutive=c.movev_quiescent_consecutive,
+                        quiescent_warmup_frames=c.quiescent_warmup_frames,
+                        quiescent_reject_step_mm=c.quiescent_reject_step_mm,
+                        pre_movev_settle_s=0.5,
+                        post_handoff_zero_s=c.post_handoff_zero_s,
                         move_speed=c.move_speed,
                         settle_timeout_s=c.settle_timeout_s,
                         next_tick=next_tick,
                     )
-                    ret_s, st = bot.robot.rm_get_current_arm_state()
-                    if ret_s == 0:
-                        burst_pose0 = np.asarray(st["pose"][:6], dtype=float)
+                    pose_quiet = handoff_diag.get("quiescent_pose")
+                    if pose_quiet is not None:
+                        burst_pose0 = np.asarray(pose_quiet, dtype=float)
                     movev_ready = True
                 t_burst = t_cmd - pd.joint_duration_s
                 vel_cmd, _ = ex.vel_burst_cmd(t_burst, vb, scale=c.scale)
+                if vb.ramp_s > 0.0 and t_burst < vb.ramp_s:
+                    vel_cmd *= t_burst / vb.ramp_s
                 last_vel = vel_cmd
                 send_velocity_canfd(
                     bot.robot, vel_cmd.tolist(),
@@ -281,7 +318,7 @@ def run_pose_d(bot, cfg: ForceIdConfig) -> Path:
                 pass
         exit_canfd_session(
             bot.robot,
-            q_resync=q0,
+            q_resync=None,
             move_speed=c.move_speed,
             settle_timeout_s=c.settle_timeout_s,
             print_diag=True,
@@ -330,6 +367,7 @@ def save_current_pose(cfg: ForceIdConfig, slot: str, label: str | None) -> None:
     from rm75_control import RobotSession
 
     with RobotSession(config=CONFIG_ROBOT) as bot:
+        require_tool_frame(bot.robot, required=cfg.required_tool_frame)
         ret, st = bot.robot.rm_get_current_arm_state()
         if ret != 0:
             raise SystemExit(f"get state failed: {ret}")
@@ -373,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
     from rm75_control import RobotSession
 
     with RobotSession(config=CONFIG_ROBOT) as bot:
+        require_tool_frame(bot.robot, required=cfg.required_tool_frame)
         saved = []
         for slot in seq:
             q_tgt, pose_tgt, rec = slots[slot]

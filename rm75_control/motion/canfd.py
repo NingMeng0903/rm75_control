@@ -93,6 +93,42 @@ def send_velocity_canfd(
         raise MotionError(f"rm_movev_canfd failed with code {ret}")
 
 
+class JointCanfdClient(Protocol):
+    def rm_movej_canfd(
+        self,
+        joint: list[float],
+        follow: bool,
+        expand: float = 0,
+        trajectory_mode: int = 0,
+        radio: int = 0,
+    ) -> int:
+        ...
+
+
+def send_joint_canfd(
+    robot: JointCanfdClient,
+    joint_deg: Sequence[float],
+    *,
+    follow: bool = True,
+    expand: float = 0.0,
+    trajectory_mode: int = 0,
+    radio: int = 0,
+) -> None:
+    """Stream absolute joint angles (degrees) via rm_movej_canfd passthrough.
+
+    This is the single output interface for the joint-space inner loop - it never
+    switches the controller between MoveJ/MoveV modes.  Joint values must already
+    be smoothed / rate-limited (see joint_admittance.utils.safety); the driver
+    faults on discontinuities.
+    """
+    del trajectory_mode, radio
+    if len(joint_deg) != 7:
+        raise ValueError(f"joint_deg must have 7 elements, got {len(joint_deg)}")
+    ret = robot.rm_movej_canfd(list(joint_deg), follow, expand, TRAJ0_MODE, TRAJ0_RADIO)
+    if ret != 0:
+        raise MotionError(f"rm_movej_canfd failed with code {ret}")
+
+
 def _wait_planning_idle(robot, timeout_s: float = 10.0) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:

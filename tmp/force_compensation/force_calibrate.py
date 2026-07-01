@@ -2,6 +2,8 @@
 """
 One-shot force compensation calibration: collect A→B→C→D→A, then identify φ.
 
+Prerequisite: set active tool frame to Arm_Tip in the teach pendant / Web UI.
+
   source env.sh
   python tmp/force_compensation/force_calibrate.py
   python tmp/force_compensation/force_calibrate.py --dry-run

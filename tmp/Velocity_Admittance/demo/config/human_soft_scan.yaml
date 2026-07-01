@@ -1,6 +1,6 @@
-# Human soft-tissue scan — adaptive ζ + Dimeas + band-limited retract v_r.
+# Human soft-tissue scan — 200 Hz trial + 8e1efa1 d→a trajectory (yaml slot smoothstep).
 #
-# Run:
+# Run (after force_calibrate.py):
 #   python tmp/Velocity_Admittance/demo/d_to_a_sin_tool_y.py \
 #     --config tmp/Velocity_Admittance/demo/config/human_soft_scan.yaml --log
 
@@ -8,11 +8,11 @@ reference:
   shaper: pass_through
 
 timing:
-  dt_ms: 10.0
-  async_poll_ms: 10.0
+  dt_ms: 10.0                  # 100 Hz — avoids rm_set_movev_canfd_init overspeed at 5ms
+  async_poll_ms: 10.0          # match control loop
 
 startup:
-  pose_slot: d
+  pose_slot: d                  # poses.yaml pose_tool_frame=Arm_Tip; gripper OK → FK(q_deg)
   settle_frames: 50
   hold_s: 1.0
   pre_movev_settle_s: 2.0
@@ -23,6 +23,7 @@ startup:
   movev_quiescent_consecutive: 10
   post_handoff_zero_s: 1.0
   auto_realign_on_snap: true
+  realign_target: pre_init       # never auto-chase yaml pose_base (q_deg FK ≠ pose_base)
   realign_min_snap_mm: 3.0
   wait_contact: true
   auto_start_under_n: 0.5
@@ -61,6 +62,7 @@ trajectory_demo:
   from_slot: d
   to_slot: a
   transfer_s: 15.0              # 前 15s 为 d→a 平滑转移；16cm 正弦在 transfer 结束后才开始
+                                # 若要接触后立即 sin，设 transfer_s: 0
   scan_mode: sin_tool_y
   y_peak_to_peak_cm: 16.0       # tool-Y 峰峰值 16cm（±8cm）
   y_max_vel_cm_s: 1.5

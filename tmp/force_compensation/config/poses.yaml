@@ -1,4 +1,8 @@
 poses:
+  # TCP frame used when pose_base was saved (force_calibrate / teach). Runtime may use
+  # another active tool (e.g. gripper); slot TCP is then FK(q_deg) in the active frame.
+  pose_tool_frame: Arm_Tip
+
   a:
     label: pose_a
     note: rx snapped to -180° for horizontal TCP Fx excitation (2026-06-30)

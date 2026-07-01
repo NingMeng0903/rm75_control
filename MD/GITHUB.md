@@ -60,16 +60,6 @@ git commit -m "可能还行，没有验证恒定力"
 git push origin main
 ```
 
-Upload everything that changed (review `git status` first):
-
-```bash
-cd /media/camp/EXT_DRIVE/rm75_control
-git add -u
-git add MD/
-git status
-git commit -m "Describe your change here."
-git push origin main
-```
 
 If the remote is ahead:
 

@@ -142,6 +142,37 @@ def settle_movev_stream(
     )
 
 
+def stabilize_joint_canfd_hold(
+    robot,
+    *,
+    dt_ms: float,
+    n_frames: int = 80,
+    dwell_s: float = 1.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Freeze current joint angles through joint-CANFD, then dwell before movev init.
+
+    After long joint excitation the arm is still moving when CANFD exits → movev init
+    captures a bad FK reference → multi-mm/tick quiescence snap / IK faults.
+    """
+    ret, st = robot.rm_get_current_arm_state()
+    if ret != 0:
+        raise RuntimeError(f"get state at joint hold failed: {ret}")
+    q = np.asarray(st["joint"][:7], dtype=float)
+    pose = np.asarray(st["pose"][:6], dtype=float)
+    dt_s = dt_ms / 1000.0
+    for _ in range(n_frames):
+        robot.rm_movej_canfd(q.tolist(), False, 0, 0, 0)
+        time.sleep(dt_s)
+    if dwell_s > 0.0:
+        time.sleep(dwell_s)
+    ret, st = robot.rm_get_current_arm_state()
+    if ret == 0:
+        q = np.asarray(st["joint"][:7], dtype=float)
+        pose = np.asarray(st["pose"][:6], dtype=float)
+    return q, pose
+
+
 def begin_pose_d_vel_burst(
     bot,
     *,
@@ -149,12 +180,25 @@ def begin_pose_d_vel_burst(
     dt_ms: float,
     next_tick: float | None = None,
     q_resync: np.ndarray | None = None,
-    settle_frames: int = 30,
-    quiescent_mm: float = 0.3,
+    skip_resync: bool = True,
+    settle_frames: int = 50,
+    quiescent_mm: float = 0.25,
+    quiescent_consecutive: int = 10,
+    quiescent_warmup_frames: int = 25,
+    quiescent_reject_step_mm: float = 2.0,
+    pre_movev_settle_s: float = 0.5,
+    post_handoff_zero_s: float = 1.0,
     move_speed: int = 15,
     settle_timeout_s: float = 15.0,
-) -> float:
-    """Full movev handoff via enter_movev_session."""
+) -> tuple[float, dict]:
+    """
+    Joint-CANFD → movev handoff.
+
+    Call stabilize_joint_canfd_hold() before this. skip_resync=True avoids move_j
+    back to stale q0 after joint drift.
+    """
+    from rm75_control.motion.canfd import settle_movev_after_init
+
     next_tick, diag = enter_movev_session(
         bot.robot,
         frame_type=vb.frame_type,
@@ -162,14 +206,54 @@ def begin_pose_d_vel_burst(
         dt_ms=dt_ms,
         follow=vb.follow,
         q_resync=q_resync,
+        skip_resync=skip_resync,
         settle_frames=settle_frames,
         quiescent_mm=quiescent_mm,
+        quiescent_consecutive=quiescent_consecutive,
+        quiescent_warmup_frames=quiescent_warmup_frames,
+        quiescent_reject_step_mm=quiescent_reject_step_mm,
         move_speed=move_speed,
         settle_timeout_s=settle_timeout_s,
+        pre_init_settle_s=pre_movev_settle_s,
         next_tick=next_tick,
         print_diag=True,
     )
-    return next_tick
+    max_step = float(diag.get("quiescent_max_step_mm", 0.0))
+    if max_step > quiescent_reject_step_mm:
+        print(
+            f"  WARN: handoff quiescence max step {max_step:.2f}mm "
+            f"> reject {quiescent_reject_step_mm:.2f}mm — extended zero-vel bridge",
+            flush=True,
+        )
+        dt_s = dt_ms / 1000.0
+        extra_frames = max(100, int(round(2.0 / dt_s)))
+        next_tick = settle_movev_after_init(
+            bot.robot,
+            dt_ms=dt_ms,
+            follow=False,
+            n_frames=extra_frames,
+            next_tick=next_tick,
+        )
+        print(
+            f"  extra quiescence bridge: {extra_frames} frames ({extra_frames * dt_s:.1f}s)",
+            flush=True,
+        )
+    if post_handoff_zero_s > 0.0:
+        dt_s = dt_ms / 1000.0
+        bridge_frames = max(1, int(round(post_handoff_zero_s / dt_s)))
+        next_tick = settle_movev_after_init(
+            bot.robot,
+            dt_ms=dt_ms,
+            follow=False,
+            n_frames=bridge_frames,
+            next_tick=next_tick,
+        )
+        print(
+            f"  post-handoff bridge: {bridge_frames} zero-vel frames "
+            f"({post_handoff_zero_s:.1f}s, low follow)",
+            flush=True,
+        )
+    return next_tick, diag
 
 
 def ramp_down_cartesian(

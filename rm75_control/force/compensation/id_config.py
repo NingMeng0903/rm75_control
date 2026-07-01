@@ -139,6 +139,11 @@ class CollectConfig:
     cartesian_ramp_down_s: float
     movev_settle_frames: int
     movev_quiescent_mm: float
+    movev_quiescent_consecutive: int
+    quiescent_warmup_frames: int
+    quiescent_reject_step_mm: float
+    pre_movev_settle_s: float
+    post_handoff_zero_s: float
     cartesian: CartesianConfig
     pose_d: PoseDConfig
     sequence: tuple[str, ...]
@@ -173,6 +178,7 @@ class MonitorConfig:
 class ForceIdConfig:
     poses_yaml: Path
     log_dir: Path
+    required_tool_frame: str
     collect: CollectConfig
     fit: FitConfig
     monitor: MonitorConfig
@@ -210,6 +216,7 @@ def load_config(path: Path | None = None) -> ForceIdConfig:
     return ForceIdConfig(
         poses_yaml=_resolve_path(raw.get("poses_yaml", "poses.yaml"), config_dir=config_dir),
         log_dir=LOG_DIR,
+        required_tool_frame=str(raw.get("required_tool_frame", "Arm_Tip")),
         collect=CollectConfig(
             move_speed=int(c.get("move_speed", 15)),
             settle_timeout_s=float(c.get("settle_timeout_s", 15.0)),
@@ -219,8 +226,13 @@ def load_config(path: Path | None = None) -> ForceIdConfig:
             warmup_s=float(c.get("warmup_s", 3.0)),
             follow=bool(c.get("follow", False)),
             cartesian_ramp_down_s=float(c.get("cartesian_ramp_down_s", cart.get("ramp_down_s", 2.5))),
-            movev_settle_frames=int(c.get("movev_settle_frames", 30)),
-            movev_quiescent_mm=float(c.get("movev_quiescent_mm", 0.3)),
+            movev_settle_frames=int(c.get("movev_settle_frames", 50)),
+            movev_quiescent_mm=float(c.get("movev_quiescent_mm", 0.25)),
+            movev_quiescent_consecutive=int(c.get("movev_quiescent_consecutive", 10)),
+            quiescent_warmup_frames=int(c.get("quiescent_warmup_frames", 25)),
+            quiescent_reject_step_mm=float(c.get("quiescent_reject_step_mm", 2.0)),
+            pre_movev_settle_s=float(c.get("pre_movev_settle_s", 1.5)),
+            post_handoff_zero_s=float(c.get("post_handoff_zero_s", 1.0)),
             sequence=sequence,
             return_home=str(raw.get("return_home", "a")),
             cartesian=CartesianConfig(

@@ -1,905 +1,612 @@
-# velocity_admittance 源码镜像
+# Joint-Position QP-CLIK Controller — Full Source Dump
 
-由 `python scripts/gen_debug_va.py` 生成，与仓库文件一字不差。
+Auto-generated snapshot of the new cascaded joint-position controller.
+Architecture: task-space admittance outer loop → joint-space CLIK/QP inner loop → `rm_movej_canfd`.
 
-## `tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py`
+---
 
-```python
-#!/usr/bin/env python3
-"""
-Demo: 6D trajectory plugin + tool-frame force/motion hybrid.
+## FILE: `rm75_control/control/joint_admittance/__init__.py`
 
-  source env.sh
-  cd /media/camp/EXT_DRIVE/rm75_control
-  python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
-  python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_base_y --y-pp-cm 16
-  python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_base_y_tool_rz --rz-deg 12
-"""
+```py
+"""Joint-space inner loop (Pinocchio CLIK / QP IK) for RM75-F.
 
-from __future__ import annotations
+Cascaded controller: the task-space admittance outer loop
+(rm75_control.control.hybrid_motion.controller.AdmittanceController) produces a
+6D Cartesian twist, and this package converts it to absolute joint angles that
+are streamed through a single interface (rm_movej_canfd) - no MoveJ/MoveV mode
+switching.
 
-import argparse
-from pathlib import Path
+Imports are kept lazy: `import rm75_control.control.joint_admittance` does NOT
+pull in Pinocchio.  Import the submodules explicitly when you need them, e.g.::
 
-from rm75_control.control.velocity_admittance.loop import load_yaml, run_velocity_admittance
-from rm75_control.control.velocity_admittance.paths import CONFIG_SIN_TOOL_Y_Z2N
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="6D trajectory + tool-Z force hybrid (trajectory is pluggable)",
-    )
-    parser.add_argument("--config", type=Path, default=CONFIG_SIN_TOOL_Y_Z2N)
-    parser.add_argument(
-        "--trajectory", type=str, default=None,
-        help="trajectory.type: hold | sin_base_y | sin_base_y_tool_rz | sin_tool_y",
-    )
-    parser.add_argument("--desired-z", type=float, default=None, help="tool-Z force target (N)")
-    parser.add_argument("--y-pp-cm", type=float, default=None, help="world-Y peak-to-peak (cm)")
-    parser.add_argument("--rz-deg", type=float, default=None, help="tool +Z spin amplitude (deg)")
-    parser.add_argument("--duration", type=float, default=None, help="scan duration (s)")
-    parser.add_argument("--log", action="store_true", help="record pose_d vs pose_act npz every cycle")
-    parser.add_argument("--log-path", type=Path, default=None, help="npz output (default: tmp/Velocity_Admittance/logs/)")
-    args = parser.parse_args()
-
-    raw = load_yaml(args.config)
-    traj = raw.setdefault("trajectory", {})
-    if args.trajectory:
-        traj["type"] = args.trajectory
-    if args.y_pp_cm is not None:
-        traj["y_peak_to_peak_cm"] = args.y_pp_cm
-    if args.rz_deg is not None:
-        traj["rz_amplitude_deg"] = args.rz_deg
-    if args.desired_z is not None:
-        raw.setdefault("force", {})["desired_z_n"] = args.desired_z
-
-    return run_velocity_admittance(
-        raw,
-        title="Demo 6D traj + tool-Z force",
-        duration_s=args.duration,
-        log_enabled=args.log or args.log_path is not None,
-        log_path=args.log_path,
-    )
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
-
-## `tmp/Velocity_Admittance/run_admittance.py`
-
-```python
-#!/usr/bin/env python3
-"""
-Velocity-resolved admittance (generic entry).
-
-  source env.sh
-  python tmp/Velocity_Admittance/run_admittance.py
-  python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
+    from rm75_control.control.joint_admittance.model import RobotKinematics
+    from rm75_control.control.joint_admittance.clik import ClikController
 """
 
 from __future__ import annotations
-
-import argparse
-from pathlib import Path
-
-from rm75_control.control.velocity_admittance.loop import load_yaml, run_velocity_admittance
-from rm75_control.control.velocity_admittance.paths import CONFIG_ADMITTANCE
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="RM75 velocity admittance control")
-    parser.add_argument("--config", type=Path, default=CONFIG_ADMITTANCE)
-    parser.add_argument("--trajectory", type=str, default=None)
-    parser.add_argument("--desired-z", type=float, default=None, help="sensor Fz target (N)")
-    parser.add_argument("--duration", type=float, default=None, help="run time (s)")
-    parser.add_argument("--log", action="store_true", help="record scan npz (pose_d vs pose_act)")
-    parser.add_argument("--log-path", type=Path, default=None)
-    args = parser.parse_args()
-
-    raw = load_yaml(args.config)
-    if args.trajectory:
-        raw.setdefault("trajectory", {})["type"] = args.trajectory
-    if args.desired_z is not None:
-        raw.setdefault("force", {})["desired_z_n"] = args.desired_z
-
-    return run_velocity_admittance(
-        raw,
-        duration_s=args.duration,
-        log_enabled=args.log or args.log_path is not None,
-        log_path=args.log_path,
-    )
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
-
-## `tmp/Velocity_Admittance/plot_scan_log.py`
-
-```python
-#!/usr/bin/env python3
-"""Plot admittance scan log — diagnose controller vs execution vs contact."""
-
-from __future__ import annotations
-
-import argparse
-from pathlib import Path
-
-import matplotlib.pyplot as plt
-import numpy as np
-from scipy.spatial.transform import Rotation as Rsc
-
-from rm75_control.control.velocity_admittance.scan_log import (
-    load_scan_log,
-    scan_tracking_world_mm,
-)
-
-
-def _euler_delta_deg(pose: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    d = pose - ref
-    d[:, 3:6] = (d[:, 3:6] + np.pi) % (2 * np.pi) - np.pi
-    return np.degrees(d[:, 3:6])
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Plot admittance scan log npz")
-    parser.add_argument("npz", type=Path)
-    parser.add_argument("--save", type=Path, default=None, help="PNG output (use if no display)")
-    parser.add_argument("--tmax", type=float, default=None, help="limit time axis (s)")
-    args = parser.parse_args()
-
-    d = load_scan_log(args.npz)
-    t = d["t_s"]
-    if args.tmax is not None:
-        m = t <= args.tmax
-        d = {k: v[m] if hasattr(v, "__len__") and len(v) == len(t) else v for k, v in d.items()}
-        t = d["t_s"]
-
-    v = d["v_cmd"]
-    vf = d["vel_ff"]
-    pose = d["pose_act"]
-    pose_d = d["pose_d"]
-    f = d["f_ext"]
-    phase = d["phase"]
-    scan = phase >= 2
-    si = int(np.where(scan)[0][0]) if np.any(scan) else 0
-    t_scan_on = float(t[si]) if np.any(scan) else 0.0
-    dt_ms = np.concatenate([[np.nan], np.diff(t) * 1000.0])
-
-    deuler = _euler_delta_deg(pose, pose[si])
-    tr = scan_tracking_world_mm(pose_d, pose, scan_mask=scan if np.any(scan) else np.ones(len(t), dtype=bool))
-    d_cmd = tr["d_cmd_mm"].copy()
-    d_act = tr["d_act_mm"].copy()
-    s_cmd = tr["s_cmd_mm"].copy()
-    s_act = tr["s_act_mm"].copy()
-    track_err = tr["scan_track_err_mm"].copy()
-    # Pre-scan: pose_d / ref frame differ (hold logs zeros, approach logs post-init pose0).
-    # Mask so position panels only show scan tracking (cmd=act at scan ON).
-    pre = ~scan
-    d_cmd[pre] = np.nan
-    d_act[pre] = np.nan
-    s_cmd[pre] = np.nan
-    s_act[pre] = np.nan
-    track_err[pre] = np.nan
-
-    vy_ff_tool = np.zeros(len(t))
-    for i in range(len(t)):
-        r = Rsc.from_euler("xyz", pose[i, 3:6], degrees=False).as_matrix()
-        vy_ff_tool[i] = (r.T @ vf[i, :3])[1]
-
-    fig, axes = plt.subplots(7, 1, figsize=(13, 14), sharex=True)
-    fig.suptitle(
-        f"{args.npz.name}  scan position vs scan0 (pre-scan masked); vel: full run"
-    )
-
-    ax = axes[0]
-    ax.plot(t, v[:, 1], "C0", lw=0.8, label="v_cmd tool-Y")
-    ax.plot(t, vy_ff_tool, "C1", lw=0.8, alpha=0.7, label="R.T@vel_ff tool-Y")
-    ax.axvline(t[si], color="gray", ls="--", lw=0.8, label="scan ON")
-    ax.set_ylabel("tool Y vel (m/s)")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1]
-    ax.plot(t, v[:, 2], "C2", lw=0.8, label="v_cmd tool-Z")
-    ax.set_ylabel("tool Z vel")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[2]
-    ax.plot(t, f[:, 2], "C3", lw=0.8, label="Fz ext")
-    ax.axhline(3.0, color="r", ls="--", lw=0.8, label="Fz des 3N")
-    ax.axhline(1.0, color="orange", ls=":", lw=0.8, label="contact loss ~1N")
-    ax.set_ylabel("Fz (N)")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[3]
-    ax.plot(t, deuler[:, 1], label="Δpitch deg")
-    ax.plot(t, deuler[:, 2], label="Δyaw deg", alpha=0.8)
-    ax.set_ylabel("Δeuler vs scan0")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[4]
-    ax.plot(t, s_cmd, "C1", lw=0.9, ls="--", label="cmd tool-Y→world")
-    ax.plot(t, s_act, "C0", lw=0.9, label="act tool-Y→world")
-    ax.plot(t, track_err, "C3", lw=0.6, alpha=0.7, label="track err")
-    ax.axvline(t_scan_on, color="gray", ls="--", lw=0.8)
-    if np.any(scan):
-        ax.scatter([t_scan_on], [0.0], c="k", s=12, zorder=5, label="scan ON cmd≈act")
-    ax.set_ylabel("scan axis mm")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[5]
-    ax.plot(t, d_cmd[:, 1], "C3", lw=0.8, ls="--", label="cmd ΔY world")
-    ax.plot(t, d_act[:, 1], "C2", lw=0.8, label="act ΔY world")
-    ax.set_ylabel("world ΔY mm")
-    ax.legend(loc="upper right", fontsize=7)
-    ax.grid(True, alpha=0.3)
-    ax2 = ax.twinx()
-    ax2.plot(t, d_cmd[:, 0], "C1", lw=0.8, ls=":", alpha=0.9, label="cmd ΔX")
-    ax2.plot(t, d_act[:, 0], "C0", lw=0.6, alpha=0.8, label="act ΔX")
-    ax2.set_ylabel("world ΔX mm (right)")
-    cx = float(np.max(np.abs(d_cmd[scan, 0]))) if np.any(scan) else 0.0
-    ax.text(
-        0.02, 0.04,
-        f"sin_tool_y: 1 DOF tool-Y only; cmd ΔX≈±{cx:.1f}mm from tilt\n"
-        "act ΔX blow-up = contact slip + pitch drift (not missing X cmd)",
-        transform=ax.transAxes,
-        fontsize=7,
-        va="bottom",
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.35),
-    )
-
-    ax = axes[6]
-    ax.plot(t, dt_ms, "k", lw=0.6, alpha=0.7)
-    ax.axhline(10, color="g", ls="--", lw=0.8)
-    ax.axhline(15, color="r", ls=":", lw=0.8)
-    ax.set_ylabel("loop dt ms")
-    ax.set_xlabel("t (s)")
-    ax.grid(True, alpha=0.3)
-
-    for ax in axes:
-        ax.fill_between(t, ax.get_ylim()[0], ax.get_ylim()[1], where=scan, alpha=0.04, color="blue")
-
-    fig.tight_layout()
-    if args.save:
-        args.save.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(args.save, dpi=130)
-        print(f"saved → {args.save}")
-    else:
-        plt.show()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
-
-## `rm75_control/control/velocity_admittance/__init__.py`
-
-```python
-"""Velocity-resolved admittance control loop and trajectory."""
-
-from rm75_control.control.velocity_admittance.controller import (
-    AdmittanceConfig,
-    AdmittanceController,
-)
-from rm75_control.control.velocity_admittance.loop import load_yaml, run_velocity_admittance
-from rm75_control.control.velocity_admittance.observer import CompensatedForceObserver
-from rm75_control.control.velocity_admittance.scan_log import (
-    ScanLogRecorder,
-    load_scan_log,
-    print_jerk_summary,
-    scan_tracking_world_mm,
-)
-from rm75_control.control.velocity_admittance.trajectory import (
-    Trajectory6D,
-    TrajectoryGenerator,
-    TrajectorySample,
-)
-from rm75_control.control.velocity_admittance.paths import (
-    CONFIG_ADMITTANCE,
-    CONFIG_SIN_TOOL_Y_Z2N,
-)
 
 __all__ = [
-    "AdmittanceConfig",
-    "AdmittanceController",
-    "CompensatedForceObserver",
-    "ScanLogRecorder",
-    "load_scan_log",
-    "print_jerk_summary",
-    "scan_tracking_world_mm",
-    "Trajectory6D",
-    "TrajectoryGenerator",
-    "TrajectorySample",
-    "CONFIG_ADMITTANCE",
-    "CONFIG_SIN_TOOL_Y_Z2N",
-    "load_yaml",
-    "run_velocity_admittance",
+    "RobotKinematics",
+    "ClikController",
+    "ClikConfig",
+    "JointIkController",
 ]
+
+
+def __getattr__(name: str):  # PEP 562 lazy re-export (avoids importing pinocchio eagerly)
+    if name in ("RobotKinematics",):
+        from rm75_control.control.joint_admittance.model import RobotKinematics
+
+        return RobotKinematics
+    if name in ("ClikController", "ClikConfig"):
+        from rm75_control.control.joint_admittance import clik
+
+        return getattr(clik, name)
+    if name in ("JointIkController",):
+        from rm75_control.control.joint_admittance.loop import JointIkController
+
+        return JointIkController
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 ```
 
-## `rm75_control/control/velocity_admittance/paths.py`
+## FILE: `rm75_control/control/joint_admittance/clik.py`
 
-```python
-"""Paths for velocity admittance configs (under tmp/Velocity_Admittance)."""
+```py
+"""Closed-Loop Inverse Kinematics (CLIK) with DLS + nullspace projection.
+
+Phase 1 inner-loop core.  Converts a base-frame 6D Cartesian twist reference
+(from the admittance outer loop) into a joint-velocity command, integrates a
+Cartesian reference pose for drift-free feedback, and projects a secondary task
+(joint centering / limit avoidance) into the nullspace.
+
+References:
+* Sciavicco & Siciliano 1988; Siciliano 1990 -> CLIK error feedback.
+* Wampler 1986 / Nakamura & Hanafusa 1986 -> damped least squares.
+* Liegeois 1977; Chiaverini 1997 -> nullspace / gradient projection.
+
+Design contract with the loop:
+* The loop owns the *actually commanded* joint state `q_prev` (post safety /
+  smoothing) and passes it in every tick.  CLIK never assumes its raw integration
+  survived - it always re-linearizes about `q_prev`, so the loop is truly closed.
+* CLIK owns the integrated Cartesian reference `x_ref` (advanced by the twist).
+  Feedback `K * (x_ref - fk(q_prev))` removes DLS / discretization drift.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from rm75_control.force.compensation.paths import CONFIG_FORCE, CONFIG_ROBOT, PHI_JSON, REPO
-
-VA_DATA_DIR = REPO / "tmp" / "Velocity_Admittance"
-CONFIG_DIR = VA_DATA_DIR / "config"
-DEMO_CONFIG_DIR = VA_DATA_DIR / "demo" / "config"
-CONFIG_ADMITTANCE = CONFIG_DIR / "admittance.yaml"
-CONFIG_SIN_TOOL_Y_Z2N = DEMO_CONFIG_DIR / "sin_tool_y_z2n.yaml"
-```
-
-## `rm75_control/control/velocity_admittance/async_state.py`
-
-```python
-"""Background pose/force polling — keeps the control loop non-blocking."""
-
-from __future__ import annotations
-
-import threading
-import time
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.spatial.transform import Rotation as Rsc
+
+from rm75_control.control.joint_admittance.model import RobotKinematics, pose_error
 
 
 @dataclass
-class AsyncStateSnapshot:
-    pose: np.ndarray | None = None
-    q_deg: np.ndarray | None = None
-    force_raw: np.ndarray = field(default_factory=lambda: np.zeros(6))
-    t_s: float = 0.0
-    ok: bool = False
+class ClikConfig:
+    # Cartesian error feedback gain (per axis: x,y,z,rx,ry,rz), 1/s.
+    k_task: np.ndarray = field(
+        default_factory=lambda: np.array([2.0, 2.0, 2.0, 2.0, 2.0, 2.0], dtype=float)
+    )
+    # DLS sigma-scheduled damping (Wampler/Nakamura).
+    sigma_thresh: float = 0.04      # start damping when smallest singular value drops below this
+    lambda_max: float = 0.08        # max damping factor at the singularity
+    # Nullspace secondary task gain scaling (applied to the provided qdot0).
+    nullspace_gain: float = 1.0
+    # Anti-windup: cap the fed-back Cartesian error so a saturated axis can't
+    # blow up qdot (position m, orientation rad).
+    max_pos_err_m: float = 0.05
+    max_rot_err_rad: float = 0.20
+    euler_order: str = "xyz"
 
 
-class AsyncStateObserver:
+@dataclass
+class ClikResult:
+    q_next: np.ndarray        # proposed next joint position (rad), pre-safety
+    qdot: np.ndarray          # joint velocity command (rad/s)
+    x_ref: np.ndarray         # integrated Cartesian reference (pose6)
+    x_cur: np.ndarray         # current FK pose (pose6) at q_prev
+    cart_err: np.ndarray      # 6D Cartesian error used for feedback
+    sigma_min: float          # smallest singular value of J
+    lam: float                # damping factor applied
+    manip: float              # Yoshikawa manipulability
+
+
+def damping_from_sigma(sigma_min: float, sigma_thresh: float, lambda_max: float) -> float:
+    """lambda = 0 for sigma_min > thresh (pure pinv), ramps to lambda_max as sigma->0.
+
+    lambda^2 = (1 - (sigma_min / thresh)^2) * lambda_max^2   for sigma_min < thresh.
     """
-    Poll rm_get_current_arm_state / rm_get_force_data in a daemon thread.
-    Main loop reads latest snapshot without blocking on RPC.
-    """
+    if sigma_thresh <= 0.0 or sigma_min >= sigma_thresh:
+        return 0.0
+    ratio = sigma_min / sigma_thresh
+    lam_sq = (1.0 - ratio * ratio) * (lambda_max * lambda_max)
+    return float(np.sqrt(max(lam_sq, 0.0)))
 
-    def __init__(self, robot, *, poll_s: float = 0.01) -> None:
-        self.robot = robot
-        self.poll_s = poll_s
-        self._lock = threading.Lock()
-        self._snap = AsyncStateSnapshot()
-        self._running = False
-        self._thread: threading.Thread | None = None
 
-    def start(self) -> None:
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="va-async-state")
-        self._thread.start()
+def dls_pinv(J: np.ndarray, lam: float) -> np.ndarray:
+    """Damped least-squares right pseudo-inverse J^T (J J^T + lam^2 I)^-1."""
+    m = J.shape[0]
+    JJt = J @ J.T
+    if lam > 0.0:
+        JJt = JJt + (lam * lam) * np.eye(m)
+    return J.T @ np.linalg.solve(JJt, np.eye(m))
 
-    def stop(self) -> None:
-        self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
 
-    def wait_first_pose(self, timeout_s: float = 5.0) -> np.ndarray:
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            snap = self.read()
-            if snap.pose is not None:
-                return snap.pose.copy()
-            time.sleep(0.005)
-        raise TimeoutError("AsyncStateObserver: no pose within timeout")
+def integrate_pose(pose: np.ndarray, twist: np.ndarray, dt: float, euler_order: str = "xyz") -> np.ndarray:
+    """Advance a base-frame pose6 by a base-frame twist [v_lin, omega] over dt."""
+    pose = np.asarray(pose, dtype=float)
+    out = pose.copy()
+    out[:3] = pose[:3] + np.asarray(twist[:3], dtype=float) * dt
+    R = Rsc.from_euler(euler_order, pose[3:6], degrees=False).as_matrix()
+    dR = Rsc.from_rotvec(np.asarray(twist[3:6], dtype=float) * dt).as_matrix()
+    out[3:6] = Rsc.from_matrix(dR @ R).as_euler(euler_order, degrees=False)
+    return out
 
-    def read(self) -> AsyncStateSnapshot:
-        with self._lock:
-            if self._snap.pose is None:
-                return AsyncStateSnapshot(
-                    force_raw=self._snap.force_raw.copy(),
-                    t_s=self._snap.t_s,
-                    ok=False,
-                )
-            return AsyncStateSnapshot(
-                pose=self._snap.pose.copy(),
-                q_deg=self._snap.q_deg.copy() if self._snap.q_deg is not None else None,
-                force_raw=self._snap.force_raw.copy(),
-                t_s=self._snap.t_s,
-                ok=self._snap.ok,
-            )
 
-    def _loop(self) -> None:
-        while self._running:
-            t_s = time.monotonic()
-            ret_s, st = self.robot.rm_get_current_arm_state()
-            ret_f, fd = self.robot.rm_get_force_data()
-            snap = AsyncStateSnapshot(t_s=t_s)
-            if ret_s == 0:
-                snap.pose = np.asarray(st["pose"][:6], dtype=float)
-                snap.q_deg = np.asarray(st["joint"][:7], dtype=float)
-            if ret_f == 0:
-                snap.force_raw = np.asarray(fd["force_data"][:6], dtype=float)
-            snap.ok = snap.pose is not None and ret_f == 0
-            with self._lock:
-                if snap.pose is not None:
-                    self._snap.pose = snap.pose
-                if snap.q_deg is not None:
-                    self._snap.q_deg = snap.q_deg
-                if ret_f == 0:
-                    self._snap.force_raw = snap.force_raw
-                self._snap.t_s = t_s
-                self._snap.ok = snap.ok
-            time.sleep(self.poll_s)
+def _saturate_error(err: np.ndarray, max_pos: float, max_rot: float) -> np.ndarray:
+    out = np.asarray(err, dtype=float).copy()
+    pos_n = float(np.linalg.norm(out[:3]))
+    if max_pos > 0.0 and pos_n > max_pos:
+        out[:3] *= max_pos / pos_n
+    rot_n = float(np.linalg.norm(out[3:6]))
+    if max_rot > 0.0 and rot_n > max_rot:
+        out[3:6] *= max_rot / rot_n
+    return out
+
+
+class ClikController:
+    """Stateful CLIK integrator (owns only the Cartesian reference pose)."""
+
+    def __init__(self, kin: RobotKinematics, cfg: ClikConfig | None = None) -> None:
+        self.kin = kin
+        self.cfg = cfg or ClikConfig()
+        self.x_ref = np.zeros(6, dtype=float)
+        self._initialized = False
+
+    def reset(self, q0_rad: np.ndarray, pose0: np.ndarray | None = None) -> None:
+        self.x_ref = (
+            np.asarray(pose0, dtype=float).copy()
+            if pose0 is not None
+            else self.kin.fk_pose(q0_rad)
+        )
+        self._initialized = True
+
+    def set_reference(self, pose: np.ndarray) -> None:
+        self.x_ref = np.asarray(pose, dtype=float).copy()
+
+    def step(
+        self,
+        q_prev: np.ndarray,
+        twist_ref: np.ndarray,
+        dt: float,
+        secondary_qdot: np.ndarray | None = None,
+    ) -> ClikResult:
+        cfg = self.cfg
+        q_prev = np.asarray(q_prev, dtype=float)
+        twist_ref = np.asarray(twist_ref, dtype=float)
+        if not self._initialized:
+            self.reset(q_prev)
+
+        # 1) advance the integrated Cartesian reference by the feed-forward twist
+        self.x_ref = integrate_pose(self.x_ref, twist_ref, dt, cfg.euler_order)
+
+        # 2) linearize about the actually-commanded joint state
+        J = self.kin.jacobian(q_prev)
+        sigma = self.kin.singular_values(J)
+        sigma_min = float(sigma.min())
+        lam = damping_from_sigma(sigma_min, cfg.sigma_thresh, cfg.lambda_max)
+        Jdls = dls_pinv(J, lam)
+
+        # 3) CLIK feedback against the integrated reference (drift correction)
+        x_cur = self.kin.fk_pose(q_prev)
+        err = pose_error(self.x_ref, x_cur, cfg.euler_order)
+        err_sat = _saturate_error(err, cfg.max_pos_err_m, cfg.max_rot_err_rad)
+        v_cmd = twist_ref + cfg.k_task * err_sat
+
+        # 4) primary + nullspace secondary task
+        qdot = Jdls @ v_cmd
+        if secondary_qdot is not None and cfg.nullspace_gain != 0.0:
+            N = np.eye(self.kin.nv) - Jdls @ J
+            qdot = qdot + N @ (cfg.nullspace_gain * np.asarray(secondary_qdot, dtype=float))
+
+        q_next = q_prev + qdot * dt
+        return ClikResult(
+            q_next=q_next,
+            qdot=qdot,
+            x_ref=self.x_ref.copy(),
+            x_cur=x_cur,
+            cart_err=err,
+            sigma_min=sigma_min,
+            lam=lam,
+            manip=self.kin.manipulability(J),
+        )
 ```
 
-## `rm75_control/control/velocity_admittance/controller.py`
+## FILE: `rm75_control/control/joint_admittance/config.py`
 
-```python
-"""Tool-frame force/motion decoupling + base-frame 6D trajectory tracking."""
+```py
+"""YAML -> JointIkConfig loader for the joint-space inner loop.
+
+Keeps the inner-loop tuning (gains K, DLS lambda schedule, nullspace gains,
+smoothing cutoff, safety limits) in one config section so bring-up is a matter of
+editing yaml, not code.  The outer admittance loop is still configured with the
+existing hybrid_motion keys and built via AdmittanceConfig.from_dict.
+"""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
 
 import numpy as np
+
+from rm75_control.control.joint_admittance.clik import ClikConfig
+from rm75_control.control.joint_admittance.loop import JointIkConfig
+from rm75_control.control.joint_admittance.tasks.nullspace_task import NullspaceTaskConfig
+
+
+def _arr(v, default):
+    return np.asarray(v if v is not None else default, dtype=float)
+
+
+def build_joint_ik_config(raw: dict) -> JointIkConfig:
+    timing = raw.get("timing", {})
+    dt = float(timing.get("dt_ms", 10.0)) / 1000.0
+
+    inner = raw.get("inner", {})
+    euler_order = str(raw.get("frames", {}).get("euler_order", inner.get("euler_order", "xyz")))
+
+    c = inner.get("clik", {})
+    clik = ClikConfig(
+        k_task=_arr(c.get("k_task"), [2.0] * 6),
+        sigma_thresh=float(c.get("sigma_thresh", 0.04)),
+        lambda_max=float(c.get("lambda_max", 0.08)),
+        nullspace_gain=float(c.get("nullspace_gain", 1.0)),
+        max_pos_err_m=float(c.get("max_pos_err_m", 0.05)),
+        max_rot_err_rad=float(c.get("max_rot_err_rad", 0.20)),
+        euler_order=euler_order,
+    )
+
+    n = inner.get("nullspace", {})
+    nullspace = NullspaceTaskConfig(
+        k_center=float(n.get("k_center", 0.5)),
+        k_limit=float(n.get("k_limit", 2.0)),
+        activation=float(n.get("activation", 0.85)),
+        weights=(np.asarray(n["weights"], dtype=float) if n.get("weights") is not None else None),
+    )
+
+    margin_deg = float(inner.get("position_margin_deg", 1.0))
+
+    cfg = JointIkConfig(
+        dt=dt,
+        control_frame=str(inner.get("control_frame", "base")),
+        euler_order=euler_order,
+        solver=str(inner.get("solver", "clik")),
+        clik=clik,
+        nullspace=nullspace,
+        v_scale=float(inner.get("v_scale", 0.5)),
+        a_max=float(inner.get("a_max", 20.0)),
+        position_margin_rad=math.radians(margin_deg),
+        use_smoothing=bool(inner.get("use_smoothing", True)),
+        smooth_cutoff_hz=float(inner.get("smooth_cutoff_hz", 15.0)),
+    )
+
+    if cfg.solver == "qp":
+        from rm75_control.control.joint_admittance.solver.qp_builder import QpConfig
+
+        q = inner.get("qp", {})
+        cfg.qp = QpConfig(
+            k_task=_arr(q.get("k_task"), [2.0] * 6),
+            task_weight=_arr(q.get("task_weight"), [1.0, 1.0, 1.0, 0.5, 0.5, 0.5]),
+            reg=float(q.get("reg", 1e-3)),
+            reg_secondary_scale=float(q.get("reg_secondary_scale", 1.0)),
+            max_pos_err_m=float(q.get("max_pos_err_m", clik.max_pos_err_m)),
+            max_rot_err_rad=float(q.get("max_rot_err_rad", clik.max_rot_err_rad)),
+            euler_order=euler_order,
+            backend=str(q.get("backend", "proxqp")),
+            eps_abs=float(q.get("eps_abs", 1e-6)),
+            max_iter=int(q.get("max_iter", 200)),
+        )
+    return cfg
+```
+
+## FILE: `rm75_control/control/joint_admittance/model.py`
+
+```py
+"""Pinocchio kinematics engine for RM75-F (FK / Jacobian / manipulability).
+
+The whole cascade is only as correct as this model.  Two conventions are pinned
+here and must match the Realman controller:
+
+* Joint order  : joint_1..joint_7, radians internally.  The robot API speaks
+  degrees (rm_get_current_arm_state()["joint"], rm_movej_canfd) - convert at the
+  boundary with deg2rad / rad2deg helpers.
+* Cartesian    : the TCP twist / Jacobian are expressed LOCAL_WORLD_ALIGNED,
+  i.e. linear velocity of the TCP point and angular velocity, both in base-frame
+  axes.  This matches the base-frame 6D twist the admittance outer loop emits
+  (controller.py, control_frame="base").  Pose is returned as
+  [x, y, z, rx, ry, rz] with intrinsic xyz Euler (Realman convention).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pinocchio as pin
 from scipy.spatial.transform import Rotation as Rsc
 
+DEFAULT_URDF = (
+    Path(__file__).resolve().parents[2] / "assets" / "robots" / "rm75_6f" / "RM75-6F.urdf"
+)
 
-def wrap_pi(angle: float) -> float:
-    return float(math.atan2(math.sin(angle), math.cos(angle)))
+JOINT_NAMES = [f"joint_{i}" for i in range(1, 8)]
 
 
-def pose_error(
-    desired: np.ndarray,
-    current: np.ndarray,
-    euler_order: str = "xyz",
-) -> np.ndarray:
-    """
-    Base-frame 6D pose error for PBAC.
+def deg2rad(q_deg: np.ndarray) -> np.ndarray:
+    return np.asarray(q_deg, dtype=float) * (np.pi / 180.0)
 
-    Position: linear difference in base frame.
-    Orientation: SO(3) log map — rotvec of R_des @ R_cur^T, NOT Euler subtraction.
+
+def rad2deg(q_rad: np.ndarray) -> np.ndarray:
+    return np.asarray(q_rad, dtype=float) * (180.0 / np.pi)
+
+
+def pose_distance(
+    pose_a: np.ndarray, pose_b: np.ndarray, euler_order: str = "xyz"
+) -> tuple[float, float]:
+    """Position distance (mm) and orientation distance (deg) between two pose6."""
+    a = np.asarray(pose_a, dtype=float)
+    b = np.asarray(pose_b, dtype=float)
+    d_mm = float(np.linalg.norm(a[:3] - b[:3]) * 1000.0)
+    ra = Rsc.from_euler(euler_order, a[3:6], degrees=False).as_matrix()
+    rb = Rsc.from_euler(euler_order, b[3:6], degrees=False).as_matrix()
+    d_deg = float(np.degrees(np.linalg.norm(Rsc.from_matrix(ra @ rb.T).as_rotvec())))
+    return d_mm, d_deg
+
+
+def pose_error(desired: np.ndarray, current: np.ndarray, euler_order: str = "xyz") -> np.ndarray:
+    """Base-frame 6D pose error: linear diff + SO(3) log (rotvec of R_des @ R_cur^T).
+
+    Mirrors hybrid_motion.controller.pose_error so the inner loop's Cartesian
+    error definition is identical to the outer loop's.
     """
     err = np.zeros(6, dtype=float)
     err[:3] = np.asarray(desired[:3], dtype=float) - np.asarray(current[:3], dtype=float)
-
     r_des = Rsc.from_euler(euler_order, desired[3:6], degrees=False).as_matrix()
     r_cur = Rsc.from_euler(euler_order, current[3:6], degrees=False).as_matrix()
-    r_err = r_des @ r_cur.T
-    err[3:6] = Rsc.from_matrix(r_err).as_rotvec()
+    err[3:6] = Rsc.from_matrix(r_des @ r_cur.T).as_rotvec()
     return err
 
 
-def smooth_deadband_eff(f_err: float, deadband_n: float, width_n: float) -> float:
-    """
-    C1 smooth deadband: zero inside |f|<=db, ramps to f-sign*db outside transition.
-    Reduces PI limit cycles at the deadband edge (Z inertia ripple).
-    """
-    if width_n <= 0.0:
-        if abs(f_err) <= deadband_n:
-            return 0.0
-        return f_err - math.copysign(deadband_n, f_err)
-    af = abs(f_err)
-    if af <= deadband_n:
-        return 0.0
-    if af >= deadband_n + width_n:
-        return f_err - math.copysign(deadband_n + 0.5 * width_n, f_err)
-    t = (af - deadband_n) / width_n
-    gain = t * t * (3.0 - 2.0 * t)
-    return math.copysign(gain * (af - deadband_n), f_err)
+class RobotKinematics:
+    """Thin Pinocchio wrapper exposing FK, Jacobian and manipulability at the TCP."""
 
+    def __init__(
+        self,
+        urdf_path: str | Path | None = None,
+        tcp_frame: str = "tcp",
+        euler_order: str = "xyz",
+    ) -> None:
+        self.urdf_path = Path(urdf_path) if urdf_path is not None else DEFAULT_URDF
+        if not self.urdf_path.exists():
+            raise FileNotFoundError(f"URDF not found: {self.urdf_path}")
+        self.model = pin.buildModelFromUrdf(str(self.urdf_path))
+        self.data = self.model.createData()
+        self.euler_order = euler_order
 
-@dataclass
-class AdmittanceConfig:
-    """
-    force_axes: tool-frame mask for admittance (typ. [0,0,1,0,0,0] = TCP normal).
-    f_ext from phi is in sensor frame; with sensor_offset=0 and TCP pure translation,
-    f_ext[2] is used as tool-Z force (see observer docstring).
-    Trajectory pose_d / vel_ff are base-frame 6D (Servo / scan feedforward).
-    Fusion is tool-frame sleeve decoupling only — no world-XY lstsq lock.
-    """
+        if not self.model.existFrame(tcp_frame):
+            raise ValueError(f"frame {tcp_frame!r} not in URDF {self.urdf_path}")
+        self.tcp_frame = tcp_frame
+        self.tcp_id = self.model.getFrameId(tcp_frame)
 
-    euler_order: str = "xyz"
-    force_axes: np.ndarray = field(
-        default_factory=lambda: np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-    )
-    control_frame: str = "tool"
-    kp_pos: np.ndarray = field(default_factory=lambda: np.zeros(6))
-    track_axes: np.ndarray = field(default_factory=lambda: np.ones(6))
-    system_delay_s: float = 0.015
-    k_fp_press: float = 0.015
-    k_fp_release: float = 0.005
-    k_fi: float = 0.008
-    integral_limit: float = 0.05
-    k_align: float = 0.02
-    enable_normal_tracking: bool = False
-    contact_threshold_n: float = 0.5
-    deadband_n: float = 0.3
-    deadband_width_n: float = 0.2
-    max_velocity: np.ndarray = field(
-        default_factory=lambda: np.array([0.2, 0.2, 0.08, 0.5, 0.5, 0.5])
-    )
-    max_acceleration: np.ndarray = field(
-        default_factory=lambda: np.array([1.0, 1.0, 0.8, 2.0, 2.0, 2.0])
-    )
-    release_vz_up_m_s: float = 0.02
-    release_vz_down_m_s: float = 0.02
-    approach_vz_tool_m_s: float = 0.03
-    max_vz_tool_m_s: float = 0.05
-    open_loop: bool = False
-    vz_filter_alpha: float = 0.3
-    slew_skip_force_axes: bool = True
-    # Force-axis virtual mass (Keemink 2018, Guideline 4/6): a finite acceleration
-    # limit on the tool-Z admittance velocity renders a virtual inertia → bounded
-    # jerk + coupled-stability margin. Replaces the slew-skip hack (which left the
-    # force axis with no acceleration limit → the press/pull jerk). 0 ⇒ legacy skip.
-    vz_accel_limit_m_s2: float = 0.6
-    # Position-loop conditioning (PBAC). Small deadband kills FT/encoder-noise jitter
-    # on the velocity-controlled (tracking) directions; the correction clamp keeps a
-    # transient contact slip from surging the velocity command independent of vel_ff.
-    pos_err_deadband_m: float = 0.0
-    pos_correction_max_m_s: float = 0.0
+        self.nq = self.model.nq
+        self.nv = self.model.nv
+        if self.nq != 7 or self.nv != 7:
+            raise ValueError(f"expected 7-DOF model, got nq={self.nq} nv={self.nv}")
 
-    @classmethod
-    def from_dict(cls, raw: dict) -> AdmittanceConfig:
-        c = raw.get("controller", raw)
-        frames = raw.get("frames", {})
-        traj = raw.get("trajectory", {})
-        fa = np.asarray(c.get("force_axes", [0, 0, 1, 0, 0, 0]), dtype=float)
-        open_loop = bool(c.get("open_loop", c.get("open_loop_scan", traj.get("open_loop", False))))
-        return cls(
-            euler_order=str(frames.get("euler_order", "xyz")),
-            control_frame=str(frames.get("control_frame", c.get("control_frame", "tool"))),
-            force_axes=fa,
-            kp_pos=np.asarray(c.get("kp_pos", [0, 0, 0, 0, 0, 0]), dtype=float),
-            track_axes=np.asarray(c.get("track_axes", [1, 1, 1, 1, 1, 1]), dtype=float),
-            system_delay_s=float(c.get("system_delay_s", 0.015)),
-            k_fp_press=float(c.get("k_fp_press", 0.015)),
-            k_fp_release=float(c.get("k_fp_release", 0.005)),
-            k_fi=float(c.get("k_fi", 0.008)),
-            integral_limit=float(c.get("integral_limit", 0.05)),
-            k_align=float(c.get("k_align", 0.02)),
-            enable_normal_tracking=bool(c.get("enable_normal_tracking", False)),
-            contact_threshold_n=float(c.get("contact_threshold_n", 0.5)),
-            deadband_n=float(c.get("deadband_n", 0.3)),
-            deadband_width_n=float(c.get("deadband_width_n", 0.2)),
-            max_velocity=np.asarray(
-                c.get("max_velocity", [0.2, 0.2, 0.08, 0.5, 0.5, 0.5]), dtype=float
-            ),
-            max_acceleration=np.asarray(
-                c.get("max_acceleration", [1.0, 1.0, 0.8, 2.0, 2.0, 2.0]), dtype=float
-            ),
-            release_vz_up_m_s=float(c.get("release_vz_up_m_s", 0.05)),
-            release_vz_down_m_s=float(c.get("release_vz_down_m_s", 0.05)),
-            approach_vz_tool_m_s=float(c.get("approach_vz_tool_m_s", 0.03)),
-            max_vz_tool_m_s=float(c.get("max_vz_tool_m_s", 0.05)),
-            open_loop=open_loop,
-            vz_filter_alpha=float(c.get("vz_filter_alpha", 0.3)),
-            slew_skip_force_axes=bool(c.get("slew_skip_force_axes", True)),
-            vz_accel_limit_m_s2=float(c.get("vz_accel_limit_m_s2", 0.6)),
-            pos_err_deadband_m=float(c.get("pos_err_deadband_m", 0.0)),
-            pos_correction_max_m_s=float(c.get("pos_correction_max_m_s", 0.0)),
+        # Position / velocity limits (radians, rad/s) straight from the URDF.
+        self.q_lower = np.asarray(self.model.lowerPositionLimit, dtype=float).copy()
+        self.q_upper = np.asarray(self.model.upperPositionLimit, dtype=float).copy()
+        self.v_max = np.asarray(self.model.velocityLimit, dtype=float).copy()
+
+    # ---- forward kinematics ------------------------------------------------
+    def fk_placement(self, q_rad: np.ndarray) -> pin.SE3:
+        q = np.asarray(q_rad, dtype=float)
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacement(self.model, self.data, self.tcp_id)
+        return self.data.oMf[self.tcp_id]
+
+    def fk_pose(self, q_rad: np.ndarray) -> np.ndarray:
+        """TCP pose as [x, y, z, rx, ry, rz] (m, rad; intrinsic xyz Euler)."""
+        M = self.fk_placement(q_rad)
+        pose = np.zeros(6, dtype=float)
+        pose[:3] = M.translation
+        pose[3:6] = Rsc.from_matrix(M.rotation).as_euler(self.euler_order, degrees=False)
+        return pose
+
+    def fk_position_quat(self, q_rad: np.ndarray) -> np.ndarray:
+        """TCP pose as [x, y, z, qx, qy, qz, qw] (handy for logging / comparisons)."""
+        M = self.fk_placement(q_rad)
+        quat = Rsc.from_matrix(M.rotation).as_quat()  # [x, y, z, w]
+        return np.concatenate([M.translation, quat])
+
+    def frame_placement(self, q_rad: np.ndarray, frame_name: str) -> pin.SE3:
+        """SE3 of an arbitrary frame (e.g. 'link_7' flange) in the base frame."""
+        if not self.model.existFrame(frame_name):
+            raise ValueError(f"frame {frame_name!r} not in URDF {self.urdf_path}")
+        fid = self.model.getFrameId(frame_name)
+        q = np.asarray(q_rad, dtype=float)
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacement(self.model, self.data, fid)
+        return self.data.oMf[fid]
+
+    def frame_pose(self, q_rad: np.ndarray, frame_name: str) -> np.ndarray:
+        """Pose [x, y, z, rx, ry, rz] of an arbitrary frame in the base frame."""
+        M = self.frame_placement(q_rad, frame_name)
+        pose = np.zeros(6, dtype=float)
+        pose[:3] = M.translation
+        pose[3:6] = Rsc.from_matrix(M.rotation).as_euler(self.euler_order, degrees=False)
+        return pose
+
+    # ---- differential kinematics ------------------------------------------
+    def jacobian(self, q_rad: np.ndarray) -> np.ndarray:
+        """6x7 TCP Jacobian, LOCAL_WORLD_ALIGNED (linear on top, angular below).
+
+        Maps joint velocity (rad/s) -> [v_lin(base), omega(base)].
+        """
+        q = np.asarray(q_rad, dtype=float)
+        pin.computeJointJacobians(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        J = pin.getFrameJacobian(
+            self.model, self.data, self.tcp_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
         )
-
-
-class AdmittanceController:
-    """
-    Pipeline (base trajectory/Servo → sleeve fusion → movev):
-      1. v_pos_base = vel_ff + kp * (pose_d - pose)
-      2. fuse_tool_sleeve: Tool-X/Y from R.T @ v_pos_base; Tool-Z from force admittance
-      3. output v_cmd_tool (frame_type=0) or v_cmd_base
-
-    Sleeve vs old S_p @ (R.T v_base):
-      - Old S_p zeroed tool-Z trajectory rate → lost tilted scan component.
-      - Sleeve keeps tool-X/Y intact, replaces only [2] with force — no world-XY lock.
-    """
-
-    def __init__(self, dt: float, config: AdmittanceConfig | None = None) -> None:
-        self.dt = dt
-        self.cfg = config or AdmittanceConfig()
-        self.force_error_integral = np.zeros(6)
-        self.last_v_cmd = np.zeros(6)
-        self._contact_ticks = 0
-        self.filtered_vz = 0.0
-
-    def reset(self, *, clear_velocity: bool = False) -> None:
-        self.force_error_integral.fill(0.0)
-        self._contact_ticks = 0
-        self.filtered_vz = 0.0
-        if clear_velocity:
-            self.last_v_cmd.fill(0.0)
+        return np.asarray(J, dtype=float)
 
     @staticmethod
-    def fuse_tool_sleeve(
-        v_pos_base: np.ndarray,
-        v_force_tool: np.ndarray,
-        r_mat: np.ndarray,
-        *,
-        normal_track: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Tool-frame orthogonal decoupling (sleeve / slider):
-          Tool-X/Y ← trajectory or visual Servo feedforward
-          Tool-Z   ← force admittance only — no lateral compensation for Z motion.
-        """
-        v_pos_tool = np.zeros(6, dtype=float)
-        v_pos_tool[:3] = r_mat.T @ np.asarray(v_pos_base[:3], dtype=float)
-        v_pos_tool[3:6] = r_mat.T @ np.asarray(v_pos_base[3:6], dtype=float)
+    def manipulability(J: np.ndarray) -> float:
+        """Yoshikawa measure sqrt(det(J J^T)); 0 at a singularity."""
+        JJt = J @ J.T
+        det = float(np.linalg.det(JJt))
+        return float(np.sqrt(max(det, 0.0)))
 
-        v_cmd_tool = v_pos_tool.copy()
-        v_cmd_tool[2] = float(v_force_tool[2])
-        if normal_track:
-            v_cmd_tool[3:6] += np.asarray(v_force_tool[3:6], dtype=float)
+    @staticmethod
+    def singular_values(J: np.ndarray) -> np.ndarray:
+        return np.linalg.svd(J, compute_uv=False)
 
-        v_cmd_base = np.zeros(6, dtype=float)
-        v_cmd_base[:3] = r_mat @ v_cmd_tool[:3]
-        v_cmd_base[3:] = r_mat @ v_cmd_tool[3:6]
-        return v_cmd_tool, v_cmd_base
-
-    def compute_velocity_command(
-        self,
-        current_pose: np.ndarray,
-        desired_pose: np.ndarray,
-        desired_vel_ff: np.ndarray,
-        f_ext: np.ndarray,
-        desired_force: np.ndarray,
-        *,
-        in_contact: bool | None = None,
-        enable_pbac: bool | None = None,
-    ) -> np.ndarray:
-        cfg = self.cfg
-        r_mat = Rsc.from_euler(
-            cfg.euler_order, current_pose[3:6], degrees=False
-        ).as_matrix()
-
-        pose_predicted = np.asarray(current_pose, dtype=float).copy()
-        if cfg.system_delay_s > 0.0:
-            if cfg.control_frame == "tool":
-                pose_predicted[:3] += r_mat @ self.last_v_cmd[:3] * cfg.system_delay_s
-            else:
-                pose_predicted[:3] += self.last_v_cmd[:3] * cfg.system_delay_s
-
-        err_pose = pose_error(desired_pose, pose_predicted, cfg.euler_order)
-        vel_ff = np.asarray(desired_vel_ff, dtype=float).copy()
-        use_pbac = (not cfg.open_loop) if enable_pbac is None else bool(enable_pbac)
-        if not use_pbac:
-            err_pose[:] = 0.0
-        # --- Translation PBAC in the TOOL frame (task-frame formalism) ---
-        # The force axis is the tool-Z (probe normal). When the probe is tilted, the
-        # force-driven tool-Z excursion projects onto base-X/Z; a base-frame position
-        # loop mis-reads that as lateral tracking error and injects spurious tool-X/Y
-        # velocity (probe slides sideways). De Schutter & Van Brussel 1988 / Bruyninckx
-        # & De Schutter 1996: force- and velocity-controlled directions must be
-        # orthogonal IN THE TASK FRAME → compute the correction in the tool frame and
-        # drop the tool-Z (force) component before applying gains.
-        err_tool = r_mat.T @ err_pose[:3]
-        err_tool[2] = 0.0
-        if cfg.pos_err_deadband_m > 0.0:
-            for i in (0, 1):
-                if abs(err_tool[i]) <= cfg.pos_err_deadband_m:
-                    err_tool[i] = 0.0
-        kp_xy = np.array([
-            cfg.kp_pos[0] * cfg.track_axes[0],
-            cfg.kp_pos[1] * cfg.track_axes[1],
-            0.0,
-        ])
-        v_corr_tool = kp_xy * err_tool
-        if cfg.pos_correction_max_m_s > 0.0:
-            v_corr_tool[:2] = np.clip(
-                v_corr_tool[:2], -cfg.pos_correction_max_m_s, cfg.pos_correction_max_m_s
-            )
-        v_corr = np.zeros(6, dtype=float)
-        v_corr[:3] = r_mat @ v_corr_tool
-        kp_rot = cfg.kp_pos[3:6] * cfg.track_axes[3:6]
-        v_corr[3:6] = kp_rot * err_pose[3:6]
-        v_pos_base = vel_ff + v_corr
-
-        f_ext = np.asarray(f_ext, dtype=float)
-        f_des = np.asarray(desired_force, dtype=float)
-        v_force_tool = np.zeros(6, dtype=float)
-
-        if in_contact is None:
-            in_contact = float(np.linalg.norm(f_ext[:3])) >= cfg.contact_threshold_n
-        else:
-            in_contact = bool(in_contact)
-
-        if in_contact:
-            self._contact_ticks += 1
-        else:
-            self._contact_ticks = 0
-        db_alpha = min(1.0, self._contact_ticks / 50.0)
-
-        for axis in range(6):
-            if cfg.force_axes[axis] < 0.5:
-                continue
-            f_err = f_des[axis] - f_ext[axis]
-            v_force_tool[axis] = self._admittance_axis(
-                axis, f_err, in_contact, db_alpha,
-            )
-
-        normal_track = in_contact and cfg.enable_normal_tracking
-        if normal_track:
-            v_force_tool[3] = -cfg.k_align * f_ext[1]
-            v_force_tool[4] = cfg.k_align * f_ext[0]
-
-        v_cmd_tool, v_cmd_base = self.fuse_tool_sleeve(
-            v_pos_base, v_force_tool, r_mat, normal_track=normal_track,
-        )
-        if cfg.max_vz_tool_m_s > 0.0:
-            v_cmd_tool[2] = float(np.clip(v_cmd_tool[2], -cfg.max_vz_tool_m_s, cfg.max_vz_tool_m_s))
-            if cfg.control_frame == "base":
-                v_cmd_base[:3] = r_mat @ v_cmd_tool[:3]
-                v_cmd_base[3:] = r_mat @ v_cmd_tool[3:6]
-
-        v_out = v_cmd_tool if cfg.control_frame == "tool" else v_cmd_base
-        v_clamp = np.clip(v_out, -cfg.max_velocity, cfg.max_velocity)
-        dv_max = cfg.max_acceleration * self.dt
-        v_final = np.asarray(v_clamp, dtype=float).copy()
-        for i in range(6):
-            is_force_axis = cfg.force_axes[i] > 0.5
-            if is_force_axis:
-                # Virtual-mass acceleration limit on the force axis (Keemink 2018
-                # Guideline 4/6): a finite Δv per tick bounds jerk and gives a coupled-
-                # stability margin, while still being far less restrictive than the
-                # position-axis slew. Falls back to legacy skip only if disabled.
-                if cfg.vz_accel_limit_m_s2 <= 0.0:
-                    if cfg.slew_skip_force_axes:
-                        continue
-                    dvf = dv_max[i]
-                else:
-                    dvf = cfg.vz_accel_limit_m_s2 * self.dt
-            else:
-                dvf = dv_max[i]
-            v_final[i] = float(np.clip(
-                v_final[i],
-                self.last_v_cmd[i] - dvf,
-                self.last_v_cmd[i] + dvf,
-            ))
-        self.last_v_cmd = v_final.copy()
-        return v_final
-
-    def _filter_vz_tool(self, v: float) -> float:
-        """First-order low-pass on tool-Z admittance velocity (virtual mass / M)."""
-        alpha = float(self.cfg.vz_filter_alpha)
-        if alpha >= 1.0:
-            self.filtered_vz = float(v)
-            return self.filtered_vz
-        if alpha <= 0.0:
-            return self.filtered_vz
-        self.filtered_vz = alpha * float(v) + (1.0 - alpha) * self.filtered_vz
-        return self.filtered_vz
-
-    def _admittance_axis(
-        self,
-        axis: int,
-        f_err: float,
-        in_contact: bool,
-        db_alpha: float = 1.0,
-    ) -> float:
-        cfg = self.cfg
-        if axis == 2 and not in_contact:
-            self.force_error_integral[axis] = 0.0
-            v = cfg.k_fp_release * f_err
-            cap = cfg.approach_vz_tool_m_s
-            return self._filter_vz_tool(float(np.clip(v, -cap, cap)))
-
-        if abs(f_err) > 5.0:
-            self.force_error_integral[axis] = 0.0
-
-        actual_deadband = cfg.deadband_n * db_alpha
-        actual_width = cfg.deadband_width_n * db_alpha
-        eff = smooth_deadband_eff(f_err, actual_deadband, actual_width)
-        k_fp = cfg.k_fp_press if f_err < 0 else cfg.k_fp_release
-
-        if abs(eff) > 1e-9:
-            self.force_error_integral[axis] += eff * self.dt
-            if axis == 2:
-                if f_err < 0:
-                    self.force_error_integral[axis] = min(
-                        0.0, float(self.force_error_integral[axis]),
-                    )
-                else:
-                    self.force_error_integral[axis] = max(
-                        0.0, float(self.force_error_integral[axis]),
-                    )
-            self.force_error_integral[axis] = float(
-                np.clip(self.force_error_integral[axis], -cfg.integral_limit, cfg.integral_limit)
-            )
-            v = k_fp * eff + cfg.k_fi * self.force_error_integral[axis]
-        else:
-            v = 0.0
-
-        if axis == 2:
-            v = float(np.clip(v, -cfg.max_vz_tool_m_s, cfg.max_vz_tool_m_s))
-            return self._filter_vz_tool(v)
-        return v
+    def clamp_to_limits(self, q_rad: np.ndarray, margin: float = 0.0) -> np.ndarray:
+        return np.clip(q_rad, self.q_lower + margin, self.q_upper - margin)
 ```
 
-## `rm75_control/control/velocity_admittance/trajectory.py`
+## FILE: `rm75_control/control/joint_admittance/reference.py`
 
-```python
-"""6D trajectory producers (base frame). Hybrid controller consumes pose_d + vel_ff."""
+```py
+"""Motion references for the joint-admittance loop.
+
+Re-uses hybrid_motion.MotionReference so any existing MotionReferenceSource
+(demo trajectories, planners) is equally usable with the joint-space loop.
+
+Provided here, self-contained (no robot handle needed - pure kinematics/scipy):
+
+* HoldReference          - hold the start pose (bring-up default).
+* CartesianMoveReference - smoothstep point-to-point Cartesian move (position +
+  Slerp orientation), analytic vel_ff.  Drives the "walk to pose D" phase.
+* SinToolYReference      - tool-frame Y sinusoid about a fixed origin (analogue
+  of the tmp/Velocity_Admittance BuiltinTrajectorySource "sin_tool_y" mode, but
+  computed directly instead of via robot.rm_algo_pose_move).
+"""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Protocol
 
 import numpy as np
 from scipy.spatial.transform import Rotation as Rsc
+from scipy.spatial.transform import Slerp
 
-from .rm_algo import end2tool_pose
+from rm75_control.control.hybrid_motion.reference import MotionReference
 
 
-def tool_frame_delta_pose(
-    pose_ref: np.ndarray,
-    dx: float,
-    dy: float,
-    dz: float,
+class HoldReference:
+    """Hold the start pose: pose_d = pose0, vel_ff = 0 (bring-up default).
+
+    With force enabled and force_axes = tool-Z, this yields a pure constant-force
+    hold - the safest first on-robot test of the cascade.
+    """
+
+    def __init__(self) -> None:
+        self._pose0: np.ndarray | None = None
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        self._pose0 = np.asarray(pose0, dtype=float).copy()
+
+    def sample(self, t_s: float) -> MotionReference:
+        if self._pose0 is None:
+            raise RuntimeError("HoldReference.set_origin must be called first")
+        return MotionReference.from_pose_hold(self._pose0)
+
+
+def interpolate_pose_smoothstep(
+    pose_start: np.ndarray,
+    pose_end: np.ndarray,
+    t_s: float,
+    duration_s: float,
     *,
     euler_order: str = "xyz",
-) -> np.ndarray:
-    """Tool-frame translation without rm_algo RPC (matches frameMode=1 pure translation)."""
-    pose = np.asarray(pose_ref, dtype=float).copy()
-    r_mat = Rsc.from_euler(euler_order, pose[3:6], degrees=False).as_matrix()
-    pose[:3] = pose[:3] + r_mat @ np.array([dx, dy, dz], dtype=float)
-    return pose
+) -> tuple[np.ndarray, np.ndarray]:
+    """Smoothstep (C1, zero end-velocity) pose blend with analytic vel_ff.
+
+    Position: linear interpolation scaled by s(u) = 3u^2 - 2u^3, u = t/T.
+    Orientation: Slerp along the same s(u); velocity via a small finite
+    difference on the Slerp path (robust for any relative rotation angle).
+    """
+    pose_start = np.asarray(pose_start, dtype=float)
+    pose_end = np.asarray(pose_end, dtype=float)
+    if duration_s <= 0.0:
+        return pose_end.copy(), np.zeros(6, dtype=float)
+
+    u = float(np.clip(t_s / duration_s, 0.0, 1.0))
+    s = u * u * (3.0 - 2.0 * u)
+    ds_dt = 6.0 * u * (1.0 - u) / duration_s
+
+    pose = np.zeros(6, dtype=float)
+    pose[:3] = (1.0 - s) * pose_start[:3] + s * pose_end[:3]
+
+    r0 = Rsc.from_euler(euler_order, pose_start[3:6], degrees=False)
+    r1 = Rsc.from_euler(euler_order, pose_end[3:6], degrees=False)
+    slerp = Slerp([0.0, 1.0], Rsc.concatenate([r0, r1]))
+    rot_s = slerp([s])[0]
+    pose[3:6] = rot_s.as_euler(euler_order, degrees=False)
+
+    vel = np.zeros(6, dtype=float)
+    vel[:3] = ds_dt * (pose_end[:3] - pose_start[:3])
+    ds = 1e-4
+    s2 = min(s + ds, 1.0)
+    if s2 > s:
+        rot_s2 = slerp([s2])[0]
+        vel[3:6] = (rot_s2 * rot_s.inv()).as_rotvec() / (s2 - s) * ds_dt
+    return pose, vel
 
 
-def tool_offset_pose(robot, ref_pose: list[float], dx: float, dy: float, dz: float) -> list[float]:
-    delta = [dx, dy, dz, 0.0, 0.0, 0.0]
-    return robot.rm_algo_pose_move(ref_pose, delta, frameMode=1)
+class CartesianMoveReference:
+    """Point-to-point Cartesian move: smoothstep pose0 -> pose_target over duration_s.
+
+    Generic, reusable "Cartesian trajectory tracking" building block - drives the
+    inner IK loop straight from the current pose to any target pose without any
+    MoveJ/MoveV mode switch.  ``done(t_s)`` tells the caller when to advance to
+    the next phase.
+    """
+
+    def __init__(
+        self,
+        pose_target: np.ndarray,
+        duration_s: float,
+        *,
+        euler_order: str = "xyz",
+    ) -> None:
+        self.pose_target = np.asarray(pose_target, dtype=float).copy()
+        self.duration_s = float(duration_s)
+        self.euler_order = euler_order
+        self._pose0: np.ndarray | None = None
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        self._pose0 = np.asarray(pose0, dtype=float).copy()
+
+    def sample(self, t_s: float) -> MotionReference:
+        if self._pose0 is None:
+            raise RuntimeError("CartesianMoveReference.set_origin must be called first")
+        pose, vel = interpolate_pose_smoothstep(
+            self._pose0, self.pose_target, t_s, self.duration_s, euler_order=self.euler_order
+        )
+        return MotionReference(pose, vel, t_ref=t_s)
+
+    def done(self, t_s: float) -> bool:
+        return t_s >= self.duration_s
 
 
 def sin_period_for_peak_vel(amplitude_m: float, max_vel_m_s: float) -> float:
     if amplitude_m <= 0.0 or max_vel_m_s <= 0.0:
         return 1.0
     return 2.0 * math.pi * amplitude_m / max_vel_m_s
-
-
-@dataclass(frozen=True)
-class TrajectorySample:
-    """One tick of reference motion in base/world frame (6D pose + 6D velocity)."""
-
-    pose_d: np.ndarray
-    vel_ff: np.ndarray
-
-
-class Trajectory6D(Protocol):
-    """Any trajectory plugin: set contact origin, then stream 6D references."""
-
-    def set_origin(self, pose0: np.ndarray) -> None: ...
-
-    def sample(self, t_s: float) -> TrajectorySample: ...
-
-
-@dataclass
-class TrajectoryConfig:
-    kind: str = "hold"
-    amplitude_mm: float = 5.0
-    y_peak_to_peak_cm: float | None = None
-    period_s: float | None = None
-    y_max_vel_cm_s: float = 1.0
-    soft_start: bool = False
-    ramp_s: float = 2.0
-    rz_amplitude_deg: float = 0.0
-
-    @property
-    def half_amplitude_m(self) -> float:
-        if self.y_peak_to_peak_cm is not None:
-            return float(self.y_peak_to_peak_cm) * 0.01 / 2.0
-        return self.amplitude_mm / 1000.0
 
 
 def sin_y_motion(
@@ -917,1643 +624,1657 @@ def sin_y_motion(
     return dy, vy
 
 
-def tool_z_spin_angle_rad(
-    t_s: float, *, rz_amp_deg: float, omega: float, soft_start: bool, ramp_s: float,
-) -> float:
-    if rz_amp_deg <= 0.0:
-        return 0.0
-    ramp = 1.0
-    if soft_start and ramp_s > 0.0 and t_s < ramp_s:
-        ramp = math.sin(0.5 * math.pi * t_s / ramp_s)
-    return math.radians(rz_amp_deg) * math.sin(omega * t_s) * ramp
+class SinToolYReference:
+    """Tool-frame Y sinusoid about a fixed origin (orientation held constant).
+
+    origin is set once via ``set_origin`` (e.g. pose D once the arm has arrived);
+    pose = origin + R(origin) @ [0, amplitude*sin(wt), 0], matching a pure
+    tool-frame translation delta (equivalent to rm_algo_pose_move with a
+    translation-only delta in tool frame, computed directly - no robot RPC).
+    """
+
+    def __init__(
+        self,
+        amplitude_m: float,
+        *,
+        period_s: float | None = None,
+        max_vel_m_s: float | None = None,
+        soft_start: bool = True,
+        ramp_s: float = 2.0,
+        euler_order: str = "xyz",
+    ) -> None:
+        if period_s is None:
+            if max_vel_m_s is None:
+                raise ValueError("provide either period_s or max_vel_m_s")
+            period_s = sin_period_for_peak_vel(amplitude_m, max_vel_m_s)
+        self.amplitude_m = float(amplitude_m)
+        self.period_s = float(period_s)
+        self.omega = 2.0 * math.pi / self.period_s if self.period_s > 0 else 0.0
+        self.soft_start = soft_start
+        self.ramp_s = ramp_s
+        self.euler_order = euler_order
+        self._origin: np.ndarray | None = None
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        self._origin = np.asarray(pose0, dtype=float).copy()
+
+    def sample(self, t_s: float) -> MotionReference:
+        if self._origin is None:
+            raise RuntimeError("SinToolYReference.set_origin must be called first")
+        dy, vy = sin_y_motion(
+            t_s, self.amplitude_m, self.omega, soft_start=self.soft_start, ramp_s=self.ramp_s
+        )
+        r_mat = Rsc.from_euler(self.euler_order, self._origin[3:6], degrees=False).as_matrix()
+        pose = self._origin.copy()
+        pose[:3] = self._origin[:3] + r_mat @ np.array([0.0, dy, 0.0])
+        vel = np.zeros(6, dtype=float)
+        vel[:3] = r_mat @ np.array([0.0, vy, 0.0])
+        return MotionReference(pose, vel, t_ref=t_s)
+```
+
+## FILE: `rm75_control/control/joint_admittance/validation.py`
+
+```py
+"""FK validation: Pinocchio model vs the real Realman controller (重中之重).
+
+The entire cascade is only as trustworthy as the URDF <-> robot frame match.
+Before running ANY joint-position control, prove that Pinocchio FK agrees with
+the Realman pose interface to <1 mm / <0.1 deg.  If it does not, the URDF base
+rotation or the TCP offset is wrong and every downstream Jacobian is wrong.
+
+Two robot comparisons (both use rm_get_current_arm_state + rm_get_current_tool_frame):
+
+* flange  (default, tool-agnostic): recover the base->flange (link_7) transform
+  from the reported base->tool pose and the active tool offset, then compare to
+  Pinocchio's link_7 FK.  Validates the 7-DOF arm chain independent of any tool.
+* tcp     : compare Pinocchio's `tcp` frame FK (link_7 +0.220 m Z) directly to
+  the reported base->tool pose.  Requires the ACTIVE Realman tool frame to be the
+  matching +220 mm tool; otherwise it will (correctly) report the offset mismatch.
+
+Usage (source env.sh first):
+    # read-only single-shot at the current configuration
+    python -m rm75_control.control.joint_admittance.validation --ip 192.168.1.18
+
+    # drive fixed MoveJ points from a poses yaml and assert thresholds
+    python -m rm75_control.control.joint_admittance.validation \
+        --ip 192.168.1.18 --poses tmp/force_compensation/config/poses.yaml --move
+
+    # offline: compare recorded (q_deg, pose) pairs, no robot
+    python -m rm75_control.control.joint_admittance.validation --npz run.npz
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+
+import numpy as np
+from scipy.spatial.transform import Rotation as Rsc
+
+from rm75_control.control.joint_admittance.model import RobotKinematics, deg2rad, pose_distance
+
+POS_TOL_MM = 1.0
+ROT_TOL_DEG = 0.1
 
 
-def apply_tool_z_spin_pose(pose_ref: np.ndarray, phi_rad: float) -> np.ndarray:
-    """Rotate pose_ref orientation by phi about tool +Z (base-frame axis)."""
-    from scipy.spatial.transform import Rotation as Rsc
+def pose_to_se3(pose6: np.ndarray, euler_order: str = "xyz"):
+    """[x,y,z,rx,ry,rz] -> (t(3), R(3x3))."""
+    pose6 = np.asarray(pose6, dtype=float)
+    t = pose6[:3].copy()
+    R = Rsc.from_euler(euler_order, pose6[3:6], degrees=False).as_matrix()
+    return t, R
 
-    pose = np.asarray(pose_ref, dtype=float).copy()
-    if abs(phi_rad) < 1e-12:
-        return pose
-    r0 = Rsc.from_euler("xyz", pose_ref[3:6], degrees=False).as_matrix()
-    axis = r0[:, 2]
-    r_d = Rsc.from_rotvec(axis * phi_rad).as_matrix() @ r0
-    pose[3:6] = Rsc.from_matrix(r_d).as_euler("xyz", degrees=False)
+
+def se3_to_pose(t: np.ndarray, R: np.ndarray, euler_order: str = "xyz") -> np.ndarray:
+    pose = np.zeros(6, dtype=float)
+    pose[:3] = t
+    pose[3:6] = Rsc.from_matrix(R).as_euler(euler_order, degrees=False)
     return pose
 
 
-def tool_z_spin_vel_base(pose_ref: np.ndarray, t_s: float, *, rz_amp_deg: float, omega: float,
-                         soft_start: bool, ramp_s: float) -> np.ndarray:
-    """Sinusoidal spin about tool +Z → base-frame angular velocity (small-angle)."""
-    from scipy.spatial.transform import Rotation as Rsc
-
-    if rz_amp_deg <= 0.0:
-        return np.zeros(3)
-    ramp = 1.0
-    if soft_start and ramp_s > 0.0 and t_s < ramp_s:
-        ramp = math.sin(0.5 * math.pi * t_s / ramp_s)
-    wz_tool = math.radians(rz_amp_deg) * omega * math.cos(omega * t_s) * ramp
-    r_mat = Rsc.from_euler("xyz", pose_ref[3:6], degrees=False).as_matrix()
-    return r_mat @ np.array([0.0, 0.0, wz_tool], dtype=float)
+def se3_inv(t: np.ndarray, R: np.ndarray):
+    Rt = R.T
+    return -Rt @ t, Rt
 
 
-class TrajectoryGenerator:
-    """
-    Built-in trajectory kinds (demos). Each sample() returns full 6D base-frame
-    (pose_d, vel_ff). Drop tool-Z from vel_ff externally if desired; force hybrid
-    fills tool-Z via force_axes.
-    """
+def se3_mul(ta, Ra, tb, Rb):
+    return ta + Ra @ tb, Ra @ Rb
 
-    def __init__(self, cfg: TrajectoryConfig, pose0: np.ndarray, robot) -> None:
-        self.cfg = cfg
-        self.pose0 = np.asarray(pose0, dtype=float)
-        self.robot = robot
-        amp_m = cfg.half_amplitude_m
-        if cfg.period_s is None:
-            period = sin_period_for_peak_vel(amp_m, cfg.y_max_vel_cm_s / 100.0)
-        else:
-            period = float(cfg.period_s)
-        self.omega = 2.0 * math.pi / period if period > 0 else 0.0
-        self.amplitude_m = amp_m
 
-    def set_origin(self, pose0: np.ndarray) -> None:
-        self.pose0 = np.asarray(pose0, dtype=float).copy()
+def pose_diff(pose_a: np.ndarray, pose_b: np.ndarray, euler_order: str = "xyz") -> tuple[float, float]:
+    """Return (position error mm, orientation error deg) between two pose6."""
+    return pose_distance(pose_a, pose_b, euler_order)
 
-    def sample(self, t_s: float) -> TrajectorySample:
-        kind = self.cfg.kind
-        if kind == "hold":
-            return TrajectorySample(self.pose0.copy(), np.zeros(6))
 
-        if kind in ("sin_base_y", "sin_base_y_tool_rz"):
-            return self._sin_base_y(t_s, spin=(kind == "sin_base_y_tool_rz"))
+def base_flange_from_tool(tool_pose: np.ndarray, tool_offset: np.ndarray, euler_order: str = "xyz") -> np.ndarray:
+    """base->flange = base->tool * (flange->tool)^-1."""
+    tb, Rb = pose_to_se3(tool_pose, euler_order)
+    to, Ro = pose_to_se3(tool_offset, euler_order)
+    ti, Ri = se3_inv(to, Ro)
+    tf, Rf = se3_mul(tb, Rb, ti, Ri)
+    return se3_to_pose(tf, Rf, euler_order)
 
-        if kind == "sin_tool_y":
-            return self._sin_tool_y(t_s)
 
-        raise ValueError(f"Unknown trajectory type: {kind}")
+def _summary(rows: list[dict]) -> dict:
+    max_mm = max((r["pos_mm"] for r in rows), default=0.0)
+    max_deg = max((r["rot_deg"] for r in rows), default=0.0)
+    ok = max_mm < POS_TOL_MM and max_deg < ROT_TOL_DEG
+    return {"max_mm": max_mm, "max_deg": max_deg, "ok": ok, "n": len(rows)}
 
-    def _sin_base_y(self, t_s: float, *, spin: bool) -> TrajectorySample:
-        dy, vy = sin_y_motion(
-            t_s, self.amplitude_m, self.omega,
-            soft_start=self.cfg.soft_start, ramp_s=self.cfg.ramp_s,
-        )
-        pose = self.pose0.copy()
-        pose[1] += dy
-        if spin:
-            phi = tool_z_spin_angle_rad(
-                t_s,
-                rz_amp_deg=self.cfg.rz_amplitude_deg,
-                omega=self.omega,
-                soft_start=self.cfg.soft_start,
-                ramp_s=self.cfg.ramp_s,
+
+def _print_rows(rows: list[dict], mode: str) -> None:
+    print(f"\n  {mode} comparison (Pinocchio vs Realman):", flush=True)
+    print("   idx |  pos err (mm) | rot err (deg)", flush=True)
+    for r in rows:
+        flag = "" if (r["pos_mm"] < POS_TOL_MM and r["rot_deg"] < ROT_TOL_DEG) else "  <-- FAIL"
+        print(f"   {r['idx']:>3} | {r['pos_mm']:>11.4f} | {r['rot_deg']:>11.5f}{flag}", flush=True)
+
+
+def compare_offline(npz_path: str, kin: RobotKinematics, frame: str) -> dict:
+    data = np.load(npz_path)
+    q_deg = np.asarray(data["q_deg"] if "q_deg" in data else data["joint"], dtype=float)
+    pose = np.asarray(data["pose"], dtype=float)
+    if q_deg.ndim == 1:
+        q_deg = q_deg[None, :]
+        pose = pose[None, :]
+    rows = []
+    for i in range(len(q_deg)):
+        q = deg2rad(q_deg[i][:7])
+        fk = kin.fk_pose(q) if frame == "tcp" else kin.frame_pose(q, frame)
+        d_mm, d_deg = pose_diff(fk, pose[i][:6], kin.euler_order)
+        rows.append({"idx": i, "pos_mm": d_mm, "rot_deg": d_deg})
+    _print_rows(rows, f"offline[{frame}]")
+    return _summary(rows)
+
+
+def _read_state(robot) -> tuple[np.ndarray, np.ndarray]:
+    ret, st = robot.rm_get_current_arm_state()
+    if ret != 0:
+        raise RuntimeError(f"rm_get_current_arm_state failed: {ret}")
+    q_deg = np.asarray(st["joint"][:7], dtype=float)
+    pose = np.asarray(st["pose"][:6], dtype=float)
+    return q_deg, pose
+
+
+def _read_tool_offset(robot) -> tuple[str, np.ndarray]:
+    ret, tf = robot.rm_get_current_tool_frame()
+    if ret != 0:
+        raise RuntimeError(f"rm_get_current_tool_frame failed: {ret}")
+    return str(tf.get("name", "?")), np.asarray(tf["pose"][:6], dtype=float)
+
+
+def compare_once(robot, kin: RobotKinematics, mode: str, idx: int, *, verbose: bool = False) -> dict:
+    q_deg, tool_pose = _read_state(robot)
+    q = deg2rad(q_deg)
+    row: dict = {"idx": idx, "q_deg": q_deg.tolist()}
+
+    if mode == "tcp":
+        fk = kin.fk_pose(q)
+        d_mm, d_deg = pose_diff(fk, tool_pose, kin.euler_order)
+        row.update(pos_mm=d_mm, rot_deg=d_deg)
+    elif mode == "rm_fk":
+        fk = kin.fk_pose(q)
+        rm_fk = np.asarray(robot.rm_algo_forward_kinematics(q_deg.tolist(), flag=1)[:6], dtype=float)
+        d_mm, d_deg = pose_diff(fk, rm_fk, kin.euler_order)
+        row.update(pos_mm=d_mm, rot_deg=d_deg, rm_fk=rm_fk.tolist())
+    else:  # flange
+        _tool_name, tool_offset = _read_tool_offset(robot)
+        flange_meas = base_flange_from_tool(tool_pose, tool_offset, kin.euler_order)
+        fk = kin.frame_pose(q, "link_7")
+        d_mm, d_deg = pose_diff(fk, flange_meas, kin.euler_order)
+        row.update(pos_mm=d_mm, rot_deg=d_deg, flange_meas=flange_meas.tolist(), fk_link7=fk.tolist())
+        if verbose:
+            r_mat = Rsc.from_euler(kin.euler_order, fk[3:6], degrees=False).as_matrix()
+            delta_base = np.asarray(flange_meas[:3], dtype=float) - np.asarray(fk[:3], dtype=float)
+            delta_link7 = r_mat.T @ delta_base
+            row["flange_delta_link7_mm"] = (delta_link7 * 1000.0).tolist()
+            print(
+                f"  [{idx}] flange offset in link_7 frame (mm): "
+                f"{np.round(delta_link7 * 1000.0, 3).tolist()}  |Δ|={d_mm:.3f} mm",
+                flush=True,
             )
-            pose = apply_tool_z_spin_pose(pose, phi)
-        vel = np.zeros(6, dtype=float)
-        vel[1] = vy
-        if spin:
-            vel[3:6] = tool_z_spin_vel_base(
-                self.pose0, t_s,
-                rz_amp_deg=self.cfg.rz_amplitude_deg,
-                omega=self.omega,
-                soft_start=self.cfg.soft_start,
-                ramp_s=self.cfg.ramp_s,
-            )
-        return TrajectorySample(pose, vel)
-
-    def _sin_tool_y(self, t_s: float) -> TrajectorySample:
-        dy, vy = sin_y_motion(
-            t_s, self.amplitude_m, self.omega,
-            soft_start=self.cfg.soft_start, ramp_s=self.cfg.ramp_s,
-        )
-        pose = np.asarray(
-            tool_offset_pose(self.robot, list(self.pose0), 0.0, dy, 0.0), dtype=float
-        )
-        r_mat = Rsc.from_euler("xyz", pose[3:6], degrees=False).as_matrix()
-        vel = np.zeros(6, dtype=float)
-        vel[:3] = r_mat @ np.array([0.0, vy, 0.0], dtype=float)
-        return TrajectorySample(pose, vel)
-
-    @classmethod
-    def from_dict(cls, raw: dict, pose0: np.ndarray, robot) -> TrajectoryGenerator:
-        t = raw.get("trajectory", {})
-        ps = t.get("period_s")
-        y_pp_cm = t.get("y_peak_to_peak_cm")
-        return cls(
-            TrajectoryConfig(
-                kind=str(t.get("type", "hold")),
-                amplitude_mm=float(t.get("amplitude_mm", 5.0)),
-                y_peak_to_peak_cm=float(y_pp_cm) if y_pp_cm is not None else None,
-                period_s=float(ps) if ps is not None else None,
-                y_max_vel_cm_s=float(t.get("y_max_vel_cm_s", 1.0)),
-                soft_start=bool(t.get("soft_start", False)),
-                ramp_s=float(t.get("ramp_s", 2.0)),
-                rz_amplitude_deg=float(t.get("rz_amplitude_deg", 0.0)),
-            ),
-            pose0,
-            robot,
-        )
-```
-
-## `rm75_control/control/velocity_admittance/observer.py`
-
-```python
-"""Compensated external wrench from rolling pose/force buffer + phi."""
-
-from __future__ import annotations
-
-import json
-from collections import deque
-from dataclasses import dataclass, field
-from pathlib import Path
-
-import numpy as np
-import yaml
-
-from rm75_control.force.compensation import regressor as fid
-from rm75_control.force.compensation.paths import CONFIG_FORCE, PHI_JSON
+    return row
 
 
-@dataclass
-class ForceObserverConfig:
-    phi_path: Path = PHI_JSON
-    phi_source: str = "phi_recommended"
-    force_sensor: Path = CONFIG_FORCE
-    fc_hz: float = 2.5
-    buffer_s: float = 4.0
-    min_samples: int = 35
-    use_inertia: bool = False
-    poll_hz: float = 100.0
+def run_robot(args, kin: RobotKinematics) -> dict:
+    from rm75_control.core.session import RobotSession
+
+    modes = ["flange", "tcp", "rm_fk"] if args.all_modes else [args.mode]
+    summaries: dict[str, dict] = {}
+
+    with RobotSession(ip=args.ip, port=args.port) as sess:
+        robot = sess.robot
+        tool_name, tool_offset = _read_tool_offset(robot)
+        print(f"  active Realman tool frame: {tool_name!r}  offset={np.round(tool_offset, 5).tolist()}", flush=True)
+
+        for mode in modes:
+            if mode == "tcp":
+                print(
+                    "  NOTE: --mode tcp compares Pinocchio tcp vs state.pose (active tool).",
+                    flush=True,
+                )
+            if mode == "rm_fk":
+                print(
+                    "  NOTE: --mode rm_fk compares Pinocchio tcp vs rm_algo_forward_kinematics.",
+                    flush=True,
+                )
+
+            rows: list[dict] = []
+            if args.move and args.poses:
+                targets = _load_pose_targets(args.poses)
+                print(f"  driving {len(targets)} MoveJ points from {args.poses} [{mode}]", flush=True)
+                for i, q_tgt in enumerate(targets):
+                    sess.move_joints(q_tgt, velocity_percent=args.speed, block=1)
+                    time.sleep(0.6)
+                    rows.append(compare_once(robot, kin, mode, i, verbose=args.verbose))
+            else:
+                print(f"  read-only: comparing at the current configuration [{mode}]", flush=True)
+                rows.append(compare_once(robot, kin, mode, 0, verbose=args.verbose))
+
+            _print_rows(rows, f"robot[{mode}]")
+            summaries[mode] = _summary(rows)
+
+            if mode == "flange" and rows and not summaries[mode]["ok"]:
+                deltas = [r.get("flange_delta_link7_mm") for r in rows if "flange_delta_link7_mm" in r]
+                if deltas:
+                    mean_mm = np.mean(np.asarray(deltas, dtype=float), axis=0)
+                    print(
+                        f"  mean flange offset pin->rm in link_7 frame (mm): "
+                        f"{np.round(mean_mm, 3).tolist()}  |mean|={np.linalg.norm(mean_mm):.3f} mm",
+                        flush=True,
+                    )
+                    print(
+                        "  If |mean| is constant across poses, fix joint_7 origin y in the URDF "
+                        "(vendor -172.5 mm vs Realman ~-161.2 mm).",
+                        flush=True,
+                    )
+
+    if len(summaries) == 1:
+        return next(iter(summaries.values()))
+    ok = all(s["ok"] for s in summaries.values())
+    max_mm = max(s["max_mm"] for s in summaries.values())
+    max_deg = max(s["max_deg"] for s in summaries.values())
+    n = sum(s["n"] for s in summaries.values())
+    return {"max_mm": max_mm, "max_deg": max_deg, "ok": ok, "n": n, "by_mode": summaries}
 
 
-@dataclass
-class ForceSampleBuffer:
-    max_len: int
-    t: deque = field(default_factory=deque)
-    pose: deque = field(default_factory=deque)
-    force: deque = field(default_factory=deque)
+def _load_pose_targets(poses_yaml: str) -> list[np.ndarray]:
+    import yaml
 
-    def __post_init__(self) -> None:
-        self.t = deque(maxlen=self.max_len)
-        self.pose = deque(maxlen=self.max_len)
-        self.force = deque(maxlen=self.max_len)
-
-    def append(self, t_s: float, pose6: np.ndarray, force6: np.ndarray) -> None:
-        self.t.append(t_s)
-        self.pose.append(np.asarray(pose6, dtype=float))
-        self.force.append(np.asarray(force6, dtype=float))
-
-    def __len__(self) -> int:
-        return len(self.t)
-
-
-class CompensatedForceObserver:
-    def __init__(self, cfg: ForceObserverConfig) -> None:
-        self._fid = fid
-        self.cfg = cfg
-        self.phi = self._load_phi(cfg.phi_path, cfg.phi_source)
-        self.frame = fid.FrameConfig.from_yaml(cfg.force_sensor)
-        max_len = max(cfg.min_samples + 5, int(cfg.buffer_s * cfg.poll_hz) + 5)
-        self.buf = ForceSampleBuffer(max_len=max_len)
-
-    @staticmethod
-    def _load_phi(path: Path, source: str) -> np.ndarray:
-        data = json.loads(path.read_text())
-        if source not in data:
-            raise SystemExit(f"Key '{source}' not in {path}")
-        return np.array([data[source][k] for k in fid.PHI_NAMES])
-
-    def append(self, t_s: float, pose6: np.ndarray, force_raw: np.ndarray) -> None:
-        self.buf.append(t_s, pose6, force_raw)
-
-    def ready(self) -> bool:
-        return len(self.buf) >= self.cfg.min_samples
-
-    def latest_wrench(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """
-        Return (signed_filtered_raw, f_ext).
-
-        f_ext is computed in the sensor frame (phi regressor). With
-        sensor_offset_euler=0 and TCP offset a pure translation, linear
-        f_ext[0:3] matches tool-frame force components — use f_ext[2] as tool-Z.
-        """
-        if not self.ready():
-            return None
-        t = np.asarray(self.buf.t)
-        pose = np.asarray(self.buf.pose)
-        force = np.asarray(self.buf.force)
-        W, Y = self._fid.build_dataset(
-            pose, force, t, self.frame, fc=self.cfg.fc_hz, use_inertia=self.cfg.use_inertia
-        )
-        k = len(t) - 1
-        sl = slice(6 * k, 6 * k + 6)
-        raw_show = Y[sl].copy()
-        f_ext = (Y[sl] - W[sl] @ self.phi).reshape(6)
-        return raw_show, f_ext
-
-    @classmethod
-    def from_yaml(cls, raw: dict) -> CompensatedForceObserver:
-        f = raw.get("force", {})
-        fc_cfg = float(yaml.safe_load(CONFIG_FORCE.read_text()).get("filtfilt_cutoff_hz", 2.5))
-        fc_hz = float(f.get("fc_hz", fc_cfg))
-        timing = raw.get("timing", {})
-        dt_ms = float(timing.get("dt_ms", 10.0))
-        return cls(
-            ForceObserverConfig(
-                phi_path=PHI_JSON,
-                phi_source=str(f.get("phi_source", "phi_recommended")),
-                fc_hz=fc_hz,
-                buffer_s=float(f.get("buffer_s", 4.0)),
-                min_samples=int(f.get("min_samples", 35)),
-                use_inertia=bool(f.get("use_inertia", False)),
-                poll_hz=1000.0 / dt_ms,
-            )
-        )
-```
-
-## `rm75_control/control/velocity_admittance/scan_log.py`
-
-```python
-"""High-rate scan log: target trajectory vs actual encoder feedback."""
-
-from __future__ import annotations
-
-import time
-from pathlib import Path
-
-import numpy as np
-
-from rm75_control.control.velocity_admittance.paths import VA_DATA_DIR
+    with open(poses_yaml, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    targets: list[np.ndarray] = []
+    # Accept either {poses: {a: {q_deg: [...]}, ...}} or {slots: [...]} or a plain list.
+    src = data.get("poses", data.get("slots", data))
+    if isinstance(src, dict):
+        for _k, rec in src.items():
+            if isinstance(rec, dict) and "q_deg" in rec:
+                targets.append(np.asarray(rec["q_deg"][:7], dtype=float))
+    elif isinstance(src, list):
+        for rec in src:
+            if isinstance(rec, dict) and "q_deg" in rec:
+                targets.append(np.asarray(rec["q_deg"][:7], dtype=float))
+            elif isinstance(rec, (list, tuple)):
+                targets.append(np.asarray(rec[:7], dtype=float))
+    if not targets:
+        raise SystemExit(f"no q_deg pose targets found in {poses_yaml}")
+    return targets
 
 
-LOG_DIR = VA_DATA_DIR / "logs"
-_GROW = 512
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Pinocchio-vs-Realman FK validation")
+    ap.add_argument("--ip", default="192.168.1.18")
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--mode", choices=["flange", "tcp", "rm_fk"], default="flange")
+    ap.add_argument("--all-modes", action="store_true", help="run flange + tcp + rm_fk in one session")
+    ap.add_argument("--verbose", action="store_true", help="print per-pose flange offset in link_7 frame")
+    ap.add_argument("--poses", default=None, help="poses yaml with q_deg entries")
+    ap.add_argument("--move", action="store_true", help="drive MoveJ to each pose (needs --poses)")
+    ap.add_argument("--speed", type=int, default=20, help="MoveJ velocity percent")
+    ap.add_argument("--urdf", default=None, help="override URDF path")
+    ap.add_argument("--npz", default=None, help="offline: compare recorded q_deg/pose arrays")
+    args = ap.parse_args()
 
+    kin = RobotKinematics(urdf_path=args.urdf)
+    print(f"Loaded URDF: {kin.urdf_path}", flush=True)
 
-class ScanLogRecorder:
-    """Pre-allocated ring growth — minimal per-tick overhead."""
+    if args.npz:
+        frame = "tcp" if args.mode == "tcp" else "link_7"
+        summ = compare_offline(args.npz, kin, frame)
+    else:
+        summ = run_robot(args, kin)
 
-    def __init__(self, *, capacity: int = 4096) -> None:
-        self._cap = capacity
-        self._n = 0
-        self.t_s = np.zeros(capacity, dtype=float)
-        self.t_scan = np.full(capacity, np.nan, dtype=float)
-        self.phase = np.zeros(capacity, dtype=np.int8)
-        self.pose_act = np.zeros((capacity, 6), dtype=float)
-        self.q_deg = np.zeros((capacity, 7), dtype=float)
-        self.pose_d = np.zeros((capacity, 6), dtype=float)
-        self.vel_ff = np.zeros((capacity, 6), dtype=float)
-        self.v_cmd = np.zeros((capacity, 6), dtype=float)
-        self.f_ext = np.zeros((capacity, 6), dtype=float)
-        self.f_des_z = np.zeros(capacity, dtype=float)
-
-    def __len__(self) -> int:
-        return self._n
-
-    def _grow(self) -> None:
-        new_cap = self._cap + _GROW
-        for name in (
-            "t_s", "t_scan", "phase", "f_des_z",
-        ):
-            old = getattr(self, name)
-            ext = np.zeros(new_cap, dtype=old.dtype)
-            ext[: self._cap] = old
-            if name == "t_scan":
-                ext[self._cap :] = np.nan
-            setattr(self, name, ext)
-        for name in ("pose_act", "pose_d", "vel_ff", "v_cmd", "f_ext"):
-            old = getattr(self, name)
-            ext = np.zeros((new_cap, 6), dtype=float)
-            ext[: self._cap] = old
-            setattr(self, name, ext)
-        old = self.q_deg
-        ext = np.zeros((new_cap, 7), dtype=float)
-        ext[: self._cap] = old
-        self.q_deg = ext
-        self._cap = new_cap
-
-    def append_row(
-        self,
-        *,
-        t_s: float,
-        t_scan: float,
-        phase: int,
-        pose_act: np.ndarray,
-        q_deg: np.ndarray,
-        pose_d: np.ndarray,
-        vel_ff: np.ndarray,
-        v_cmd: np.ndarray,
-        f_ext: np.ndarray,
-        f_des_z: float,
-    ) -> None:
-        if self._n >= self._cap:
-            self._grow()
-        i = self._n
-        self.t_s[i] = t_s
-        self.t_scan[i] = t_scan
-        self.phase[i] = phase
-        self.pose_act[i] = pose_act
-        self.q_deg[i] = q_deg
-        self.pose_d[i] = pose_d
-        self.vel_ff[i] = vel_ff
-        self.v_cmd[i] = v_cmd
-        self.f_ext[i] = f_ext
-        self.f_des_z[i] = f_des_z
-        self._n += 1
-
-    def save(self, path: Path, *, meta: dict | None = None) -> Path:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        n = self._n
-        if n == 0:
-            raise ValueError("ScanLogRecorder: no samples")
-        pack = {
-            "t_s": self.t_s[:n].copy(),
-            "t_scan": self.t_scan[:n].copy(),
-            "phase": self.phase[:n].copy(),
-            "pose_act": self.pose_act[:n].copy(),
-            "q_deg": self.q_deg[:n].copy(),
-            "pose_d": self.pose_d[:n].copy(),
-            "vel_ff": self.vel_ff[:n].copy(),
-            "v_cmd": self.v_cmd[:n].copy(),
-            "f_ext": self.f_ext[:n].copy(),
-            "f_des_z": self.f_des_z[:n].copy(),
-        }
-        if meta:
-            pack["meta_json"] = np.array([str(meta)])
-        np.savez_compressed(path, **pack)
-        return path
-
-
-def default_log_path(prefix: str = "admittance") -> Path:
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    return LOG_DIR / f"{prefix}_{stamp}.npz"
-
-
-def load_scan_log(path: Path) -> dict[str, np.ndarray]:
-    with np.load(path, allow_pickle=False) as z:
-        return {k: z[k] for k in z.files}
-
-
-def scan_origin_r(pose_act: np.ndarray, scan_mask: np.ndarray) -> tuple[int, np.ndarray, np.ndarray]:
-    """Scan ON index, pose0, and R0 (tool orientation in world at scan start)."""
-    from scipy.spatial.transform import Rotation as Rsc
-
-    idx = np.where(scan_mask)[0]
-    if len(idx) == 0:
-        return 0, pose_act[0].copy(), np.eye(3)
-    si = int(idx[0])
-    pose0 = pose_act[si].copy()
-    r0 = Rsc.from_euler("xyz", pose0[3:6], degrees=False).as_matrix()
-    return si, pose0, r0
-
-
-def world_delta_mm(pose: np.ndarray, pose0: np.ndarray) -> np.ndarray:
-    """TCP linear displacement vs scan origin, in world frame (mm)."""
-    return (pose[:, :3] - pose0[:3]) * 1000.0
-
-
-def tool_y_world_scalar_mm(delta_world_mm: np.ndarray, r0: np.ndarray) -> np.ndarray:
-    """Tool-Y scan progress: world displacement projected onto tool +Y at scan ON."""
-    e_scan = r0[:, 1]
-    return delta_world_mm @ e_scan
-
-
-def scan_tracking_world_mm(
-    pose_d: np.ndarray,
-    pose_act: np.ndarray,
-    *,
-    scan_mask: np.ndarray,
-) -> dict[str, np.ndarray]:
-    """
-    Decoupled scan tracking in world frame.
-
-    Compare commanded vs actual TCP world deltas from scan origin. TCP-Z is force-controlled:
-    use scan-axis scalar (tool-Y in world @ scan0) and world-XY cross-track, not world-Z.
-    """
-    si, pose0, r0 = scan_origin_r(pose_act, scan_mask)
-    d_cmd = world_delta_mm(pose_d, pose0)
-    d_act = world_delta_mm(pose_act, pose0)
-    s_cmd = tool_y_world_scalar_mm(d_cmd, r0)
-    s_act = tool_y_world_scalar_mm(d_act, r0)
-    dxy_err = (d_cmd[:, :2] - d_act[:, :2])
-    return {
-        "d_cmd_mm": d_cmd,
-        "d_act_mm": d_act,
-        "s_cmd_mm": s_cmd,
-        "s_act_mm": s_act,
-        "scan_track_err_mm": s_cmd - s_act,
-        "world_xy_err_mm": np.linalg.norm(dxy_err, axis=1),
-        "scan_idx": si,
-        "r0": r0,
-    }
-
-
-def print_jerk_summary(path: Path, *, dt_s: float) -> None:
-    """Print v_cmd / pose tracking diagnostics to separate planner vs execution."""
-    data = load_scan_log(path)
-    t = data["t_s"]
-    v = data["v_cmd"]
-    pose_act = data["pose_act"]
-    pose_d = data["pose_d"]
-    phase = data["phase"]
-    n = len(t)
-    if n < 3:
-        print(f"  log summary: too few samples ({n})", flush=True)
-        return
-
-    dv = np.diff(v, axis=0) / np.maximum(np.diff(t)[:, None], 1e-6)
-    jerk_proxy = np.diff(dv, axis=0) / np.maximum(np.diff(t)[1:, None], 1e-6)
-    scan_mask = phase >= 2
-    mask = scan_mask if np.any(scan_mask) else np.ones(n, dtype=bool)
-
-    idx = np.where(mask)[0]
-    idx = idx[(idx > 0) & (idx < n - 2)]
-    if len(idx) == 0:
-        idx = np.arange(1, min(n - 2, n))
-
-    finite_dv = np.isfinite(dv).all(axis=1)
-    finite_jk = np.isfinite(jerk_proxy).all(axis=1) if len(jerk_proxy) else np.array([True])
-    idx_dv = idx[np.isin(idx - 1, np.where(finite_dv)[0])]
-    idx_jk = idx[np.isin(idx - 2, np.where(finite_jk)[0])]
-
-    dv_n = np.linalg.norm(dv[idx_dv - 1], axis=1) if len(idx_dv) else np.array([0.0])
-    jk_n = (
-        np.linalg.norm(jerk_proxy[idx_jk - 2], axis=1)
-        if len(idx_jk) and len(jerk_proxy)
-        else np.array([0.0])
-    )
-
-    tr = scan_tracking_world_mm(pose_d, pose_act, scan_mask=mask)
-    idx_scan = np.where(mask)[0]
-    s_cmd = tr["s_cmd_mm"][idx_scan] if len(idx_scan) else np.array([0.0])
-    s_act = tr["s_act_mm"][idx_scan] if len(idx_scan) else np.array([0.0])
-    scan_track = np.abs(tr["scan_track_err_mm"][idx_scan]) if len(idx_scan) else np.array([0.0])
-    xy_cross = tr["world_xy_err_mm"][idx_scan] if len(idx_scan) else np.array([0.0])
-
-    loop_dt = np.diff(t[scan_mask]) * 1000.0 if np.any(scan_mask) else np.diff(t) * 1000.0
-    loop_dt = loop_dt[np.isfinite(loop_dt)]
-
-    print("\n=== scan log summary ===", flush=True)
-    print(f"  file: {path}", flush=True)
-    print(f"  samples={n}  scan_samples={int(np.sum(scan_mask))}  dt_nom={dt_s*1000:.1f}ms", flush=True)
-    if len(loop_dt):
-        print(
-            f"  loop dt ms: median={float(np.median(loop_dt)):.2f}  "
-            f"max={float(np.max(loop_dt)):.2f}  "
-            f">15ms={int(np.sum(loop_dt > 15))}/{len(loop_dt)}",
-            flush=True,
-        )
     print(
-        f"  |dv_cmd| max={float(np.nanmax(dv_n)) if len(dv_n) else 0:.4f} m/s²  "
-        f"p95={float(np.nanpercentile(dv_n, 95)) if len(dv_n) else 0:.4f}  "
-        f"|jerk_proxy| max={float(np.nanmax(jk_n)) if len(jk_n) else 0:.2f}",
+        f"\n  RESULT: max pos {summ['max_mm']:.4f} mm | max rot {summ['max_deg']:.5f} deg "
+        f"over {summ['n']} pose(s)  ->  {'PASS' if summ['ok'] else 'FAIL'}"
+        f"  (tol {POS_TOL_MM} mm / {ROT_TOL_DEG} deg)",
         flush=True,
     )
-    if len(idx_scan):
-        print(
-            f"  tool-Y world (scan axis @ scan0): track err max={float(np.max(scan_track)):.2f} mm  "
-            f"p95={float(np.percentile(scan_track, 95)):.2f} mm  "
-            f"(world-Z decoupled — force axis)",
-            flush=True,
-        )
-        print(
-            f"  tool-Y world stroke  cmd [{float(s_cmd.min()):+.1f}, {float(s_cmd.max()):+.1f}] mm  "
-            f"act [{float(s_act.min()):+.1f}, {float(s_act.max()):+.1f}] mm  "
-            f"world-XY |Δcmd−Δact| p95={float(np.percentile(xy_cross, 95)):.2f} mm",
-            flush=True,
-        )
-        print(
-            "  (large world track err + smooth v_cmd tool-Y → execution/contact slip)",
-            flush=True,
-        )
-    for axis, name in enumerate(["vx", "vy", "vz", "wx", "wy", "wz"]):
-        col = v[scan_mask, axis] if np.any(scan_mask) else v[:, axis]
-        col = col[np.isfinite(col)]
-        if len(col) < 2:
-            continue
-        dcol = np.diff(col) / dt_s
-        dcol = dcol[np.isfinite(dcol)]
-        if len(dcol) == 0:
-            continue
-        spikes = int(np.sum(np.abs(dcol) > 3.0 * float(np.std(dcol) + 1e-9)))
-        print(
-            f"  v_cmd {name}: std={float(np.std(col)):.5f}  "
-            f"|dv/dt| max={float(np.max(np.abs(dcol))):.4f}  spikes(>3σ)={spikes}",
-            flush=True,
-        )
+    if not summ["ok"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-## `rm75_control/control/velocity_admittance/loop.py`
+## FILE: `rm75_control/control/joint_admittance/loop.py`
 
-```python
-"""Shared velocity-admittance control loop."""
+```py
+"""Joint-space inner loop: Cartesian twist -> absolute joint angles (rm_movej_canfd).
+
+Two layers:
+
+* ``JointIkController`` - the reusable, hardware-free inner loop.  Given the last
+  commanded joint state and a Cartesian twist, it runs CLIK (DLS + nullspace),
+  integrates, smooths and safety-clamps, and returns the next joint command.
+  This is what the offline sim validation exercises.
+
+* ``run_joint_admittance_loop`` - the on-robot orchestration.  It reuses the
+  task-space admittance outer loop (hybrid_motion.AdmittanceController) plus the
+  compensated force observer and the async state reader, feeds the outer twist
+  into ``JointIkController`` every tick, and streams the result through
+  ``rm_movej_canfd`` on an absolute perf_counter schedule.  It NEVER calls a
+  MoveV/MoveJ mode switch during the loop - the only motion interface is the
+  joint CANFD passthrough (a single ``move_j`` positions the arm at start).
+"""
 
 from __future__ import annotations
 
+import os
 import time
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Protocol
 
 import numpy as np
-import yaml
 from scipy.spatial.transform import Rotation as Rsc
 
-from rm75_control.force.compensation.collection import load_slot, move_j, wait_settle
-from rm75_control.force.compensation.id_config import load_config
-from rm75_control.force.compensation.paths import CONFIG_ID
-from rm75_control.motion.canfd import send_velocity_canfd
-
-from .async_state import AsyncStateObserver
-from .controller import AdmittanceConfig, AdmittanceController, pose_error, wrap_pi
-from .observer import CompensatedForceObserver
-from .paths import CONFIG_ROBOT, PHI_JSON
-from .scan_log import ScanLogRecorder, default_log_path, print_jerk_summary
-from .trajectory import TrajectoryGenerator, sin_period_for_peak_vel
-
-
-def load_yaml(path: Path) -> dict:
-    return yaml.safe_load(path.read_text()) or {}
-
-
-def prepare_canfd_velocity_session(
-    bot,
-    *,
-    settle_s: float = 0.5,
-    clear_errors: bool = False,
-) -> dict:
-    """Full recover_controller before movev init — use only when stuck in force/plan mode."""
-    return bot.recover_controller(
-        settle_s=settle_s,
-        clear_errors=clear_errors,
-        probe_force_stream=False,
-    )
+from rm75_control.control.joint_admittance.clik import ClikConfig, ClikController
+from rm75_control.control.joint_admittance.model import (
+    RobotKinematics,
+    deg2rad,
+    pose_distance,
+    pose_error,
+    rad2deg,
+)
+from rm75_control.control.joint_admittance.tasks.nullspace_task import (
+    JointCenteringTask,
+    NullspaceTaskConfig,
+)
+from rm75_control.control.joint_admittance.utils.friction import (
+    FrictionCompensator,
+    FrictionConfig,
+)
+from rm75_control.control.joint_admittance.utils.safety import (
+    SafetyLimiter,
+    SafetyLimits,
+    Watchdog,
+)
+from rm75_control.control.joint_admittance.utils.smoothing import SecondOrderLowPass
 
 
-def idle_before_movev_init(
-    robot,
-    *,
-    mode: str = "light",
-    extra_settle_s: float = 0.0,
-) -> None:
-    """
-    Idle before rm_set_movev_canfd_init.
-
-    Modes (see tmp/Velocity_control/run_sin_tool_y.py):
-      skip     — init immediately (lowest snap if already idle after move_j)
-      minimal  — delete_traj only, no slow_stop (after move_j settle)
-      light    — slow_stop + delete_traj (run_sin_tool_y default)
-      full     — use prepare_canfd_velocity_session instead (avoid after move_j)
-    """
-    m = mode.lower()
-    if m in ("skip", "none", "false", "0"):
-        return
-    if m in ("light", "slow_stop"):
-        robot.rm_set_arm_slow_stop()
-        time.sleep(0.3)
-    try:
-        robot.rm_set_arm_delete_trajectory()
-    except Exception:
-        pass
-    time.sleep(0.2)
-    if extra_settle_s > 0.0:
-        time.sleep(extra_settle_s)
+# ---------------------------------------------------------------------------
+# Inner loop (hardware-free)
+# ---------------------------------------------------------------------------
+@dataclass
+class JointIkConfig:
+    dt: float = 0.01
+    control_frame: str = "base"        # frame the incoming twist is expressed in
+    euler_order: str = "xyz"
+    solver: str = "clik"               # "clik" (Phase 1 DLS) | "qp" (Phase 2 ProxQP)
+    clik: ClikConfig = field(default_factory=ClikConfig)
+    qp: "QpConfig | None" = None       # only used when solver == "qp"
+    nullspace: NullspaceTaskConfig = field(default_factory=NullspaceTaskConfig)
+    # safety
+    v_scale: float = 0.5               # fraction of URDF joint velocity limit allowed
+    a_max: float = 20.0                # rad/s^2 acceleration clamp (per joint)
+    position_margin_rad: float = 0.017
+    # smoothing
+    use_smoothing: bool = True
+    smooth_cutoff_hz: float = 15.0
+    # optional Phase 3 friction feed-forward (default off)
+    friction: FrictionConfig = field(default_factory=FrictionConfig)
 
 
-def init_velocity_canfd(robot, vc: dict, dt_ms: float) -> None:
-    ret = robot.rm_set_movev_canfd_init(
-        int(vc.get("avoid_singularity", 0)),
-        int(vc.get("frame_type", 1)),
-        int(dt_ms),
-    )
-    if ret != 0:
-        raise RuntimeError(f"rm_set_movev_canfd_init failed: {ret}")
+@dataclass
+class JointIkStep:
+    q_send: np.ndarray          # commanded joint position (rad) after smooth + clamp
+    qdot: np.ndarray            # CLIK joint velocity (rad/s)
+    twist_base: np.ndarray      # twist actually applied (base frame)
+    sigma_min: float
+    lam: float
+    manip: float
+    cart_err_mm: float
+    vel_clamped: bool
+    acc_clamped: bool
+    pos_clamped: bool
 
 
-def settle_movev_after_init(
-    robot,
-    *,
-    dt_ms: float,
-    follow: bool,
-    trajectory_mode: int,
-    radio: int,
-    n_frames: int = 10,
-) -> None:
-    """Zero-velocity frames after rm_set_movev_canfd_init — cuts mode-switch jerk."""
-    dt_s = dt_ms / 1000.0
-    zero = [0.0] * 6
-    next_tick = time.monotonic()
-    for _ in range(n_frames):
-        now = time.monotonic()
-        if now < next_tick:
-            time.sleep(min(0.002, next_tick - now))
-        next_tick += dt_s
-        send_velocity_canfd(
-            robot, zero,
-            follow=follow, trajectory_mode=trajectory_mode, radio=radio,
+class JointIkController:
+    """Reusable inner loop: (q_prev, twist) -> next joint command, all in rad."""
+
+    def __init__(self, kin: RobotKinematics, cfg: JointIkConfig | None = None) -> None:
+        self.kin = kin
+        self.cfg = cfg or JointIkConfig()
+        self.cfg.clik.euler_order = self.cfg.euler_order
+        self.task = JointCenteringTask.from_kinematics(kin, self.cfg.nullspace)
+        self.limits = SafetyLimits.from_kinematics(
+            kin,
+            v_scale=self.cfg.v_scale,
+            a_max=self.cfg.a_max,
+            position_margin=self.cfg.position_margin_rad,
+        )
+        self.core = self._make_core()
+        # backward-compatible alias (tests / diagnostics read `.clik.x_ref`)
+        self.clik = self.core
+        self.safety = SafetyLimiter(self.limits)
+        self.smoother = (
+            SecondOrderLowPass(self.cfg.smooth_cutoff_hz, self.cfg.dt, dim=kin.nv)
+            if self.cfg.use_smoothing
+            else None
+        )
+        self.friction = FrictionCompensator(self.cfg.friction)
+        self.q_cmd = np.zeros(kin.nv, dtype=float)
+
+    def _make_core(self):
+        if self.cfg.solver == "qp":
+            from rm75_control.control.joint_admittance.solver.qp_builder import (
+                QpConfig,
+                QpIkController,
+            )
+
+            qp_cfg = self.cfg.qp or QpConfig()
+            qp_cfg.euler_order = self.cfg.euler_order
+            self.cfg.qp = qp_cfg
+            return QpIkController(self.kin, self.limits, qp_cfg)
+        return ClikController(self.kin, self.cfg.clik)
+
+    def reset(self, q0_rad: np.ndarray, pose0: np.ndarray | None = None) -> None:
+        self.q_cmd = np.asarray(q0_rad, dtype=float).copy()
+        self.core.reset(self.q_cmd, pose0)
+        self.safety.reset(self.q_cmd)
+        if self.smoother is not None:
+            self.smoother.reset(self.q_cmd)
+
+    def _twist_to_base(self, twist: np.ndarray, q_prev: np.ndarray) -> np.ndarray:
+        twist = np.asarray(twist, dtype=float)
+        if self.cfg.control_frame != "tool":
+            return twist
+        # rotate tool-frame twist into base frame using the current TCP orientation
+        R = self.kin.fk_placement(q_prev).rotation
+        out = np.zeros(6, dtype=float)
+        out[:3] = R @ twist[:3]
+        out[3:6] = R @ twist[3:6]
+        return out
+
+    def update(self, twist: np.ndarray, dt: float | None = None) -> JointIkStep:
+        dt = self.cfg.dt if dt is None else dt
+        q_prev = self.q_cmd
+        twist_base = self._twist_to_base(twist, q_prev)
+
+        secondary = self.task(q_prev)
+        r = self.core.step(q_prev, twist_base, dt, secondary_qdot=secondary)
+
+        q_target = r.q_next
+        if self.cfg.friction.enabled:
+            q_target = q_target + self.friction(r.qdot) * dt
+        if self.smoother is not None:
+            q_target = self.smoother(q_target)
+
+        rep = self.safety.clamp(q_prev, q_target, dt)
+        if self.smoother is not None:
+            self.smoother.sync(rep.q_safe)
+
+        self.q_cmd = rep.q_safe
+        return JointIkStep(
+            q_send=rep.q_safe.copy(),
+            qdot=r.qdot,
+            twist_base=twist_base,
+            sigma_min=r.sigma_min,
+            lam=r.lam,
+            manip=r.manip,
+            cart_err_mm=float(np.linalg.norm(r.cart_err[:3]) * 1000.0),
+            vel_clamped=rep.vel_clamped,
+            acc_clamped=rep.acc_clamped,
+            pos_clamped=rep.pos_clamped,
         )
 
 
-def wait_movev_quiescent(
-    robot,
-    *,
-    dt_ms: float,
-    follow: bool,
-    trajectory_mode: int,
-    radio: int,
-    settle_mm: float = 0.3,
-    need_consecutive: int = 5,
-    max_frames: int = 200,
-) -> tuple[np.ndarray | None, float, int]:
-    """
-    Stream zero velocity until the TCP stops moving, THEN anchor.
+# ---------------------------------------------------------------------------
+# Outer loop adapter
+# ---------------------------------------------------------------------------
+class OuterLoop(Protocol):
+    """Task-space controller producing a Cartesian twist each tick."""
 
-    Switching into rm_movev_canfd carries a non-deterministic mode-switch transient:
-    even with v=0 the controller can coast a few mm before the internal velocity
-    reference settles (observed 0.05 mm one run, 9.4 mm the next, same config). Rather
-    than anchor a fixed N frames after init, we watch frame-to-frame motion and only
-    anchor once it is < settle_mm for need_consecutive ticks (or max_frames timeout).
+    def sample(self, t_s: float, current_pose: np.ndarray, f_ext: np.ndarray) -> np.ndarray:
+        """Return a 6D twist in the inner loop's control_frame."""
+        ...
 
-    Returns (last_pose, max_step_mm_observed, frames_used).
+
+class AdmittanceOuterLoop:
+    """Wrap hybrid_motion.AdmittanceController + a MotionReferenceSource.
+
+    Emits the same 6D Cartesian twist the velocity stack streamed to MoveV - here
+    it feeds the joint-space inner loop instead.  ``control_frame`` matches the
+    AdmittanceController config (tool by default).
     """
-    dt_s = dt_ms / 1000.0
-    zero = [0.0] * 6
-    next_tick = time.monotonic()
-    prev_xyz: np.ndarray | None = None
-    last_pose: np.ndarray | None = None
-    quiet = 0
-    max_step_mm = 0.0
-    for k in range(max_frames):
-        now = time.monotonic()
-        if now < next_tick:
-            time.sleep(min(0.002, next_tick - now))
-        next_tick += dt_s
-        send_velocity_canfd(
-            robot, zero,
-            follow=follow, trajectory_mode=trajectory_mode, radio=radio,
+
+    def __init__(self, controller, reference_source, *, desired_force: np.ndarray | None = None):
+        self.controller = controller
+        self.reference = reference_source
+        self.desired_force = (
+            np.zeros(6) if desired_force is None else np.asarray(desired_force, dtype=float)
         )
-        ret, st = robot.rm_get_current_arm_state()
-        if ret != 0:
-            continue
-        pose = np.asarray(st["pose"][:6], dtype=float)
-        last_pose = pose
-        if prev_xyz is not None:
-            step_mm = float(np.linalg.norm((pose[:3] - prev_xyz) * 1000.0))
-            max_step_mm = max(max_step_mm, step_mm)
-            if step_mm < settle_mm:
-                quiet += 1
-                if quiet >= need_consecutive:
-                    return last_pose, max_step_mm, k + 1
-            else:
-                quiet = 0
-        prev_xyz = pose[:3].copy()
-    return last_pose, max_step_mm, max_frames
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        if hasattr(self.reference, "set_origin"):
+            self.reference.set_origin(pose0)
+
+    def sample(self, t_s: float, current_pose: np.ndarray, f_ext: np.ndarray) -> np.ndarray:
+        ref = self.reference.sample(t_s)
+        return self.controller.compute_velocity_command(
+            current_pose,
+            ref.pose_d,
+            ref.vel_ff,
+            f_ext,
+            self.desired_force,
+        )
 
 
-def hold_velocity_command(
-    pose_act: np.ndarray,
-    pose_anchor: np.ndarray,
+@dataclass
+class CartesianTrackConfig:
+    """Pure position/orientation tracking, no force axis - used to reposition the
+    arm (e.g. walk to a pose slot) through the SAME inner IK loop, so a Cartesian
+    move and an admittance scan can be sequenced without any MoveJ/MoveV switch."""
+
+    k_task: np.ndarray = field(default_factory=lambda: np.full(6, 1.5))
+    max_lin_vel_m_s: float = 0.08
+    max_ang_vel_rad_s: float = 0.5
+    euler_order: str = "xyz"
+    # MUST match the consuming JointIkConfig.control_frame. MotionReference.pose_d /
+    # vel_ff are always base-frame (see reference.py); this outer loop computes the
+    # PD+feedforward twist in base frame and then, if control_frame=="tool", rotates
+    # it INTO tool-axis coordinates (R^T @ v) before returning - because the inner
+    # loop's _twist_to_base() rotates a "tool" twist back OUT with R @ twist. Return
+    # a base-frame vector here when control_frame=="tool" and you get a silent
+    # double rotation: the command points along the wrong axes and the loop diverges
+    # instead of converging (this bit us: cart_err growing to 100s of mm).
+    control_frame: str = "base"
+
+
+class CartesianTrackOuterLoop:
+    """Generic Cartesian-trajectory-tracking outer loop (no force).
+
+    Wraps any MotionReferenceSource (e.g. CartesianMoveReference for a point-to-
+    point walk, or SinToolYReference for a scan without force control) and turns
+    its (pose_d, vel_ff) into a twist via simple PD + feedforward, clamped to safe
+    Cartesian rates.  Use AdmittanceOuterLoop instead when you want force control.
+
+    The returned twist is expressed in ``cfg.control_frame`` - set it to match the
+    ``JointIkConfig.control_frame`` of the inner loop this feeds (see CartesianTrackConfig).
+    """
+
+    def __init__(self, reference, cfg: CartesianTrackConfig | None = None) -> None:
+        self.reference = reference
+        self.cfg = cfg or CartesianTrackConfig()
+
+    def set_origin(self, pose0: np.ndarray) -> None:
+        if hasattr(self.reference, "set_origin"):
+            self.reference.set_origin(pose0)
+
+    def sample(self, t_s: float, current_pose: np.ndarray, f_ext: np.ndarray) -> np.ndarray:
+        del f_ext
+        cfg = self.cfg
+        ref = self.reference.sample(t_s)
+        err = pose_error(ref.pose_d, current_pose, cfg.euler_order)
+        v = np.asarray(ref.vel_ff, dtype=float) + cfg.k_task * err  # base-frame twist
+
+        lin_n = float(np.linalg.norm(v[:3]))
+        if cfg.max_lin_vel_m_s > 0.0 and lin_n > cfg.max_lin_vel_m_s:
+            v[:3] *= cfg.max_lin_vel_m_s / lin_n
+        ang_n = float(np.linalg.norm(v[3:6]))
+        if cfg.max_ang_vel_rad_s > 0.0 and ang_n > cfg.max_ang_vel_rad_s:
+            v[3:6] *= cfg.max_ang_vel_rad_s / ang_n
+
+        if cfg.control_frame == "tool":
+            R = Rsc.from_euler(cfg.euler_order, current_pose[3:6], degrees=False).as_matrix()
+            out = np.zeros(6, dtype=float)
+            out[:3] = R.T @ v[:3]
+            out[3:6] = R.T @ v[3:6]
+            return out
+        return v
+
+
+def arrived(
+    current_pose: np.ndarray,
+    target_pose: np.ndarray,
     *,
-    control_frame: str,
-    euler_order: str,
-    kp_pos: float,
-    kp_rot: float,
-    deadband_mm: float,
-    max_vel_m_s: float,
-    max_omega_rad_s: float,
-    last_v: np.ndarray,
-    max_accel_m_s2: float,
-    dt_s: float,
-    hold_z: bool = True,
-) -> np.ndarray:
-    """
-    Gentle position-hold velocity that actively cancels movev idle-creep.
-
-    Commanding v=0 does NOT reliably hold pose right after CANFD switch-in (the arm
-    can drift mm under a zero command). A small P-loop on the measured pose error vs
-    the captured anchor keeps the switch-in bumpless. Output is rate-limited so the
-    hold itself never injects a step. When hold_z is False the tool-Z (force) axis is
-    left to the force loop and only X/Y/attitude are held.
-    """
-    err = pose_error(pose_anchor, pose_act, euler_order)
-    if deadband_mm > 0.0:
-        thr = deadband_mm / 1000.0
-        for i in range(3):
-            if abs(err[i]) <= thr:
-                err[i] = 0.0
-    v_base = np.zeros(6, dtype=float)
-    v_base[:3] = kp_pos * err[:3]
-    v_base[3:] = kp_rot * err[3:6]
-    v_base[:3] = np.clip(v_base[:3], -max_vel_m_s, max_vel_m_s)
-    v_base[3:] = np.clip(v_base[3:], -max_omega_rad_s, max_omega_rad_s)
-
-    if control_frame == "tool":
-        r_mat = Rsc.from_euler(euler_order, pose_act[3:6], degrees=False).as_matrix()
-        v_out = np.zeros(6, dtype=float)
-        v_out[:3] = r_mat.T @ v_base[:3]
-        v_out[3:] = r_mat.T @ v_base[3:]
-    else:
-        v_out = v_base
-    if not hold_z:
-        v_out[2] = 0.0
-
-    dv = max_accel_m_s2 * dt_s
-    v_final = np.clip(v_out, last_v - dv, last_v + dv)
-    return v_final
-
-
-def _pose_tracking_error_mm_deg(
-    pose_act: np.ndarray,
-    pose_tgt: np.ndarray,
+    tol_mm: float = 1.0,
+    tol_deg: float = 0.5,
     euler_order: str = "xyz",
-) -> tuple[float, float]:
-    err = pose_error(pose_tgt, pose_act, euler_order)
-    pos_mm = float(np.linalg.norm(err[:3]) * 1000.0)
-    rot_deg = float(np.degrees(np.linalg.norm(err[3:6])))
-    return pos_mm, rot_deg
+) -> bool:
+    """Convenience Phase.wait_until predicate: True once within tolerance of target."""
+    d_mm, d_deg = pose_distance(current_pose, target_pose, euler_order)
+    return d_mm <= tol_mm and d_deg <= tol_deg
 
 
-def velocity_realign_to_pose(
-    robot,
-    async_obs: AsyncStateObserver,
-    pose_target: np.ndarray,
-    *,
-    dt_ms: float,
-    follow: bool,
-    trajectory_mode: int,
-    radio: int,
-    control_frame: str,
-    euler_order: str,
-    kp_pos: float,
-    kp_rot: float,
-    max_vel_m_s: float,
-    max_omega_rad_s: float,
-    max_accel_m_s2: float,
-    max_alpha_rad_s2: float,
-    pos_tol_mm: float,
-    rot_tol_deg: float,
-    timeout_s: float,
-    settle_frames: int = 15,
-) -> tuple[np.ndarray, bool]:
+# ---------------------------------------------------------------------------
+# On-robot orchestration
+# ---------------------------------------------------------------------------
+def _set_realtime_priority(priority: int = 80) -> bool:
+    """Best-effort SCHED_FIFO for the control thread (needs CAP_SYS_NICE / root)."""
+    try:
+        param = os.sched_param(priority)
+        os.sched_setscheduler(0, os.SCHED_FIFO, param)
+        return True
+    except (PermissionError, OSError, AttributeError):
+        return False
+
+
+@dataclass
+class LoopResult:
+    ticks: int
+    duration_s: float
+    max_jitter_ms: float
+    stalled: bool
+
+
+@dataclass
+class Phase:
+    """One leg of a multi-phase on-robot run, e.g. "walk to D" then "sin scan at D".
+
+    All phases share the SAME inner loop, async state reader and watchdog - there
+    is no MoveJ/MoveV switch and no gap in the joint-command stream at the phase
+    boundary, only ``outer`` (and optionally ``force_observer``) changing.
     """
-    Post-init spatial homing while rm_movev_canfd stays active (no move_j).
 
-    Uses base-frame pose error → velocity PBAC, output in tool or base per control_frame.
-    All 6 axes are position-tracked (no force admittance) — for undoing init snap only.
-    """
-    dt_s = dt_ms / 1000.0
-    pose_tgt = np.asarray(pose_target, dtype=float)
-    last_v = np.zeros(6, dtype=float)
-    next_tick = time.monotonic()
-    t_start = time.monotonic()
-    pose_act = pose_tgt.copy()
-
-    while time.monotonic() - t_start < timeout_s:
-        now = time.monotonic()
-        if now < next_tick:
-            time.sleep(min(0.002, next_tick - now))
-            continue
-        next_tick += dt_s
-
-        snap = async_obs.read()
-        if snap.pose is None:
-            continue
-        pose_act = snap.pose
-        err = pose_error(pose_tgt, pose_act, euler_order)
-        pos_mm, rot_deg = _pose_tracking_error_mm_deg(pose_act, pose_tgt, euler_order)
-        if pos_mm <= pos_tol_mm and rot_deg <= rot_tol_deg:
-            break
-
-        v_base = np.zeros(6, dtype=float)
-        v_base[:3] = kp_pos * err[:3]
-        v_base[3:6] = kp_rot * err[3:6]
-        v_base[:3] = np.clip(v_base[:3], -max_vel_m_s, max_vel_m_s)
-        v_base[3:6] = np.clip(v_base[3:6], -max_omega_rad_s, max_omega_rad_s)
-
-        if control_frame == "tool":
-            r_mat = Rsc.from_euler(euler_order, pose_act[3:6], degrees=False).as_matrix()
-            v_out = np.zeros(6, dtype=float)
-            v_out[:3] = r_mat.T @ v_base[:3]
-            v_out[3:6] = r_mat.T @ v_base[3:6]
-        else:
-            v_out = v_base
-
-        dv_lin = max_accel_m_s2 * dt_s
-        dv_ang = max_alpha_rad_s2 * dt_s
-        for i in range(3):
-            v_out[i] = float(np.clip(
-                v_out[i], last_v[i] - dv_lin, last_v[i] + dv_lin,
-            ))
-        for i in range(3, 6):
-            v_out[i] = float(np.clip(
-                v_out[i], last_v[i] - dv_ang, last_v[i] + dv_ang,
-            ))
-        last_v = v_out.copy()
-        send_velocity_canfd(
-            robot, v_out.tolist(),
-            follow=follow, trajectory_mode=trajectory_mode, radio=radio,
-        )
-
-    settle_movev_after_init(
-        robot, dt_ms=dt_ms, follow=follow,
-        trajectory_mode=trajectory_mode, radio=radio, n_frames=settle_frames,
-    )
-    snap = async_obs.read()
-    if snap.pose is not None:
-        pose_act = snap.pose
-    pos_mm, rot_deg = _pose_tracking_error_mm_deg(pose_act, pose_tgt, euler_order)
-    ok = pos_mm <= pos_tol_mm and rot_deg <= rot_tol_deg
-    return pose_act, ok
+    outer: OuterLoop
+    label: str = ""
+    duration_s: float | None = None          # None -> run until wait_until (or max_duration_s)
+    max_duration_s: float | None = None      # safety cap when duration_s is None
+    wait_until: object | None = None         # Callable[[np.ndarray], bool] on current pose
+    force_observer: object | None = None     # None -> reuse the loop-level force_observer
+    on_enter: object | None = None           # Callable[[], None], fired right after set_origin
 
 
-def trajectory_summary(raw: dict) -> str:
-    t = raw.get("trajectory", {})
-    kind = str(t.get("type", "sin_tool_y"))
-    y_pp = t.get("y_peak_to_peak_cm")
-    if y_pp is not None:
-        pp_mm = float(y_pp) * 10.0
-        amp_label = f"Y p-p={float(y_pp):.1f}cm ({pp_mm:.0f}mm)"
-    else:
-        amp_mm = float(t.get("amplitude_mm", 5.0))
-        amp_label = f"amp=±{amp_mm:.1f}mm ({2 * amp_mm:.0f}mm p-p)"
-    vmax = float(t.get("y_max_vel_cm_s", 1.0))
-    ps = t.get("period_s")
-    half_m = float(y_pp) * 0.01 / 2.0 if y_pp is not None else float(t.get("amplitude_mm", 5.0)) / 1000.0
-    if ps is None:
-        period = sin_period_for_peak_vel(half_m, vmax / 100.0)
-        period_s = f"{period:.1f}s (auto)"
-    else:
-        period_s = f"{float(ps):.1f}s"
-    soft = " soft_start" if t.get("soft_start") else ""
-    rz = float(t.get("rz_amplitude_deg", 0.0))
-    spin = f"  tool-Rz±{rz:.1f}°" if rz > 0 else ""
-    return f"{kind}{soft}  {amp_label}{spin}  v_peak≈{vmax:.1f}cm/s  period={period_s}"
-
-
-def run_velocity_admittance(
-    raw: dict,
+def run_joint_admittance_phases(
+    session,
+    phases: list[Phase],
+    inner: JointIkController,
     *,
-    title: str = "Velocity admittance",
-    duration_s: float | None = None,
-    tool_hint: bool = True,
-    log_path: Path | None = None,
-    log_enabled: bool | None = None,
-) -> int:
-    if not PHI_JSON.exists():
-        raise SystemExit(f"Missing {PHI_JSON} — run force_calibrate.py first")
+    q_start_deg: np.ndarray | None = None,
+    dt: float | None = None,
+    force_observer=None,
+    follow: bool = True,
+    move_speed: int = 20,
+    realtime: bool = False,
+    watchdog_timeout_s: float = 0.1,
+    on_step=None,
+    verbose: bool = True,
+) -> LoopResult:
+    """Run a sequence of ``Phase`` objects on the real robot, one continuous stream.
 
-    timing = raw.get("timing", {})
-    dt_ms = float(timing.get("dt_ms", 10.0))
-    dt_s = dt_ms / 1000.0
-    async_poll_ms = float(timing.get("async_poll_ms", 10.0))
-    vc = raw.get("velocity_canfd", {})
-    follow = bool(vc.get("follow", True))
-    traj_mode = int(vc.get("trajectory_mode", 0))
-    radio = int(vc.get("radio", 0))
+    Sequence:
+      1. move_j to q_start (single planned motion; the only non-CANFD command).
+      2. Start the async state reader; read q0 and reset the inner loop at it.
+      3. For each phase, at fixed dt (perf_counter absolute schedule):
+           outer.sample(t_phase, pose, f_ext) -> inner.update(q) -> rm_movej_canfd.
+         A phase ends when t_phase >= duration_s, or wait_until(pose) is True, or
+         (if duration_s is None) t_phase >= max_duration_s.
+    """
+    from rm75_control.control.hybrid_motion.async_state import AsyncStateObserver
+    from rm75_control.motion.canfd import send_joint_canfd
 
-    startup = raw.get("startup", {})
-    settle_frames = int(startup.get("settle_frames", 10))
-    hold_s = float(startup.get("hold_s", 0.0))
-    wait_contact = bool(startup.get("wait_contact", True))
-    auto_start_under_n = float(startup.get("auto_start_under_n", 0.5))
-    auto_start_hold_s = float(startup.get("auto_start_hold_s", 0.5))
-    auto_start_samples = max(1, int(round(auto_start_hold_s / dt_s)))
-    approach_ramp_s = float(startup.get("approach_ramp_s", 1.0))
-    require_observer = bool(startup.get("require_observer_ready", True))
-    post_init_realign = bool(startup.get("post_init_realign", False))
-    pre_movev_prep = str(startup.get("pre_movev_prep", "light")).lower()
-    pre_movev_settle_s = float(startup.get("pre_movev_settle_s", 0.0))
-    realign_min_snap_mm = float(startup.get("realign_min_snap_mm", 0.5))
-    realign_pos_tol_mm = float(startup.get("realign_pos_tol_mm", 1.5))
-    realign_rot_tol_deg = float(startup.get("realign_rot_tol_deg", 0.8))
-    realign_timeout_s = float(startup.get("realign_timeout_s", 15.0))
-    realign_kp_pos = float(startup.get("realign_kp_pos", 0.6))
-    realign_kp_rot = float(startup.get("realign_kp_rot", 0.35))
-    realign_max_vel_m_s = float(startup.get("realign_max_vel_m_s", 0.025))
-    realign_max_omega = float(startup.get("realign_max_omega_rad_s", 0.12))
-    realign_target_mode = str(startup.get("realign_target", "pre_init")).lower()
-    # Active position-hold during the pre-scan hold phase (counters movev idle-creep
-    # so the switch-in is bumpless). Gentle gains; rate-limited; deadbanded.
-    hold_active = bool(startup.get("hold_active", True))
-    hold_kp_pos = float(startup.get("hold_kp_pos", 1.5))
-    hold_kp_rot = float(startup.get("hold_kp_rot", 1.5))
-    hold_deadband_mm = float(startup.get("hold_deadband_mm", 0.3))
-    hold_max_vel_m_s = float(startup.get("hold_max_vel_m_s", 0.02))
-    hold_max_omega_rad_s = float(startup.get("hold_max_omega_rad_s", 0.10))
-    hold_accel_m_s2 = float(startup.get("hold_accel_m_s2", 0.3))
-    pose_slot_raw = startup.get("pose_slot", "d")
-    pose_slot = (
-        None
-        if pose_slot_raw in (None, "", "none", "null")
-        else str(pose_slot_raw).lower()
-    )
-    move_speed = startup.get("move_speed")
+    dt = inner.cfg.dt if dt is None else dt
+    robot = session.robot
 
-    monitor = raw.get("monitor", {})
-    if log_enabled is None:
-        log_enabled = bool(monitor.get("log", False))
-    log_every = max(1, int(monitor.get("log_every", 1)))
-    if log_enabled and log_path is None:
-        log_path = default_log_path()
+    if q_start_deg is not None:
+        session.move_joints(list(np.asarray(q_start_deg, dtype=float)), velocity_percent=move_speed, block=1)
+        time.sleep(0.5)
 
-    ctrl_cfg = AdmittanceConfig.from_dict(raw)
-    control_frame = ctrl_cfg.control_frame
-    frame_type = int(vc.get("frame_type", 0 if control_frame == "tool" else 1))
-    if control_frame == "tool" and frame_type != 0:
-        print("  NOTE: control_frame=tool → forcing frame_type=0 (TCP movev)", flush=True)
-        frame_type = 0
-    elif control_frame == "base" and frame_type != 1:
-        print("  NOTE: control_frame=base → forcing frame_type=1 (world movev)", flush=True)
-        frame_type = 1
-    vc_run = {**vc, "frame_type": frame_type}
-    traj_kind = str(raw.get("trajectory", {}).get("type", "hold"))
-    observer = CompensatedForceObserver.from_yaml(raw)
-    controller = AdmittanceController(dt_s, ctrl_cfg)
+    async_obs = AsyncStateObserver(robot, poll_s=dt)
+    async_obs.start()
+    ticks = 0
+    max_jitter_ms = 0.0
+    stalled = False
+    total_t0 = time.perf_counter()
+    try:
+        pose0 = async_obs.wait_first_pose(timeout_s=5.0)
+        snap0 = async_obs.read()
+        if snap0.q_deg is None:
+            raise RuntimeError("no joint feedback from robot")
+        q0_rad = deg2rad(snap0.q_deg)
+        inner.reset(q0_rad, pose0)
 
-    f_cfg = raw.get("force", {})
-    desired_z = float(f_cfg.get("desired_z_n", 3.0))
-    f_des = np.zeros(6)
-    f_des[2] = desired_z
-    f_zero = np.zeros(6)
-    auto_start_fz_n = float(startup.get("auto_start_fz_n", desired_z - auto_start_under_n))
-    auto_recover = bool(startup.get("auto_recover", False))
-    recover_probe_force = bool(startup.get("recover_probe_force_stream", False))
+        if realtime and not _set_realtime_priority():
+            if verbose:
+                print("  (SCHED_FIFO unavailable - running at normal priority)", flush=True)
 
-    print(
-        f"{title} | rm_movev_canfd frame_type={frame_type} "
-        f"follow={follow} traj={traj_mode} radio={radio}",
-    )
-    print(
-        f"  kp_pos={ctrl_cfg.kp_pos.tolist()}  track_axes={ctrl_cfg.track_axes.tolist()}  "
-        f"delay={ctrl_cfg.system_delay_s * 1000:.0f}ms  "
-        f"async feedback ~{async_poll_ms:.0f}ms",
-    )
-    print(f"  phi: {PHI_JSON.name}  Fz_des={desired_z:.2f} N")
-    print(f"  vz cap (tool TCP): ±{ctrl_cfg.max_vz_tool_m_s * 100:.1f} cm/s")
-    print(f"  trajectory: {trajectory_summary(raw)}  kind={traj_kind}")
-    scan_mode = "open-loop ff" if ctrl_cfg.open_loop else "closed-loop track"
-    print(
-        f"  hybrid: traj/Servo=6D base  fuse=tool_sleeve (Z force, XY ff) "
-        f"S_f={ctrl_cfg.force_axes.tolist()}  "
-        f"movev={control_frame} frame_type={frame_type}  scan={scan_mode}",
-        flush=True,
-    )
-    if wait_contact:
-        print(
-            f"  auto-start: lock pose, wait Fz≥{auto_start_fz_n:.1f}N for "
-            f"{auto_start_hold_s:.1f}s → engage scan directly "
-            f"(no controller approach; external contact)",
-            flush=True,
-        )
-    if pose_slot:
-        print(f"  startup pose: move_j → slot '{pose_slot}'", flush=True)
-    if post_init_realign:
-        print(
-            f"  post-init realign: ON → target={realign_target_mode}  "
-            f"tol={realign_pos_tol_mm:.1f}mm / {realign_rot_tol_deg:.1f}°  "
-            f"skip if snap<{realign_min_snap_mm:.1f}mm",
-            flush=True,
-        )
-    print(
-        f"  pre-movev prep: {pre_movev_prep} "
-        f"(minimal/skip after move_j; light = run_sin_tool_y)",
-        flush=True,
-    )
-    if tool_hint:
-        print("  Ensure gripper (or desired tool) is active in RM Web UI before contact tasks.")
-    if log_enabled:
-        print(f"  scan log: ON → {log_path}  every {log_every} cycle(s)", flush=True)
-
-    from rm75_control import RobotSession
-
-    with RobotSession(config=CONFIG_ROBOT) as bot:
-        if auto_recover:
-            rec = bot.recover_controller(
-                settle_s=1.0,
-                clear_errors=True,
-                probe_force_stream=recover_probe_force,
-            )
-            err = rec.get("system_err") or []
-            print(
-                f"  auto-recover: idle={rec.get('planning_idle')}  "
-                f"traj={rec.get('trajectory_type_final')}  "
-                f"sys_err={err or 'none'}",
-                flush=True,
-            )
-            if err:
-                print("  (cleared latched controller errors on connect)", flush=True)
-
-        pose_slot_cartesian: np.ndarray | None = None
-        if pose_slot:
-            fid = load_config(CONFIG_ID)
-            spd = int(move_speed) if move_speed is not None else fid.collect.move_speed
-            q_tgt, pose_slot_cartesian, rec = load_slot(fid, pose_slot)
-            pose_slot_cartesian = np.asarray(pose_slot_cartesian, dtype=float)
-            print(
-                f"  move_j → {pose_slot} ({rec.get('label', '')}) speed={spd}",
-                flush=True,
-            )
-            move_j(bot.robot, q_tgt, speed=spd)
-            pose_act, q_act = wait_settle(
-                bot.robot, q_tgt, timeout_s=fid.collect.settle_timeout_s,
-            )
-            print(
-                f"  settled q_max_err={float(np.max(np.abs(q_act - q_tgt))):.3f}°",
-                flush=True,
-            )
-
-        ret, state = bot.robot.rm_get_current_arm_state()
-        if ret != 0:
-            raise SystemExit(f"get state failed: {ret}")
-        pose0 = np.asarray(state["pose"][:6], dtype=float)
-        traj_origin = pose0.copy()
-        print(
-            f"  start TCP pose (base): "
-            f"xyz=[{pose0[0]:.3f},{pose0[1]:.3f},{pose0[2]:.3f}] m",
-            flush=True,
-        )
-        traj = TrajectoryGenerator.from_dict(raw, pose0, bot.robot)
-        pose_before_prep = pose0.copy()
-
-        if pre_movev_prep == "full":
-            prep = prepare_canfd_velocity_session(bot, settle_s=0.5)
-            print(
-                f"  CANFD prep (full recover): idle={prep.get('planning_idle')}  "
-                f"traj={prep.get('trajectory_type_final')}  "
-                f"euler_deg={prep.get('pose_euler_deg', [])}",
-                flush=True,
-            )
-            if not prep.get("planning_idle", False):
-                print("  WARN: planner not idle before movev init — snap more likely", flush=True)
-        else:
-            idle_before_movev_init(
-                bot.robot, mode=pre_movev_prep, extra_settle_s=pre_movev_settle_s,
-            )
-            print(f"  CANFD prep: {pre_movev_prep}", flush=True)
-
-        ret_pre, st_pre = bot.robot.rm_get_current_arm_state()
-        pose_pre = pose_before_prep.copy()
-        if ret_pre == 0:
-            pose_pre = np.asarray(st_pre["pose"][:6], dtype=float)
-        prep_dpos_mm = (pose_pre[:3] - pose_before_prep[:3]) * 1000.0
-        prep_mm = float(np.linalg.norm(prep_dpos_mm))
-        if prep_mm > 0.5:
-            print(
-                f"  prep drift Δpos_mm="
-                f"[{prep_dpos_mm[0]:+.2f},{prep_dpos_mm[1]:+.2f},{prep_dpos_mm[2]:+.2f}]  "
-                f"|Δ|={prep_mm:.1f}mm",
-                flush=True,
-            )
-
-        init_velocity_canfd(bot.robot, vc_run, dt_ms)
-        init_settle_frames = max(1, settle_frames)
-        settle_movev_after_init(
-            bot.robot, dt_ms=dt_ms, follow=follow,
-            trajectory_mode=traj_mode, radio=radio, n_frames=init_settle_frames,
-        )
-        # Anchor only AFTER the switch-in transient has actually died out: stream zero
-        # velocity and watch frame-to-frame motion until the TCP is quiescent. This
-        # removes the non-deterministic "init snap" (the arm coasting mm under v=0
-        # right after CANFD switch-in) from biasing pose0 / traj origin.
-        pose_quiet, quiesce_step_mm, quiesce_frames = wait_movev_quiescent(
-            bot.robot, dt_ms=dt_ms, follow=follow,
-            trajectory_mode=traj_mode, radio=radio,
-            settle_mm=0.3, need_consecutive=5, max_frames=200,
-        )
-        print(
-            f"  movev quiescence: settled after {quiesce_frames} frames "
-            f"(max step {quiesce_step_mm:.2f}mm/tick)",
-            flush=True,
-        )
-        ret_post, st_post = bot.robot.rm_get_current_arm_state()
-        pose_post = pose0.copy()
-        if pose_quiet is not None:
-            pose_post = pose_quiet.copy()
-            ret_post = 0
-        if ret_post == 0:
-            if pose_quiet is None:
-                pose_post = np.asarray(st_post["pose"][:6], dtype=float)
-            deuler = np.degrees(pose_post[3:6] - pose_pre[3:6])
-            deuler = (deuler + 180.0) % 360.0 - 180.0
-            dpos_mm = (pose_post[:3] - pose_pre[:3]) * 1000.0
-            print(
-                f"  post-init settle Δpos_mm="
-                f"[{dpos_mm[0]:+.2f},{dpos_mm[1]:+.2f},{dpos_mm[2]:+.2f}]  "
-                f"Δeuler_deg=[{deuler[0]:+.2f},{deuler[1]:+.2f},{deuler[2]:+.2f}]",
-                flush=True,
-            )
-            snap_mm = float(np.linalg.norm(dpos_mm))
-            if snap_mm > 3.0:
-                print(
-                    f"  init snap |Δ|={snap_mm:.1f}mm — "
-                    f"try pre_movev_prep: skip or minimal after move_j",
-                    flush=True,
-                )
-            pose0 = pose_post.copy()
-            traj_origin = pose0.copy()
-            traj.set_origin(pose0)
-            print(
-                f"  anchored pose0 (post-init): "
-                f"xyz=[{pose0[0]:.3f},{pose0[1]:.3f},{pose0[2]:.3f}] m",
-                flush=True,
-            )
-
-        async_obs = AsyncStateObserver(bot.robot, poll_s=async_poll_ms / 1000.0)
-        async_obs.start()
-        try:
-            pose_fb = async_obs.wait_first_pose(timeout_s=5.0)
-        except TimeoutError:
-            async_obs.stop()
-            raise SystemExit("AsyncStateObserver: no pose after CANFD init")
-        q_fb = np.zeros(7, dtype=float)
-
-        controller.reset(clear_velocity=True)
-
-        if post_init_realign:
-            if realign_target_mode == "pose_slot" and pose_slot_cartesian is not None:
-                realign_target = pose_slot_cartesian.copy()
-            else:
-                realign_target = pose_pre.copy()
-            snap_to_target_mm, snap_rot_deg = _pose_tracking_error_mm_deg(
-                pose0, realign_target, ctrl_cfg.euler_order,
-            )
-            if snap_to_target_mm >= realign_min_snap_mm or snap_rot_deg >= realign_rot_tol_deg:
-                print(
-                    f"  realign start: offset vs target "
-                    f"{snap_to_target_mm:.1f}mm / {snap_rot_deg:.2f}°",
-                    flush=True,
-                )
-                pose_realigned, realign_ok = velocity_realign_to_pose(
-                    bot.robot,
-                    async_obs,
-                    realign_target,
-                    dt_ms=dt_ms,
-                    follow=follow,
-                    trajectory_mode=traj_mode,
-                    radio=radio,
-                    control_frame=control_frame,
-                    euler_order=ctrl_cfg.euler_order,
-                    kp_pos=realign_kp_pos,
-                    kp_rot=realign_kp_rot,
-                    max_vel_m_s=realign_max_vel_m_s,
-                    max_omega_rad_s=realign_max_omega,
-                    max_accel_m_s2=0.4,
-                    max_alpha_rad_s2=0.8,
-                    pos_tol_mm=realign_pos_tol_mm,
-                    rot_tol_deg=realign_rot_tol_deg,
-                    timeout_s=realign_timeout_s,
-                    settle_frames=max(10, settle_frames // 2),
-                )
-                pose0 = pose_realigned.copy()
-                traj_origin = pose0.copy()
-                traj.set_origin(pose0)
-                err_mm, err_deg = _pose_tracking_error_mm_deg(
-                    pose0, realign_target, ctrl_cfg.euler_order,
-                )
-                status = "OK" if realign_ok else "TIMEOUT"
-                print(
-                    f"  realign {status}: residual {err_mm:.1f}mm / {err_deg:.2f}°  "
-                    f"xyz=[{pose0[0]:.3f},{pose0[1]:.3f},{pose0[2]:.3f}]",
-                    flush=True,
-                )
-                controller.reset(clear_velocity=True)
-            else:
-                print(
-                    f"  realign skip: snap {snap_to_target_mm:.1f}mm < "
-                    f"{realign_min_snap_mm:.1f}mm",
-                    flush=True,
-                )
-
-        print("Velocity CANFD initialized. Ctrl+C to stop.", flush=True)
-
-        scan_log = ScanLogRecorder() if log_enabled else None
-        log_tick = 0
-
-        t0 = time.monotonic()
-        next_tick = t0
-        last_log = t0
-        scan_started = not wait_contact
-        pending_scan = False
-        start_streak = 0
-        t_scan0: float | None = None if wait_contact else t0
-        f_ext = f_zero.copy()
-        last_wait_msg = 0.0
-        fz_buf: list[float] = []
-        hold_anchor: np.ndarray | None = None
-        hold_drift_warned = False
-
-        def _fz_smooth() -> float:
-            if not fz_buf:
-                return float(f_ext[2])
-            return float(np.median(fz_buf))
-
-        try:
-            while True:
-                now = time.monotonic()
-                if duration_s is not None and t_scan0 is not None:
-                    if now - t_scan0 >= duration_s:
-                        break
-                if now < next_tick:
-                    time.sleep(min(0.002, next_tick - now))
-                    continue
-                next_tick += dt_s
-                t_s = now - t0
-
-                snap = async_obs.read()
-                if snap.pose is not None:
-                    pose_fb = snap.pose
-                    if snap.q_deg is not None:
-                        q_fb = snap.q_deg
-                    observer.append(t_s, pose_fb, snap.force_raw)
-                    wrench = observer.latest_wrench()
-                    if wrench is not None:
-                        f_ext = wrench[1]
-                        fz_buf.append(float(f_ext[2]))
-                        if len(fz_buf) > 7:
-                            fz_buf.pop(0)
-                pose = pose_fb
-
-                if not scan_started and wait_contact and t_s >= hold_s:
-                    if require_observer and not observer.ready():
-                        if t_s - last_wait_msg >= 2.0:
-                            print(
-                                f"  waiting phi observer ({len(observer.buf)}/"
-                                f"{observer.cfg.min_samples})…",
-                                flush=True,
-                            )
-                            last_wait_msg = t_s
-                        start_streak = 0
-                    else:
-                        fz_s = _fz_smooth()
-                        if fz_s >= auto_start_fz_n:
-                            start_streak += 1
-                        else:
-                            start_streak = 0
-                        if start_streak >= auto_start_samples:
-                            pending_scan = True
-                            start_streak = 0
-
-                if pending_scan and not scan_started:
-                    pending_scan = False
-                    scan_started = True
-                    t_scan0 = now
-                    traj_origin = pose.copy()
-                    traj.set_origin(traj_origin)
-                    controller.reset(clear_velocity=ctrl_cfg.open_loop)
-                    print(
-                        f"  scan ON @ t={t_s:.1f}s  Fz={f_ext[2]:+.2f}N  traj={traj_kind}",
-                        flush=True,
-                    )
-
-                t_scan = (now - t_scan0) if (scan_started and t_scan0 is not None) else float("nan")
-                phase = 2 if scan_started else (1 if t_s >= hold_s else 0)
-                pose_d_log = np.zeros(6, dtype=float)
-                vel_ff_log = np.zeros(6, dtype=float)
-                f_des_z = float(desired_z)
-
-                if not scan_started:
-                    # No controller-driven approach descent: the external trajectory /
-                    # operator drives the probe into contact. This loop only LOCKS the
-                    # pose and waits until Fz≥threshold (auto-start) → then engages scan
-                    # directly. phase 0 = observer warm-up; phase 1 = locked, waiting for
-                    # contact. Both just hold (lock) the captured anchor.
-                    phase = 0 if (t_s < hold_s or (require_observer and not observer.ready())) else 1
-                    if hold_anchor is None:
-                        hold_anchor = pose.copy()
-                    pose_d_log = hold_anchor.copy()
-                    if hold_active:
-                        v_cmd = hold_velocity_command(
-                            pose, hold_anchor,
-                            control_frame=control_frame,
-                            euler_order=ctrl_cfg.euler_order,
-                            kp_pos=hold_kp_pos, kp_rot=hold_kp_rot,
-                            deadband_mm=hold_deadband_mm,
-                            max_vel_m_s=hold_max_vel_m_s,
-                            max_omega_rad_s=hold_max_omega_rad_s,
-                            last_v=controller.last_v_cmd,
-                            max_accel_m_s2=hold_accel_m_s2,
-                            dt_s=dt_s,
-                            hold_z=True,
-                        )
-                        controller.last_v_cmd = v_cmd.copy()
-                    else:
-                        v_cmd = np.zeros(6, dtype=float)
-                    d_hold_mm = (pose[:3] - hold_anchor[:3]) * 1000.0
-                    drift_mm = float(np.linalg.norm(d_hold_mm))
-                    if not hold_drift_warned and t_s >= 0.15 and drift_mm > 3.0:
-                        hold_drift_warned = True
-                        kind = "residual creep" if hold_active else "movev idle creep"
-                        print(
-                            f"  WARN: hold TCP drifted {drift_mm:.1f}mm "
-                            f"(Δ=[{d_hold_mm[0]:+.1f},{d_hold_mm[1]:+.1f},"
-                            f"{d_hold_mm[2]:+.1f}]) — {kind}",
-                            flush=True,
-                        )
-                    send_velocity_canfd(
-                        bot.robot, v_cmd.tolist(),
-                        follow=follow, trajectory_mode=traj_mode, radio=radio,
-                    )
-                    if scan_log is not None:
-                        log_tick += 1
-                        if log_tick >= log_every:
-                            log_tick = 0
-                            scan_log.append_row(
-                                t_s=t_s, t_scan=t_scan, phase=phase,
-                                pose_act=pose, q_deg=q_fb, pose_d=pose_d_log,
-                                vel_ff=vel_ff_log, v_cmd=v_cmd, f_ext=f_ext,
-                                f_des_z=f_des_z,
-                            )
-                    continue
-
-                sample = traj.sample(t_scan)
-                pose_d_log = sample.pose_d.copy()
-                vel_ff_log = sample.vel_ff.copy()
-                v_cmd = controller.compute_velocity_command(
-                    pose, sample.pose_d, sample.vel_ff, f_ext, f_des,
-                    in_contact=True,
-                    enable_pbac=not ctrl_cfg.open_loop,
-                )
-                phase = 2
-
-                v_cmd = np.asarray(v_cmd, dtype=float)
-                if not np.all(np.isfinite(v_cmd)):
-                    print(
-                        f"  WARN: non-finite v_cmd {v_cmd} — sending zero (phase={phase})",
-                        flush=True,
-                    )
-                    v_cmd = np.zeros(6, dtype=float)
-
-                if scan_log is not None:
-                    log_tick += 1
-                    if log_tick >= log_every:
-                        log_tick = 0
-                        scan_log.append_row(
-                            t_s=t_s,
-                            t_scan=t_scan,
-                            phase=phase,
-                            pose_act=pose,
-                            q_deg=q_fb,
-                            pose_d=pose_d_log,
-                            vel_ff=vel_ff_log,
-                            v_cmd=v_cmd,
-                            f_ext=f_ext,
-                            f_des_z=f_des_z,
-                        )
-
-                send_velocity_canfd(
-                    bot.robot, v_cmd.tolist(),
-                    follow=follow, trajectory_mode=traj_mode, radio=radio,
-                )
-
-                if scan_started and now - last_log >= 1.0:
-                    last_log = now
-
-                    dy_mm = float(pose[1] - traj_origin[1]) * 1000.0
-                    deuler = np.degrees([
-                        wrap_pi(float(pose[i] - traj_origin[i])) for i in range(3, 6)
-                    ])
-                    print(
-                        f"  t={t_s:.1f}s  ΔY_world={dy_mm:+.1f}mm  "
-                        f"Δeuler_deg=[{deuler[0]:+.2f},{deuler[1]:+.2f},{deuler[2]:+.2f}]  "
-                        f"Fz_ext={f_ext[2]:+.2f}N  "
-                        f"vy={v_cmd[1]:+.4f} ({control_frame} movev)",
-                        flush=True,
-                    )
-        except KeyboardInterrupt:
-            print("\nStopped.", flush=True)
-        finally:
-            async_obs.stop()
-            if scan_log is not None and len(scan_log) > 0 and log_path is not None:
-                try:
-                    saved = scan_log.save(
-                        log_path,
-                        meta={
-                            "traj_kind": traj_kind,
-                            "dt_ms": dt_ms,
-                            "async_poll_ms": async_poll_ms,
-                            "control_frame": control_frame,
-                            "frame_type": frame_type,
-                        },
-                    )
-                    print(f"  scan log saved → {saved} ({len(scan_log)} samples)", flush=True)
-                    print_jerk_summary(saved, dt_s=dt_s)
-                except Exception as exc:
-                    print(f"  scan log save failed: {exc}", flush=True)
+        def _hold() -> None:
+            # watchdog stall action: hold at the last commanded joint state
             try:
-                settle_movev_after_init(
-                    bot.robot, dt_ms=dt_ms, follow=follow,
-                    trajectory_mode=traj_mode, radio=radio, n_frames=15,
-                )
-                bot.robot.rm_set_arm_slow_stop()
+                send_joint_canfd(robot, rad2deg(inner.q_cmd), follow=False)
+            except Exception:
+                try:
+                    robot.rm_set_arm_slow_stop()
+                except Exception:
+                    pass
+
+        wd = Watchdog(watchdog_timeout_s, _hold)
+        wd.start()
+        try:
+            pose = pose0
+            for phase in phases:
+                if verbose:
+                    print(f"-- phase: {phase.label or phase.outer.__class__.__name__} --", flush=True)
+                if hasattr(phase.outer, "set_origin"):
+                    phase.outer.set_origin(pose)
+                if phase.on_enter is not None:
+                    phase.on_enter()
+
+                obs = phase.force_observer if phase.force_observer is not None else force_observer
+                phase_t0 = time.perf_counter()
+                next_tick = phase_t0
+                while True:
+                    now = time.perf_counter()
+                    t_phase = now - phase_t0
+                    if phase.duration_s is not None and t_phase >= phase.duration_s:
+                        break
+                    if phase.max_duration_s is not None and t_phase >= phase.max_duration_s:
+                        break
+                    jitter_ms = abs(now - next_tick) * 1000.0
+                    max_jitter_ms = max(max_jitter_ms, jitter_ms)
+
+                    snap = async_obs.read()
+                    pose = snap.pose if snap.pose is not None else pose
+                    f_ext = np.zeros(6)
+                    if obs is not None:
+                        _signed, f_ext = obs.update(now - total_t0, pose, snap.force_raw)
+
+                    twist = np.asarray(phase.outer.sample(t_phase, pose, f_ext), dtype=float)
+                    step = inner.update(twist, dt)
+                    send_joint_canfd(robot, rad2deg(step.q_send), follow=follow)
+                    wd.beat()
+
+                    if on_step is not None:
+                        on_step(phase.label, t_phase, step, pose, f_ext)
+
+                    if phase.wait_until is not None and phase.wait_until(pose):
+                        break
+
+                    ticks += 1
+                    next_tick += dt
+                    sleep_for = next_tick - time.perf_counter()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+        finally:
+            wd.stop()
+            stalled = wd.fired
+    finally:
+        async_obs.stop()
+
+    total_s = time.perf_counter() - total_t0
+    if verbose:
+        print(
+            f"  joint-admittance loop: {ticks} ticks, {total_s:.1f}s, "
+            f"max jitter {max_jitter_ms:.2f} ms{' [WATCHDOG FIRED]' if stalled else ''}",
+            flush=True,
+        )
+    return LoopResult(ticks=ticks, duration_s=total_s, max_jitter_ms=max_jitter_ms, stalled=stalled)
+
+
+def run_joint_admittance_loop(
+    session,
+    outer: OuterLoop,
+    inner: JointIkController,
+    *,
+    q_start_deg: np.ndarray | None = None,
+    duration_s: float = 10.0,
+    dt: float | None = None,
+    force_observer=None,
+    follow: bool = True,
+    move_speed: int = 20,
+    realtime: bool = False,
+    watchdog_timeout_s: float = 0.1,
+    on_step=None,
+    verbose: bool = True,
+) -> LoopResult:
+    """Single-phase convenience wrapper around ``run_joint_admittance_phases``."""
+    phase = Phase(outer=outer, label="run", duration_s=duration_s)
+    on_step_1 = None if on_step is None else (lambda label, t, step, pose, f_ext: on_step(t, step, pose, f_ext))
+    return run_joint_admittance_phases(
+        session,
+        [phase],
+        inner,
+        q_start_deg=q_start_deg,
+        dt=dt,
+        force_observer=force_observer,
+        follow=follow,
+        move_speed=move_speed,
+        realtime=realtime,
+        watchdog_timeout_s=watchdog_timeout_s,
+        on_step=on_step_1,
+        verbose=verbose,
+    )
+```
+
+## FILE: `rm75_control/control/joint_admittance/tasks/__init__.py`
+
+```py
+"""Secondary / priority tasks for the joint-space inner loop."""
+```
+
+## FILE: `rm75_control/control/joint_admittance/tasks/nullspace_task.py`
+
+```py
+"""Nullspace secondary task: joint centering + limit avoidance (Liegeois 1977).
+
+Produces a desired joint velocity `qdot0` that the CLIK/QP core projects into the
+nullspace of the primary Cartesian task, so it never perturbs TCP tracking.  It
+uses the redundancy of the 7-DOF arm to (a) pull joints toward the middle of
+their range and (b) repel them harder as they approach a limit.
+
+The cost being descended is the classic Liegeois manipulability/limit criterion
+    H(q) = 1/2 * sum_i w_i * ((q_i - q_mid_i) / half_range_i)^2
+    qdot0 = -k * dH/dq
+plus a smooth activation term that grows near the limits.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from rm75_control.control.joint_admittance.model import RobotKinematics
+
+
+@dataclass
+class NullspaceTaskConfig:
+    k_center: float = 1.0        # centering velocity gain (rad/s per normalized unit)
+    k_limit: float = 2.0         # extra repulsion gain near a limit
+    activation: float = 0.8      # |u| beyond which limit repulsion ramps in (u in [-1,1])
+    weights: np.ndarray | None = None   # optional per-joint weighting (len 7)
+
+
+class JointCenteringTask:
+    """Callable secondary task: q (rad) -> qdot0 (rad/s)."""
+
+    def __init__(
+        self,
+        q_lower: np.ndarray,
+        q_upper: np.ndarray,
+        cfg: NullspaceTaskConfig | None = None,
+    ) -> None:
+        self.q_lower = np.asarray(q_lower, dtype=float)
+        self.q_upper = np.asarray(q_upper, dtype=float)
+        self.cfg = cfg or NullspaceTaskConfig()
+        self.q_mid = 0.5 * (self.q_lower + self.q_upper)
+        self.half = 0.5 * (self.q_upper - self.q_lower)
+        # guard against zero-range joints
+        self.half = np.where(self.half > 1e-9, self.half, 1.0)
+        self.w = (
+            np.ones_like(self.q_mid)
+            if self.cfg.weights is None
+            else np.asarray(self.cfg.weights, dtype=float)
+        )
+
+    @classmethod
+    def from_kinematics(
+        cls, kin: RobotKinematics, cfg: NullspaceTaskConfig | None = None
+    ) -> "JointCenteringTask":
+        return cls(kin.q_lower, kin.q_upper, cfg)
+
+    def __call__(self, q_rad: np.ndarray) -> np.ndarray:
+        cfg = self.cfg
+        q = np.asarray(q_rad, dtype=float)
+        u = (q - self.q_mid) / self.half              # normalized position in [-1, 1]
+
+        # gradient-descent centering: -k * w * u
+        qdot0 = -cfg.k_center * self.w * u
+
+        # smooth limit repulsion beyond activation band
+        if cfg.k_limit > 0.0 and cfg.activation < 1.0:
+            span = max(1.0 - cfg.activation, 1e-6)
+            over = np.clip((np.abs(u) - cfg.activation) / span, 0.0, 1.0)
+            qdot0 = qdot0 - cfg.k_limit * np.sign(u) * (over * over)
+        return qdot0
+```
+
+## FILE: `rm75_control/control/joint_admittance/solver/__init__.py`
+
+```py
+"""Phase 2 QP inner-loop solver (ProxQP preferred, OSQP fallback)."""
+```
+
+## FILE: `rm75_control/control/joint_admittance/solver/constraint_mgr.py`
+
+```py
+"""Per-tick box constraints on joint velocity for the QP inner loop.
+
+Everything the safety layer enforces after the fact is expressed here as *hard*
+inequality bounds on the decision variable qdot, so the QP respects them while
+optimizing (rather than clipping an already-computed solution):
+
+    qdot in [-v_max, v_max]                              (velocity)
+    qdot in [(q_min+m - q)/dt, (q_max-m - q)/dt]         (position, look-ahead)
+    qdot in [qdot_prev - a_max*dt, qdot_prev + a_max*dt] (acceleration)
+
+The three boxes are intersected.  If a position bound and another bound cross
+(the joint is already past a limit), the position bound wins and both l and u
+collapse onto it, which drives the joint back inside next tick.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from rm75_control.control.joint_admittance.utils.safety import SafetyLimits
+
+
+class VelocityBoxConstraints:
+    def __init__(self, limits: SafetyLimits) -> None:
+        self.lim = limits
+
+    def bounds(
+        self,
+        q: np.ndarray,
+        dt: float,
+        qdot_prev: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        lim = self.lim
+        q = np.asarray(q, dtype=float)
+
+        lo = -lim.v_max.copy()
+        hi = lim.v_max.copy()
+
+        # position look-ahead
+        m = lim.position_margin
+        p_lo = (lim.q_lower + m - q) / dt
+        p_hi = (lim.q_upper - m - q) / dt
+        lo = np.maximum(lo, p_lo)
+        hi = np.minimum(hi, p_hi)
+
+        # acceleration
+        if lim.a_max is not None and qdot_prev is not None:
+            qdot_prev = np.asarray(qdot_prev, dtype=float)
+            a = lim.a_max * dt
+            lo = np.maximum(lo, qdot_prev - a)
+            hi = np.minimum(hi, qdot_prev + a)
+
+        # resolve crossings: position limit dominates
+        crossed = lo > hi
+        if np.any(crossed):
+            mid = np.clip(0.0, p_lo, p_hi)  # bias toward staying in position range
+            lo = np.where(crossed, np.minimum(p_lo, p_hi), lo)
+            hi = np.where(crossed, np.maximum(p_lo, p_hi), hi)
+            # if still crossed after using position bounds only, collapse to feasible point
+            still = lo > hi
+            if np.any(still):
+                lo = np.where(still, mid, lo)
+                hi = np.where(still, mid, hi)
+        return lo, hi
+```
+
+## FILE: `rm75_control/control/joint_admittance/solver/qp_builder.py`
+
+```py
+"""QP-based inverse kinematics core (Phase 2), a drop-in for ClikController.
+
+Solves, every tick, the box-constrained velocity-IK QP
+
+    min_qdot  0.5 * || J qdot - v_task ||^2_{W} + 0.5 * reg * || qdot - qdot_0 ||^2
+    s.t.      l <= qdot <= u          (velocity / position look-ahead / accel)
+
+where v_task = twist_ref + K * e_x (the same CLIK closed-loop feedback as
+Phase 1) and qdot_0 is the secondary (centering) task.  Redundancy is resolved
+implicitly: the reg term pulls qdot toward qdot_0 in the directions the task
+leaves free, so no explicit nullspace projection is needed, and all limits are
+respected *as hard constraints* rather than post-hoc clipping.
+
+Backends: ProxQP (preferred, warm-started -> sub-ms) with an OSQP fallback.
+The ``step`` signature and returned ClikResult match ClikController, so
+JointIkController can swap cores without any other change.
+
+References: Escande/Kanoun task-priority QP; Diehl QP methods; Sentis WBC.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from rm75_control.control.joint_admittance.clik import (
+    ClikResult,
+    _saturate_error,
+    integrate_pose,
+)
+from rm75_control.control.joint_admittance.model import RobotKinematics, pose_error
+from rm75_control.control.joint_admittance.solver.constraint_mgr import VelocityBoxConstraints
+from rm75_control.control.joint_admittance.utils.safety import SafetyLimits
+
+
+@dataclass
+class QpConfig:
+    k_task: np.ndarray = field(default_factory=lambda: np.full(6, 2.0))
+    task_weight: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0, 1.0, 0.5, 0.5, 0.5]))
+    reg: float = 1e-3               # regularization / secondary-task weight
+    reg_secondary_scale: float = 1.0  # scales qdot_0 contribution to g
+    max_pos_err_m: float = 0.05
+    max_rot_err_rad: float = 0.20
+    euler_order: str = "xyz"
+    backend: str = "proxqp"         # "proxqp" | "osqp"
+    eps_abs: float = 1e-6
+    max_iter: int = 200
+    sigma_thresh: float = 0.04      # kept only for diagnostics / manip reporting
+
+
+class _ProxQpBackend:
+    def __init__(self, n: int, cfg: QpConfig) -> None:
+        import proxsuite
+
+        self._px = proxsuite
+        self.n = n
+        # n_eq = 0, n_in = n (box via C = I)
+        self.qp = proxsuite.proxqp.dense.QP(n, 0, n)
+        self.C = np.eye(n)
+        self.qp.settings.eps_abs = cfg.eps_abs
+        self.qp.settings.max_iter = cfg.max_iter
+        self.qp.settings.initial_guess = (
+            proxsuite.proxqp.InitialGuess.WARM_START_WITH_PREVIOUS_RESULT
+        )
+        self._initialized = False
+
+    def solve(self, H, g, lo, hi):
+        if not self._initialized:
+            self.qp.init(H, g, None, None, self.C, lo, hi)
+            self._initialized = True
+        else:
+            self.qp.update(H=H, g=g, C=self.C, l=lo, u=hi)
+        self.qp.solve()
+        return np.asarray(self.qp.results.x, dtype=float)
+
+
+class _OsqpBackend:
+    def __init__(self, n: int, cfg: QpConfig) -> None:
+        import osqp
+        import scipy.sparse as sp
+
+        self._osqp = osqp
+        self._sp = sp
+        self.n = n
+        self.cfg = cfg
+        self.A = sp.identity(n, format="csc")
+        self.prob = None
+
+    def solve(self, H, g, lo, hi):
+        sp = self._sp
+        P = sp.csc_matrix(np.triu(H))
+        if self.prob is None:
+            self.prob = self._osqp.OSQP()
+            self.prob.setup(
+                P, g, self.A, lo, hi,
+                verbose=False, warm_start=True,
+                eps_abs=self.cfg.eps_abs, eps_rel=self.cfg.eps_abs,
+                max_iter=self.cfg.max_iter,
+            )
+        else:
+            self.prob.update(Px=P.data, q=g, l=lo, u=hi)
+        res = self.prob.solve()
+        if res.x is None or np.any(np.isnan(res.x)):
+            return np.zeros(self.n)
+        return np.asarray(res.x, dtype=float)
+
+
+class QpIkController:
+    """QP velocity-IK core with the same interface as ClikController."""
+
+    def __init__(
+        self,
+        kin: RobotKinematics,
+        limits: SafetyLimits,
+        cfg: QpConfig | None = None,
+    ) -> None:
+        self.kin = kin
+        self.cfg = cfg or QpConfig()
+        self.constraints = VelocityBoxConstraints(limits)
+        self.x_ref = np.zeros(6, dtype=float)
+        self.qdot_prev = np.zeros(kin.nv, dtype=float)
+        self._initialized = False
+        self.backend = self._make_backend(kin.nv)
+
+    def _make_backend(self, n: int):
+        want = self.cfg.backend.lower()
+        if want == "proxqp":
+            try:
+                return _ProxQpBackend(n, self.cfg)
             except Exception:
                 pass
+        if want in ("osqp", "proxqp"):
+            try:
+                return _OsqpBackend(n, self.cfg)
+            except Exception as exc:  # pragma: no cover
+                raise RuntimeError(
+                    "No QP backend available (install proxsuite or osqp)"
+                ) from exc
+        raise ValueError(f"unknown QP backend {self.cfg.backend!r}")
 
-    return 0
+    @property
+    def backend_name(self) -> str:
+        return type(self.backend).__name__.replace("_", "").replace("Backend", "").lower()
+
+    def reset(self, q0_rad: np.ndarray, pose0: np.ndarray | None = None) -> None:
+        self.x_ref = (
+            np.asarray(pose0, dtype=float).copy()
+            if pose0 is not None
+            else self.kin.fk_pose(q0_rad)
+        )
+        self.qdot_prev = np.zeros(self.kin.nv, dtype=float)
+        self._initialized = True
+
+    def set_reference(self, pose: np.ndarray) -> None:
+        self.x_ref = np.asarray(pose, dtype=float).copy()
+
+    def step(
+        self,
+        q_prev: np.ndarray,
+        twist_ref: np.ndarray,
+        dt: float,
+        secondary_qdot: np.ndarray | None = None,
+    ) -> ClikResult:
+        cfg = self.cfg
+        q_prev = np.asarray(q_prev, dtype=float)
+        twist_ref = np.asarray(twist_ref, dtype=float)
+        if not self._initialized:
+            self.reset(q_prev)
+
+        # advance integrated Cartesian reference
+        self.x_ref = integrate_pose(self.x_ref, twist_ref, dt, cfg.euler_order)
+
+        J = self.kin.jacobian(q_prev)
+        sigma = self.kin.singular_values(J)
+        sigma_min = float(sigma.min())
+
+        x_cur = self.kin.fk_pose(q_prev)
+        err = pose_error(self.x_ref, x_cur, cfg.euler_order)
+        err_sat = _saturate_error(err, cfg.max_pos_err_m, cfg.max_rot_err_rad)
+        v_task = twist_ref + cfg.k_task * err_sat
+
+        W = np.diag(cfg.task_weight)
+        H = J.T @ W @ J + cfg.reg * np.eye(self.kin.nv)
+        # symmetrize for solver numerics
+        H = 0.5 * (H + H.T)
+        g = -(J.T @ (W @ v_task))
+        if secondary_qdot is not None:
+            g = g - cfg.reg * cfg.reg_secondary_scale * np.asarray(secondary_qdot, dtype=float)
+
+        lo, hi = self.constraints.bounds(q_prev, dt, self.qdot_prev)
+        qdot = self.backend.solve(
+            np.ascontiguousarray(H),
+            np.ascontiguousarray(g),
+            np.ascontiguousarray(lo),
+            np.ascontiguousarray(hi),
+        )
+        self.qdot_prev = qdot
+        q_next = q_prev + qdot * dt
+        return ClikResult(
+            q_next=q_next,
+            qdot=qdot,
+            x_ref=self.x_ref.copy(),
+            x_cur=x_cur,
+            cart_err=err,
+            sigma_min=sigma_min,
+            lam=cfg.reg,
+            manip=self.kin.manipulability(J),
+        )
 ```
 
-## `rm75_control/control/velocity_admittance/rm_algo.py`
+## FILE: `rm75_control/control/joint_admittance/utils/__init__.py`
 
-```python
-"""RM algo helpers (pose structs for rm_algo_* calls)."""
+```py
+"""Utilities for the joint-space inner loop (smoothing, safety, watchdog)."""
+```
+
+## FILE: `rm75_control/control/joint_admittance/utils/safety.py`
+
+```py
+"""Safety layer for direct joint-position streaming.
+
+When you bypass MoveJ's built-in S-curve planner and push q_cmd straight into
+rm_movej_canfd, the motor drivers will fault (over-current / following error) on
+any discontinuity.  This module enforces, per tick, in order:
+
+  1. velocity limit : |dq| <= v_max * dt          (per-frame dq clamp)
+  2. acceleration   : |dq - dq_prev| <= a_max*dt^2 (jerk-free enough for CANFD)
+  3. position limit : q in [q_lower+margin, q_upper-margin]
+
+plus a Watchdog thread that trips (freeze / slow-stop) if the control loop stops
+feeding heartbeats - so a stuck Python process can never leave the arm coasting.
+"""
 
 from __future__ import annotations
 
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable
 
-def pose_to_rm_pose(pose: list[float]):
-    from Robotic_Arm.rm_ctypes_wrap import rm_euler_t, rm_pose_t, rm_position_t
-
-    po = rm_pose_t()
-    po.position = rm_position_t(*pose[:3])
-    po.euler = rm_euler_t(*pose[3:6])
-    return po
+import numpy as np
 
 
-def end2tool_pose(robot, pose6: list[float]) -> list[float]:
-    return list(robot.rm_algo_end2tool(pose_to_rm_pose(pose6)))
+@dataclass
+class SafetyLimits:
+    q_lower: np.ndarray
+    q_upper: np.ndarray
+    v_max: np.ndarray                       # rad/s (per joint)
+    a_max: np.ndarray | None = None         # rad/s^2 (per joint); None disables accel clamp
+    position_margin: float = 0.017          # ~1 deg back-off from hard limit
+
+    @classmethod
+    def from_kinematics(
+        cls,
+        kin,
+        *,
+        v_scale: float = 1.0,
+        a_max: np.ndarray | float | None = None,
+        position_margin: float = 0.017,
+    ) -> "SafetyLimits":
+        v_max = np.asarray(kin.v_max, dtype=float) * float(v_scale)
+        if a_max is not None and np.isscalar(a_max):
+            a_max = np.full_like(v_max, float(a_max))
+        return cls(
+            q_lower=np.asarray(kin.q_lower, dtype=float),
+            q_upper=np.asarray(kin.q_upper, dtype=float),
+            v_max=v_max,
+            a_max=None if a_max is None else np.asarray(a_max, dtype=float),
+            position_margin=position_margin,
+        )
 
 
-def end2tool_xyz(robot, pose6: list[float]) -> list[float]:
-    return end2tool_pose(robot, pose6)[:3]
+@dataclass
+class SafetyReport:
+    q_safe: np.ndarray
+    dq: np.ndarray
+    vel_clamped: bool = False
+    acc_clamped: bool = False
+    pos_clamped: bool = False
+
+
+class SafetyLimiter:
+    """Stateful per-tick clamp: velocity -> acceleration -> position."""
+
+    def __init__(self, limits: SafetyLimits) -> None:
+        self.lim = limits
+        self._dq_prev: np.ndarray | None = None
+
+    def reset(self, q0: np.ndarray | None = None) -> None:
+        self._dq_prev = None
+
+    def clamp(self, q_prev: np.ndarray, q_desired: np.ndarray, dt: float) -> SafetyReport:
+        lim = self.lim
+        q_prev = np.asarray(q_prev, dtype=float)
+        q_desired = np.asarray(q_desired, dtype=float)
+        dq = q_desired - q_prev
+
+        vel_clamped = acc_clamped = pos_clamped = False
+
+        # 1) velocity limit
+        dq_max = lim.v_max * dt
+        clipped = np.clip(dq, -dq_max, dq_max)
+        if not np.allclose(clipped, dq):
+            vel_clamped = True
+        dq = clipped
+
+        # 2) acceleration limit (change in dq between ticks)
+        if lim.a_max is not None and self._dq_prev is not None:
+            ddq_max = lim.a_max * dt * dt
+            ddq = dq - self._dq_prev
+            ddq_c = np.clip(ddq, -ddq_max, ddq_max)
+            if not np.allclose(ddq_c, ddq):
+                acc_clamped = True
+            dq = self._dq_prev + ddq_c
+
+        q_safe = q_prev + dq
+
+        # 3) position limit
+        lo = lim.q_lower + lim.position_margin
+        hi = lim.q_upper - lim.position_margin
+        q_clamped = np.clip(q_safe, lo, hi)
+        if not np.allclose(q_clamped, q_safe):
+            pos_clamped = True
+            dq = q_clamped - q_prev
+        q_safe = q_clamped
+
+        self._dq_prev = dq
+        return SafetyReport(
+            q_safe=q_safe,
+            dq=dq,
+            vel_clamped=vel_clamped,
+            acc_clamped=acc_clamped,
+            pos_clamped=pos_clamped,
+        )
+
+
+class Watchdog:
+    """Independent heartbeat monitor.
+
+    The control loop calls `beat()` every tick.  If no beat arrives within
+    `timeout_s`, the watchdog fires `on_stall` exactly once (e.g. slow-stop the
+    arm / latch a hold).  Runs as a daemon thread so it survives a stuck loop.
+    """
+
+    def __init__(
+        self,
+        timeout_s: float,
+        on_stall: Callable[[], None],
+        *,
+        poll_s: float = 0.005,
+        name: str = "ja-watchdog",
+    ) -> None:
+        self.timeout_s = float(timeout_s)
+        self.on_stall = on_stall
+        self.poll_s = float(poll_s)
+        self._name = name
+        self._last_beat = time.perf_counter()
+        self._stop = threading.Event()
+        self._fired = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def beat(self) -> None:
+        with self._lock:
+            self._last_beat = time.perf_counter()
+            # allow re-arming after a transient recovery
+            self._fired.clear()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._last_beat = time.perf_counter()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    @property
+    def fired(self) -> bool:
+        return self._fired.is_set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                dt = time.perf_counter() - self._last_beat
+            if dt > self.timeout_s and not self._fired.is_set():
+                self._fired.set()
+                try:
+                    self.on_stall()
+                except Exception:
+                    pass
+            time.sleep(self.poll_s)
+
+    def __enter__(self) -> "Watchdog":
+        self.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
 ```
 
-## `tmp/Velocity_Admittance/demo/config/sin_tool_y_z2n.yaml`
+## FILE: `rm75_control/control/joint_admittance/utils/smoothing.py`
 
-```yaml
-# 5-DOF PBAC (X,Y,Rx,Ry,Rz) + tool-Z force admittance (sleeve decoupling).
-#
-# Task-frame formalism (De Schutter & Van Brussel 1988; Bruyninckx & De Schutter 1996):
-#   tool-Z = force-controlled direction; tool-X/Y + attitude = velocity-controlled
-#   tracking directions (orthogonal, never both on one DOF).
-#
-# Stability fixes grounded in Keemink et al. 2018 (Table 3 guidelines):
-#   1. Switch-in bumpless: quiescence-wait after CANFD init + active pose-hold during
-#      the hold/approach phase (zero velocity does NOT hold pose post-init → idle creep).
-#   2. Position dims: error deadband + bounded PBAC correction on the tracking axes
-#      (vel_ff stays authoritative; G5 phase-lead kept via system_delay_s).
-#   3. Force-Z jerk: finite virtual-mass accel limit (vz_accel_limit_m_s2, G4/G6) +
-#      light force/vel filtering (G2: avoid heavy phase lag) + sane normal-speed cap.
-#
-# Run:
-#   python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py --trajectory sin_tool_y --log
+```py
+"""Command smoothing for direct joint-position streaming.
 
-timing:
-  dt_ms: 10.0
-  async_poll_ms: 10.0
+Even a mathematically continuous q_cmd, sampled at 100-1000 Hz, carries
+high-frequency content that shows up as motor current ripple.  These filters
+smooth q_cmd before it hits rm_movej_canfd.  All are per-joint and stateful.
 
-startup:
-  pose_slot: d
-  settle_frames: 30
-  hold_s: 1.0
-  pre_movev_prep: light       # run_sin_tool_y: slow_stop + delete_traj before init
-  pre_movev_settle_s: 0.0
-  post_init_realign: false
-  auto_recover: false         # true adds stop_all before move_j → larger init snap
-  wait_contact: true          # lock pose, wait for EXTERNAL contact (no descent here)
-  auto_start_under_n: 0.5      # trigger at Fz ≥ desired_z - 0.5 = 2.5 N
-  auto_start_hold_s: 0.3       # held 0.3 s → engage scan directly
-  # Active position-hold (counters movev idle-creep → bumpless switch-in).
-  hold_active: true
-  hold_kp_pos: 1.5
-  hold_kp_rot: 1.5
-  hold_deadband_mm: 0.3
-  hold_max_vel_m_s: 0.02
-  hold_max_omega_rad_s: 0.10
-  hold_accel_m_s2: 0.3
+Provided:
+* FirstOrderLowPass    - single-pole IIR (cheap, ~6 dB/oct).
+* SecondOrderLowPass   - critically-damped 2nd order (S-curve-like step response,
+                         no overshoot; ~12 dB/oct).
+* MovingAverage        - boxcar window.
 
-frames:
-  euler_order: xyz
-  control_frame: tool
-
-velocity_canfd:
-  frame_type: 0
-  avoid_singularity: 0
-  follow: true
-  trajectory_mode: 0
-  radio: 0
-
-force:
-  phi_source: phi_recommended
-  buffer_s: 2.0
-  min_samples: 22
-  fc_hz: 4.0
-  use_inertia: false
-  desired_z_n: 3.0
-
-trajectory:
-  type: sin_base_y_tool_rz
-  y_peak_to_peak_cm: 16.0
-  rz_amplitude_deg: 12.0
-  y_max_vel_cm_s: 3.0
-  soft_start: true
-  ramp_s: 2.0
-  open_loop: false
-
-controller:
-  force_axes: [0, 0, 1, 0, 0, 0]
-  open_loop: false
-  # 5-DOF PBAC. kp_pos[0,1] are now TOOL-X / TOOL-Y gains (translation loop runs in the
-  # tool frame, force axis tool-Z excluded). Decoupling lets us raise them safely:
-  # tool-X holds the probe laterally (no commanded motion), tool-Y tracks the sweep.
-  track_axes: [1, 1, 0, 1, 1, 1]
-  kp_pos: [0.15, 0.30, 0.0, 0.4, 0.4, 0.4]
-  deadband_n: 0.3
-  deadband_width_n: 0.2
-  system_delay_s: 0.015
-  k_fp_press: 0.035
-  k_fp_release: 0.030
-  k_fi: 0.001
-  integral_limit: 0.015
-  # Position-loop conditioning (tracking axes): kill noise jitter + bound slip surge.
-  pos_err_deadband_m: 0.0005   # 0.5 mm
-  pos_correction_max_m_s: 0.03
-  # Normal (tool-Z) force admittance.
-  # Velocity-loop bandwidth (Keemink G6): tool-Z MUST be fast enough to follow the
-  # surface as Y sweeps, else force error saturates (0.06 m/s capped 42% of the scan
-  # → Fz σ blew up). 0.15 m/s gives headroom (good run saturated only 1%).
-  max_vz_tool_m_s: 0.15
-  approach_vz_tool_m_s: 0.02   # gentler contact → less preload overshoot at handoff
-  # Virtual mass = FINITE accel limit (Keemink G4/G6): bounds jerk WITHOUT crippling
-  # tracking. 3.0 m/s² reaches full vz in ~50 ms (vs the old ∞ slew-skip → |dv/dt|≈7).
-  vz_accel_limit_m_s2: 3.0
-  slew_skip_force_axes: false
-  vz_filter_alpha: 0.30        # moderate LPF; virtual mass does the rest (G2: no heavy lag)
-  max_velocity: [0.03, 0.10, 0.15, 0.12, 0.12, 0.12]
-  max_acceleration: [0.5, 1.0, 3.0, 0.5, 0.5, 0.5]
-
-monitor:
-  log: false
-  log_every: 1
-```
-
-## `tmp/Velocity_Admittance/config/admittance.yaml`
-
-```yaml
-# Velocity admittance — library: rm75_control.control.velocity_admittance
-# Generic: python tmp/Velocity_Admittance/run_admittance.py
-# Demo:    python tmp/Velocity_Admittance/demo/sin_tool_y_z2n.py
-
-timing:
-  dt_ms: 10.0
-  async_poll_ms: 10.0
-
-startup:
-  pose_slot: d
-
-frames:
-  euler_order: xyz   # rm_get_current_arm_state pose; match configs/force_sensor.yaml
-
-velocity_canfd:
-  frame_type: 1          # 0 tool, 1 work/base — v_cmd output is base frame
-  avoid_singularity: 0
-  follow: true
-  trajectory_mode: 0     # 0 passthrough — smoothing in controller only
-  radio: 0
-
-force:
-  phi_source: phi_recommended
-  buffer_s: 4.0
-  min_samples: 35
-  use_inertia: false     # no virtual mass — PI admittance only (Keemink §5.4)
-  desired_z_n: 3.0
-
-trajectory:
-  type: sin_tool_y       # hold | sin_tool_y | sin_base_y
-  amplitude_mm: 5.0
-  period_s: null         # auto from y_max_vel_cm_s if null
-  y_max_vel_cm_s: 1.0
-
-controller:
-  force_axes: [0, 0, 1, 0, 0, 0]   # 1 = admittance on axis (sensor frame)
-  motion_axes: [0, 1, 0, 0, 0, 0]
-  lock_orientation: true
-  enable_normal_tracking: false
-  kp_pos: [2.0, 2.0, 0.0, 1.5, 1.5, 1.5]
-  system_delay_s: 0.015
-  k_fp_press: 0.015
-  k_fp_release: 0.005
-  k_fi: 0.008
-  integral_limit: 0.05
-  k_align: 0.0
-  contact_threshold_n: 0.5
-  deadband_n: 0.3
-  max_vz_tool_m_s: 0.05
-  max_velocity: [0.2, 0.2, 0.05, 0.08, 0.08, 0.08]
-  max_acceleration: [1.0, 1.0, 0.05, 0.15, 0.15, 0.15]
-  release_vz_up_m_s: 0.05
-  release_vz_down_m_s: 0.05
-
-monitor:
-  enabled: false
-  window_s: 25.0
-  refresh_hz: 12.0
-```
-
-## `rm75_control/motion/canfd.py`
-
-```python
-"""CANFD pose and velocity streaming via rm_movep_canfd / rm_movev_canfd."""
+Cutoff is specified in Hz; alpha is derived from the control dt.
+"""
 
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from collections import deque
+
+import numpy as np
+
+
+def alpha_from_cutoff(cutoff_hz: float, dt: float) -> float:
+    """First-order IIR smoothing factor for a given cutoff and sample period."""
+    if cutoff_hz <= 0.0:
+        return 1.0  # no filtering
+    tau = 1.0 / (2.0 * np.pi * cutoff_hz)
+    return float(dt / (tau + dt))
+
+
+class FirstOrderLowPass:
+    def __init__(self, cutoff_hz: float, dt: float, dim: int = 7) -> None:
+        self.alpha = alpha_from_cutoff(cutoff_hz, dt)
+        self.dim = dim
+        self._y: np.ndarray | None = None
+
+    def reset(self, x0: np.ndarray | None = None) -> None:
+        self._y = None if x0 is None else np.asarray(x0, dtype=float).copy()
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        if self._y is None:
+            self._y = x.copy()
+        else:
+            self._y = self._y + self.alpha * (x - self._y)
+        return self._y.copy()
+
+    def sync(self, y: np.ndarray) -> None:
+        """Force the filter output state to `y` (keep it aligned with the value
+        actually sent after a downstream safety clamp)."""
+        self._y = np.asarray(y, dtype=float).copy()
+
+
+class SecondOrderLowPass:
+    """Critically-damped-equivalent 2nd-order low-pass, monotone step response.
+
+    Implemented as two cascaded first-order IIR stages at the SAME cutoff
+    (two coincident real poles = the discrete analogue of critical damping).
+    Each stage is `y += alpha*(x-y)` with `0 < alpha <= 1`, which is
+    UNCONDITIONALLY STABLE for any cutoff_hz / dt (unlike an explicit-Euler
+    integration of the continuous mass-spring-damper ODE, which only stays
+    stable while omega*dt is small and produces large tracking lag / blows up
+    numerically as cutoff approaches ~1/(2*dt)).  This lets you raise the
+    cutoff at a fixed control dt without risking instability - the tradeoff
+    between smoothing and ramp-tracking lag is then just alpha vs alpha^2.
+    """
+
+    def __init__(self, cutoff_hz: float, dt: float, dim: int = 7) -> None:
+        self.cutoff_hz = cutoff_hz
+        self.dt = dt
+        self.dim = dim
+        self.alpha = alpha_from_cutoff(cutoff_hz, dt)
+        self._y1: np.ndarray | None = None
+        self._y2: np.ndarray | None = None
+
+    def reset(self, x0: np.ndarray | None = None) -> None:
+        self._y1 = None if x0 is None else np.asarray(x0, dtype=float).copy()
+        self._y2 = None if x0 is None else np.asarray(x0, dtype=float).copy()
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        if self._y1 is None:
+            self._y1 = x.copy()
+            self._y2 = x.copy()
+            return self._y2.copy()
+        self._y1 = self._y1 + self.alpha * (x - self._y1)
+        self._y2 = self._y2 + self.alpha * (self._y1 - self._y2)
+        return self._y2.copy()
+
+    def sync(self, y: np.ndarray) -> None:
+        """Re-seat both stages on the actually-sent value after a clamp."""
+        y = np.asarray(y, dtype=float).copy()
+        self._y1 = y.copy()
+        self._y2 = y.copy()
+
+
+class MovingAverage:
+    def __init__(self, window: int, dim: int = 7) -> None:
+        self.window = max(int(window), 1)
+        self.dim = dim
+        self._buf: deque[np.ndarray] = deque(maxlen=self.window)
+
+    def reset(self, x0: np.ndarray | None = None) -> None:
+        self._buf.clear()
+        if x0 is not None:
+            self._buf.append(np.asarray(x0, dtype=float).copy())
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        self._buf.append(x.copy())
+        return np.mean(np.stack(self._buf, axis=0), axis=0)
+```
+
+## FILE: `rm75_control/control/joint_admittance/utils/friction.py`
+
+```py
+"""Optional joint friction / stiction feed-forward (Phase 3, experimental).
+
+RM harmonic-drive joints have noticeable static friction; at very low scan speed
+the force loop can stick-slip while the joint fights breakaway.  With only a
+position/velocity interface (no direct torque command) we cannot inject a true
+torque compensation, so this applies a *velocity-level* nudge: a smooth Coulomb
++ viscous term that adds a small breakaway velocity in the direction of motion.
+
+Disabled by default.  Enable and tune ONLY after the basic loop is stable, and
+keep the gains tiny - excessive compensation causes limit-cycle chatter.
+
+    dqdot = fc * tanh(qdot / v_eps) + fv * qdot
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+
+@dataclass
+class FrictionConfig:
+    enabled: bool = False
+    coulomb: np.ndarray = field(default_factory=lambda: np.zeros(7))   # rad/s breakaway nudge
+    viscous: np.ndarray = field(default_factory=lambda: np.zeros(7))   # rad/s per rad/s
+    v_eps: float = 0.02                                                # rad/s smoothing of sign()
+
+
+class FrictionCompensator:
+    def __init__(self, cfg: FrictionConfig | None = None) -> None:
+        self.cfg = cfg or FrictionConfig()
+
+    def __call__(self, qdot: np.ndarray) -> np.ndarray:
+        cfg = self.cfg
+        if not cfg.enabled:
+            return np.zeros_like(qdot)
+        qdot = np.asarray(qdot, dtype=float)
+        return cfg.coulomb * np.tanh(qdot / max(cfg.v_eps, 1e-6)) + cfg.viscous * qdot
+```
+
+## FILE: `rm75_control/force/compensation/tool_pose.py`
+
+```py
+"""Map poses.yaml slot TCP into the active tool frame (FK from q_deg)."""
+
+from __future__ import annotations
+
+import numpy as np
+
+# Scan / admittance standoff: poses.yaml slot d is force-ID Arm_Tip at contact;
+# runtime scan pose D is +220 mm along tool +Z from that teach pose (not FK(q_deg)).
+DEFAULT_SCAN_APPROACH_DZ_M = 0.220
+
+
+def get_active_tool_name(robot) -> str:
+    ret, cur = robot.rm_get_current_tool_frame()
+    if ret != 0:
+        return ""
+    return str(cur.get("name", ""))
+
+
+def poses_calib_tool_frame(poses_data: dict, *, default: str = "Arm_Tip") -> str:
+    return str(poses_data.get("pose_tool_frame", default))
+
+
+def slot_tcp_pose(
+    robot,
+    q_deg: np.ndarray,
+    pose_stored: np.ndarray,
+    *,
+    calib_tool: str,
+) -> np.ndarray:
+    """
+    TCP pose in base frame for the **active** tool at slot ``q_deg``.
+
+    ``poses.yaml`` ``pose_base`` is recorded with ``calib_tool`` active (e.g. Arm_Tip).
+    When the Web UI active tool differs (e.g. gripper, ~220 mm offset on RM75-6F),
+    ``state.pose`` and stored ``pose_base`` disagree at the same ``q_deg`` — use FK.
+    """
+    q_deg = np.asarray(q_deg, dtype=float)
+    pose_stored = np.asarray(pose_stored, dtype=float)
+    active = get_active_tool_name(robot)
+    if active and calib_tool and active != calib_tool:
+        fk = robot.rm_algo_forward_kinematics(q_deg.tolist(), flag=1)
+        return np.asarray(fk[:6], dtype=float)
+    return pose_stored.copy()
+
+
+def tool_frame_delta_pose(
+    robot,
+    pose_ref: np.ndarray,
+    dx: float,
+    dy: float,
+    dz: float,
+) -> np.ndarray:
+    """Apply a translation delta in the tool frame of ``pose_ref`` (Realman frameMode=1)."""
+    delta = [float(dx), float(dy), float(dz), 0.0, 0.0, 0.0]
+    out = robot.rm_algo_pose_move(list(np.asarray(pose_ref, dtype=float)), delta, frameMode=1)
+    return np.asarray(out[:6], dtype=float)
+
+
+def slot_scan_approach_pose(
+    robot,
+    pose_arm_tip: np.ndarray,
+    *,
+    approach_dz_m: float = DEFAULT_SCAN_APPROACH_DZ_M,
+) -> np.ndarray:
+    """
+    Scan standoff pose D from a force-ID slot teach pose.
+
+    ``poses.yaml`` slot ``d`` ``pose_base`` is saved with ``Arm_Tip`` at the
+    contact / identification tip.  The velocity-admittance scan startup pose D is
+    **+220 mm along tool +Z** (outward, away from tissue) — not the raw teach
+    pose and not ``FK(q_deg)`` with ``gripper`` active (that lands on the tip).
+    """
+    return tool_frame_delta_pose(robot, pose_arm_tip, 0.0, 0.0, approach_dz_m)
+```
+
+## FILE: `rm75_control/motion/canfd.py`
+
+```py
+"""CANFD pose and velocity streaming + unified handoff (traj0 only)."""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Protocol, Sequence
+
+import numpy as np
 
 from rm75_control.core.exceptions import MotionError
 
@@ -2562,6 +2283,11 @@ Vel6 = Sequence[float]
 
 MAX_LINEAR_V_M_S = 0.25
 MAX_ANGULAR_V_RAD_S = 0.6
+
+TRAJ0_MODE = 0
+TRAJ0_RADIO = 0
+
+LATCHED_ERR_CODES = frozenset({"4119", "1003", "4099", "0x1003"})
 
 
 class PoseCanfdClient(Protocol):
@@ -2583,14 +2309,15 @@ def send_pose_canfd(
     trajectory_mode: int = 0,
     radio: int = 0,
 ) -> None:
+    del trajectory_mode, radio
     if len(pose) not in (6, 7):
         raise ValueError(f"pose must have 6 (euler) or 7 (quat) elements, got {len(pose)}")
 
     ret = robot.rm_movep_canfd(
         list(pose),
         follow,
-        trajectory_mode,
-        radio,
+        TRAJ0_MODE,
+        TRAJ0_RADIO,
     )
     if ret != 0:
         raise MotionError(f"rm_movep_canfd failed with code {ret}")
@@ -2624,13 +2351,1253 @@ def send_velocity_canfd(
     trajectory_mode: int = 0,
     radio: int = 0,
 ) -> None:
+    del trajectory_mode, radio
     ret = robot.rm_movev_canfd(
         clamp_cartesian_velocity(cartesian_velocity),
         follow,
-        trajectory_mode,
-        radio,
+        TRAJ0_MODE,
+        TRAJ0_RADIO,
     )
     if ret != 0:
         raise MotionError(f"rm_movev_canfd failed with code {ret}")
+
+
+class JointCanfdClient(Protocol):
+    def rm_movej_canfd(
+        self,
+        joint: list[float],
+        follow: bool,
+        expand: float = 0,
+        trajectory_mode: int = 0,
+        radio: int = 0,
+    ) -> int:
+        ...
+
+
+def send_joint_canfd(
+    robot: JointCanfdClient,
+    joint_deg: Sequence[float],
+    *,
+    follow: bool = True,
+    expand: float = 0.0,
+    trajectory_mode: int = 0,
+    radio: int = 0,
+) -> None:
+    """Stream absolute joint angles (degrees) via rm_movej_canfd passthrough.
+
+    This is the single output interface for the joint-space inner loop - it never
+    switches the controller between MoveJ/MoveV modes.  Joint values must already
+    be smoothed / rate-limited (see joint_admittance.utils.safety); the driver
+    faults on discontinuities.
+    """
+    del trajectory_mode, radio
+    if len(joint_deg) != 7:
+        raise ValueError(f"joint_deg must have 7 elements, got {len(joint_deg)}")
+    ret = robot.rm_movej_canfd(list(joint_deg), follow, expand, TRAJ0_MODE, TRAJ0_RADIO)
+    if ret != 0:
+        raise MotionError(f"rm_movej_canfd failed with code {ret}")
+
+
+def _wait_planning_idle(robot, timeout_s: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        traj = robot.rm_get_arm_current_trajectory()
+        if traj.get("return_code") == 0 and traj.get("trajectory_type", 0) == 0:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def read_system_err(robot) -> list[str]:
+    ret, st = robot.rm_get_current_arm_state()
+    if ret != 0:
+        return [f"get_state:{ret}"]
+    err = st.get("err", {})
+    n = int(err.get("err_len", 0))
+    return [str(c) for c in list(err.get("err", []))[:n]]
+
+
+def _should_clear_err(codes: list[str]) -> bool:
+    if not codes or codes == ["0"]:
+        return False
+    for c in codes:
+        if c in LATCHED_ERR_CODES:
+            return True
+        if "1003" in c or "4119" in c:
+            return True
+    return False
+
+
+def _format_system_err(codes: list[str]) -> str:
+    """Realman returns ['0'] when no latched error — not a fault."""
+    if not codes:
+        return "none"
+    if len(codes) == 1 and str(codes[0]) in ("0", ""):
+        return "none"
+    return str(codes)
+
+
+def print_handoff_diag(diag: dict[str, Any], *, prefix: str = "  handoff") -> None:
+    parts = [
+        f"slow_stop={diag.get('slow_stop')}",
+        f"pause={diag.get('pause')}",
+        f"delete={diag.get('delete_traj')}",
+        f"idle={diag.get('planning_idle')}",
+        f"traj={diag.get('trajectory_type')}",
+    ]
+    if diag.get("q_drift_deg") is not None:
+        parts.append(f"q_drift={diag['q_drift_deg']:.2f}°")
+    if diag.get("resync_done"):
+        parts.append("resync=1")
+    err = _format_system_err(diag.get("system_err") or [])
+    parts.append(f"err={err}")
+    if diag.get("quiescent_max_step_mm") is not None:
+        parts.append(f"quiesce={diag.get('quiescent_frames')}f/{diag['quiescent_max_step_mm']:.2f}mm")
+    print(f"{prefix}: " + "  ".join(parts), flush=True)
+
+
+def exit_canfd_session(
+    robot,
+    *,
+    q_resync: np.ndarray | None = None,
+    settle_sleep_s: float = 0.3,
+    move_speed: int = 15,
+    settle_timeout_s: float = 15.0,
+    resync_threshold_deg: float = 1.0,
+    print_diag: bool = False,
+) -> dict[str, Any]:
+    """
+    Unified CANFD exit: slow_stop → pause → delete → idle → sleep → resync → clear err.
+
+    Call before move_j, between slots, and before enter_movev_session.
+    """
+    diag: dict[str, Any] = {}
+    diag["slow_stop"] = robot.rm_set_arm_slow_stop()
+    time.sleep(0.1)
+    diag["pause"] = robot.rm_set_arm_pause()
+    diag["delete_traj"] = robot.rm_set_arm_delete_trajectory()
+    diag["planning_idle"] = _wait_planning_idle(robot)
+    time.sleep(settle_sleep_s)
+
+    if q_resync is not None:
+        q_tgt = np.asarray(q_resync, dtype=float)
+        ret, st = robot.rm_get_current_arm_state()
+        if ret == 0:
+            q_act = np.asarray(st["joint"][:7], dtype=float)
+            q_drift = float(np.max(np.abs(q_act - q_tgt)))
+            diag["q_drift_deg"] = q_drift
+            if q_drift > resync_threshold_deg:
+                from rm75_control.force.compensation.collection import move_j, wait_settle
+
+                move_j(robot, q_tgt, speed=move_speed)
+                wait_settle(robot, q_tgt, timeout_s=settle_timeout_s)
+                diag["resync_done"] = True
+
+    diag["system_err_before"] = read_system_err(robot)
+    if _should_clear_err(diag["system_err_before"]):
+        try:
+            diag["clear_system_err"] = robot.rm_clear_system_err()
+        except Exception:
+            diag["clear_system_err"] = -999
+        time.sleep(0.2)
+
+    traj = robot.rm_get_arm_current_trajectory()
+    diag["trajectory_type"] = traj.get("trajectory_type", -1)
+    diag["system_err"] = read_system_err(robot)
+
+    if print_diag:
+        print_handoff_diag(diag)
+    return diag
+
+
+def settle_movev_after_init(
+    robot,
+    *,
+    dt_ms: float,
+    follow: bool,
+    n_frames: int = 30,
+    next_tick: float | None = None,
+) -> float:
+    """
+    Zero-velocity frames after rm_set_movev_canfd_init — always low follow.
+
+    rm_set_movev_canfd_init captures the current joint state as the IK
+    reference.  If the arm is still micro-vibrating (which is common <200ms
+    after move_j), with follow=True the high-bandwidth servo sees the residual
+    error and issues a large corrective velocity → visible twitch/snap.
+
+    Sending ALL settle frames with follow=False (低跟随, gentler servo) keeps
+    the correction velocity small regardless of when init was called.  The
+    actual scan commands use follow=True from the first tick of the main loop,
+    by which point the arm is already confirmed quiescent.
+    """
+    dt_s = dt_ms / 1000.0
+    if next_tick is None:
+        next_tick = time.monotonic()
+    zero = [0.0] * 6
+    for _ in range(n_frames):
+        now = time.monotonic()
+        if now < next_tick:
+            time.sleep(min(0.002, next_tick - now))
+        next_tick += dt_s
+        send_velocity_canfd(robot, zero, follow=False)
+    return next_tick
+
+
+def wait_movev_quiescent(
+    robot,
+    *,
+    dt_ms: float,
+    follow: bool,
+    settle_mm: float = 0.3,
+    need_consecutive: int = 5,
+    max_frames: int = 200,
+    warmup_frames: int = 15,
+    reject_max_step_mm: float = 2.0,
+    next_tick: float | None = None,
+) -> tuple[np.ndarray | None, float, int, float]:
+    """
+    Stream zero velocity until TCP motion < settle_mm for need_consecutive ticks.
+
+    Uses follow=False (低跟随) to match settle_movev_after_init — quiescence is
+    measured under the same gentle-servo conditions the arm will settle in.
+    The actual session's follow mode takes effect from the first real command.
+
+    warmup_frames: ignore motion for the first N ticks after init (init snap).
+    reject_max_step_mm: the quiet streak's peak step must stay below this limit;
+        prevents declaring quiescence when an early 9 mm snap is followed by
+        sub-mm creep (global max_step was misleading).
+
+    Returns (last_pose, max_step_mm, frames_used, next_tick).
+    """
+    dt_s = dt_ms / 1000.0
+    if next_tick is None:
+        next_tick = time.monotonic()
+    del follow  # low follow throughout; see docstring
+    zero = [0.0] * 6
+    prev_xyz: np.ndarray | None = None
+    last_pose: np.ndarray | None = None
+    quiet = 0
+    max_step_mm = 0.0
+    streak_max_mm = 0.0
+    for k in range(max_frames):
+        now = time.monotonic()
+        if now < next_tick:
+            time.sleep(min(0.002, next_tick - now))
+        next_tick += dt_s
+        send_velocity_canfd(robot, zero, follow=False)
+        ret, st = robot.rm_get_current_arm_state()
+        if ret != 0:
+            continue
+        pose = np.asarray(st["pose"][:6], dtype=float)
+        last_pose = pose
+        if k < warmup_frames:
+            prev_xyz = pose[:3].copy()
+            quiet = 0
+            streak_max_mm = 0.0
+            continue
+        if prev_xyz is not None:
+            step_mm = float(np.linalg.norm((pose[:3] - prev_xyz) * 1000.0))
+            max_step_mm = max(max_step_mm, step_mm)
+            if step_mm < settle_mm:
+                quiet += 1
+                streak_max_mm = max(streak_max_mm, step_mm)
+                if (
+                    quiet >= need_consecutive
+                    and streak_max_mm <= reject_max_step_mm
+                ):
+                    return last_pose, max_step_mm, k + 1, next_tick
+            else:
+                quiet = 0
+                streak_max_mm = 0.0
+        prev_xyz = pose[:3].copy()
+    return last_pose, max_step_mm, max_frames, next_tick
+
+
+def enter_movev_session(
+    robot,
+    *,
+    frame_type: int,
+    avoid_singularity: int,
+    dt_ms: float,
+    follow: bool,
+    q_resync: np.ndarray | None = None,
+    skip_resync: bool = False,
+    settle_frames: int = 50,
+    quiescent_mm: float = 0.25,
+    quiescent_consecutive: int = 10,
+    quiescent_warmup_frames: int = 15,
+    quiescent_reject_step_mm: float = 2.0,
+    move_speed: int = 15,
+    settle_timeout_s: float = 15.0,
+    pre_init_settle_s: float = 1.5,
+    next_tick: float | None = None,
+    print_diag: bool = False,
+) -> tuple[float, dict[str, Any]]:
+    """
+    Full movev handoff: exit → (settle) → init → zero frames → quiescence.
+
+    pre_init_settle_s: extra sleep between exit_canfd_session and
+    rm_set_movev_canfd_init.  exit_canfd_session already sleeps 0.3s, so the
+    total static time before init = 0.3 + pre_init_settle_s.  Default 1.5s
+    gives 1.8s total — arm must be fully static before init captures FK.
+
+    skip_resync: when True, exit CANFD without joint resync (use after move_j
+    already placed the arm at the target slot).
+
+    Returns (next_tick, diag).
+    """
+    diag = exit_canfd_session(
+        robot,
+        q_resync=None if skip_resync else q_resync,
+        move_speed=move_speed,
+        settle_timeout_s=settle_timeout_s,
+        print_diag=False,
+    )
+
+    if pre_init_settle_s > 0.0:
+        time.sleep(pre_init_settle_s)
+
+    # rm_set_movev_canfd_init can transiently refuse if the controller's internal
+    # CANFD state machine (joint-CANFD layer) hasn't fully reset yet — the
+    # trajectory-planner idle check doesn't cover that layer.  Retry with a
+    # short light-cleanup cycle between attempts.
+    _INIT_RETRIES = 3
+    _INIT_RETRY_SLEEP_S = 0.5
+    ret = -1
+    for attempt in range(_INIT_RETRIES):
+        ret = robot.rm_set_movev_canfd_init(avoid_singularity, frame_type, int(dt_ms))
+        if ret == 0:
+            break
+        if attempt < _INIT_RETRIES - 1:
+            robot.rm_set_arm_pause()
+            robot.rm_set_arm_delete_trajectory()
+            _wait_planning_idle(robot, timeout_s=5.0)
+            time.sleep(_INIT_RETRY_SLEEP_S)
+    diag["movev_init"] = ret
+    diag["movev_init_attempts"] = attempt + 1
+    if ret != 0:
+        raise RuntimeError(
+            f"rm_set_movev_canfd_init failed after {_INIT_RETRIES} attempts: {ret}"
+        )
+
+    next_tick = settle_movev_after_init(
+        robot, dt_ms=dt_ms, follow=follow,
+        n_frames=settle_frames, next_tick=next_tick,
+    )
+    pose_quiet, max_step_mm, q_frames, next_tick = wait_movev_quiescent(
+        robot, dt_ms=dt_ms, follow=follow,
+        settle_mm=quiescent_mm, need_consecutive=quiescent_consecutive,
+        warmup_frames=quiescent_warmup_frames,
+        reject_max_step_mm=quiescent_reject_step_mm,
+        next_tick=next_tick,
+    )
+    diag["quiescent_max_step_mm"] = max_step_mm
+    diag["quiescent_frames"] = q_frames
+    if pose_quiet is not None:
+        diag["quiescent_pose"] = pose_quiet.tolist()
+
+    if print_diag:
+        print_handoff_diag(diag)
+        attempts = diag.get("movev_init_attempts", 1)
+        if attempts > 1:
+            print(f"  movev_init: needed {attempts} attempts", flush=True)
+        if max_step_mm > 0:
+            print(
+                f"  movev quiescence: {q_frames} frames (max step {max_step_mm:.2f}mm/tick)",
+                flush=True,
+            )
+    return next_tick, diag
 ```
 
+## FILE: `configs/joint_admittance.yaml`
+
+```yaml
+# Joint-space inner-loop (QP/CLIK) + task-space admittance outer-loop config.
+#
+# Cascade: the admittance outer loop (hybrid_motion.AdmittanceController) emits a
+# 6D Cartesian twist; the inner loop turns it into absolute joint angles streamed
+# via rm_movej_canfd (single interface, no MoveJ/MoveV mode switching).
+#
+# Run:  source env.sh
+#       python apps/joint_admittance/run_joint_admittance.py --config configs/joint_admittance.yaml
+#
+# For an on-robot test that also exercises Cartesian trajectory tracking (walk to
+# a pose) + force-position hybrid control (sin scan there), both through this same
+# cascade with no MoveJ/MoveV switch, see tmp/joint_admittance/d_sin_tool_y.py.
+
+robot:
+  ip: "192.168.1.18"
+  port: 8080
+  thread_mode: 2
+
+timing:
+  dt_ms: 10.0          # 100 Hz control loop
+  async_poll_ms: 10.0
+
+# ---------------------------------------------------------------------------
+# Inner loop (joint-space IK)
+# ---------------------------------------------------------------------------
+inner:
+  solver: clik          # "clik" (Phase 1 DLS) | "qp" (Phase 2 ProxQP, hard limits)
+  control_frame: tool   # frame the outer-loop twist is expressed in (match hybrid_motion.control_frame)
+  euler_order: xyz
+
+  # safety (streaming q_cmd bypasses MoveJ's planner, so these MUST hold)
+  v_scale: 0.35         # fraction of URDF joint velocity limit allowed (start conservative)
+  a_max: 12.0           # rad/s^2 per-joint acceleration clamp
+  position_margin_deg: 2.0
+  use_smoothing: true
+  # utils/smoothing.SecondOrderLowPass is now two cascaded 1st-order stages
+  # (unconditionally stable at any cutoff/dt - see MD/JOINT_ADMITTANCE.md).
+  # Ramp-tracking lag falls roughly with 1/cutoff; smoothing (jerk reduction)
+  # falls as you raise it. 20 Hz is a safe starting point at 100 Hz control;
+  # raise toward 30-40 Hz once bring-up confirms no current-spike faults.
+  smooth_cutoff_hz: 20.0
+
+  clik:
+    k_task: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]   # Cartesian error feedback gain (1/s)
+    sigma_thresh: 0.04    # DLS: below this smallest singular value, damping ramps in
+    lambda_max: 0.08      # DLS: max damping at a singularity
+    nullspace_gain: 1.0
+    max_pos_err_m: 0.05   # anti-windup cap on fed-back Cartesian error
+    max_rot_err_rad: 0.20
+
+  qp:                     # used only when solver == qp
+    k_task: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    task_weight: [1.0, 1.0, 1.0, 0.5, 0.5, 0.5]
+    reg: 1.0e-3           # regularization / secondary-task weight
+    backend: proxqp       # proxqp (warm-started) | osqp
+    eps_abs: 1.0e-6
+    max_iter: 200
+
+  nullspace:
+    k_center: 0.5         # pull joints toward mid-range (rad/s per normalized unit)
+    k_limit: 2.0          # extra repulsion near a joint limit
+    activation: 0.85      # |normalized pos| beyond which repulsion ramps in
+
+# ---------------------------------------------------------------------------
+# Outer loop (task-space admittance) - hybrid_motion.AdmittanceConfig keys
+# ---------------------------------------------------------------------------
+frames:
+  euler_order: xyz
+  control_frame: tool
+
+force:
+  desired_z_n: 3.0        # constant normal-force setpoint on tool-Z [N]
+  phi_source: phi_recommended
+  fc_hz: 6.0
+  min_samples: 35
+
+hybrid_motion:
+  force_axes: [0, 0, 1, 0, 0, 0]
+  track_axes: [1, 1, 0, 1, 1, 1]
+  kp_pos: [0.3, 0.6, 0.0, 0.4, 0.4, 0.4]
+  system_delay_s: 0.015
+  contact_threshold_n: 0.5
+  deadband_n: 0.3
+  deadband_width_n: 0.2
+  max_velocity: [0.15, 0.15, 0.05, 0.5, 0.5, 0.5]
+  max_acceleration: [1.0, 1.0, 0.8, 2.0, 2.0, 2.0]
+  admittance_mass_z: 3.0
+  admittance_damping_z: 60.0
+  max_vz_tool_m_s: 0.05
+  var_damping_enabled: true
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+startup:
+  pose_slot_q_deg: null   # optional [7] MoveJ target before streaming; null = start where it is
+  duration_s: 20.0
+  move_speed: 20
+  reference: hold         # "hold" = maintain the start pose (bring-up default)
+  enable_force: false     # true requires a calibrated force_id_phi.json
+  follow: true
+  realtime: false         # true attempts SCHED_FIFO (needs privileges)
+  watchdog_timeout_s: 0.1
+```
+
+## FILE: `apps/joint_admittance/run_joint_admittance.py`
+
+```py
+#!/usr/bin/env python3
+"""Run the cascaded joint-position controller on the RM75-F.
+
+  source env.sh
+  # 1) FIRST prove FK matches the robot (<1mm / <0.1deg):
+  python -m rm75_control.control.joint_admittance.validation --ip 192.168.1.18
+  # 2) then run the loop (bring-up default: hold the start pose):
+  python apps/joint_admittance/run_joint_admittance.py --config configs/joint_admittance.yaml
+
+For a real test sequence (Cartesian move to a pose + force-position sinusoid
+scan there, both through this same controller), see
+tmp/joint_admittance/d_sin_tool_y.py instead.
+
+The outer admittance loop emits a Cartesian twist; the inner CLIK/QP loop turns
+it into absolute joint angles streamed through rm_movej_canfd only - no MoveV/
+MoveJ mode switching once running.  A single MoveJ positions the arm at start.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import yaml
+
+from rm75_control.control.hybrid_motion.controller import AdmittanceConfig, AdmittanceController
+from rm75_control.control.joint_admittance.config import build_joint_ik_config
+from rm75_control.control.joint_admittance.loop import (
+    AdmittanceOuterLoop,
+    JointIkController,
+    run_joint_admittance_loop,
+)
+from rm75_control.control.joint_admittance.model import RobotKinematics
+from rm75_control.control.joint_admittance.reference import HoldReference
+from rm75_control.core.session import RobotSession
+
+
+def load_yaml(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="RM75 joint-position cascaded controller")
+    ap.add_argument("--config", type=Path, default=Path("configs/joint_admittance.yaml"))
+    ap.add_argument("--duration", type=float, default=None)
+    ap.add_argument("--solver", choices=["clik", "qp"], default=None)
+    ap.add_argument("--dry-run", action="store_true", help="build everything, do not connect")
+    args = ap.parse_args()
+
+    raw = load_yaml(args.config)
+    if args.solver:
+        raw.setdefault("inner", {})["solver"] = args.solver
+
+    startup = raw.get("startup", {})
+    dt = float(raw.get("timing", {}).get("dt_ms", 10.0)) / 1000.0
+
+    kin = RobotKinematics()
+    inner_cfg = build_joint_ik_config(raw)
+    inner = JointIkController(kin, inner_cfg)
+    print(f"Inner loop: solver={inner_cfg.solver} control_frame={inner_cfg.control_frame} "
+          f"dt={dt*1000:.0f}ms v_scale={inner_cfg.v_scale}", flush=True)
+    if inner_cfg.solver == "qp":
+        print(f"  QP backend: {inner.core.backend_name}", flush=True)
+
+    outer_ctrl = AdmittanceController(dt, AdmittanceConfig.from_dict(raw))
+    desired_force = np.zeros(6)
+    desired_force[2] = float(raw.get("force", {}).get("desired_z_n", 0.0))
+    reference = HoldReference()  # bring-up default: hold the start pose
+    outer = AdmittanceOuterLoop(outer_ctrl, reference, desired_force=desired_force)
+
+    force_observer = None
+    if bool(startup.get("enable_force", False)):
+        from rm75_control.control.hybrid_motion.observer import CompensatedForceObserver
+
+        force_observer = CompensatedForceObserver.from_yaml(raw)
+        print("  force observer: enabled (requires calibrated phi)", flush=True)
+
+    q_start = startup.get("pose_slot_q_deg")
+    q_start = None if q_start is None else np.asarray(q_start, dtype=float)
+    duration = args.duration if args.duration is not None else float(startup.get("duration_s", 10.0))
+
+    if args.dry_run:
+        print("dry-run: controllers built OK, not connecting.", flush=True)
+        return 0
+
+    robot_cfg = raw.get("robot", {})
+    with RobotSession(ip=robot_cfg.get("ip"), port=robot_cfg.get("port"), config=args.config) as sess:
+        run_joint_admittance_loop(
+            sess,
+            outer,
+            inner,
+            q_start_deg=q_start,
+            duration_s=duration,
+            dt=dt,
+            force_observer=force_observer,
+            follow=bool(startup.get("follow", True)),
+            move_speed=int(startup.get("move_speed", 20)),
+            realtime=bool(startup.get("realtime", False)),
+            watchdog_timeout_s=float(startup.get("watchdog_timeout_s", 0.1)),
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+## FILE: `tmp/joint_admittance/d_sin_tool_y.py`
+
+```py
+#!/usr/bin/env python3
+"""On-robot bring-up test: Cartesian move to pose D, then tool-Y sin scan at D -
+both driven by OUR joint-position cascade (CLIK/QP inner loop -> rm_movej_canfd),
+never rm_movev_canfd / MoveV. One continuous run, no mode switch at the D handoff.
+
+  Phase 1  current pose -> scan pose D   (CartesianTrackOuterLoop, no force)
+  Phase 2  hold D, sin sweep tool-Y       (AdmittanceOuterLoop, force-position hybrid)
+
+``poses.yaml`` slot ``d`` is the **force-ID Arm_Tip teach pose** (contact tip).
+Scan pose **D** = that ``pose_base`` + **220 mm along tool +Z outward** — NOT
+``FK(q_deg)`` with gripper (that puts the TCP tip on the ID point).
+
+This is a SPECIFIC test script (hardcodes pose slot "d" from poses.yaml) - the
+generic, config-driven entry point lives at apps/joint_admittance/run_joint_admittance.py.
+
+Usage:
+  source env.sh
+  # 0) FIRST prove FK matches the robot (<1mm / <0.1deg):
+  python -m rm75_control.control.joint_admittance.validation --ip 192.168.1.18
+
+  # 1) dry run (builds everything, no robot connection):
+  python tmp/joint_admittance/d_sin_tool_y.py --dry-run
+
+  # 2) move to D only, no scan (prove Cartesian trajectory tracking in isolation):
+  python tmp/joint_admittance/d_sin_tool_y.py --scan-duration 0
+
+  # 3) full test: move to D, then 30s of tool-Y sin scan with 3N tool-Z force hold
+  #    (requires a calibrated tmp/force_compensation/logs/force_id_phi.json):
+  python tmp/joint_admittance/d_sin_tool_y.py --enable-force --desired-z 3.0 --scan-duration 30
+
+  # 4) tune the move and the sweep:
+  python tmp/joint_admittance/d_sin_tool_y.py --move-duration 10 \
+      --y-pp-cm 10 --max-vel-cm-s 2 --enable-force --desired-z 3.0 --scan-duration 60
+
+Ctrl+C stops cleanly (watchdog holds the last q, RobotSession releases the arm).
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+import yaml
+
+from rm75_control.control.hybrid_motion.controller import AdmittanceConfig, AdmittanceController
+from rm75_control.control.joint_admittance.config import build_joint_ik_config
+from rm75_control.control.joint_admittance.loop import (
+    AdmittanceOuterLoop,
+    CartesianTrackConfig,
+    CartesianTrackOuterLoop,
+    JointIkController,
+    Phase,
+    arrived,
+    run_joint_admittance_phases,
+)
+from rm75_control.control.joint_admittance.model import RobotKinematics
+from rm75_control.control.joint_admittance.reference import (
+    CartesianMoveReference,
+    SinToolYReference,
+)
+from rm75_control.core.session import RobotSession
+from rm75_control.force.compensation.collection import load_slot
+from rm75_control.force.compensation.id_config import load_config as load_force_id_config
+from rm75_control.force.compensation.paths import CONFIG_ID
+from rm75_control.force.compensation.tool_pose import (
+    DEFAULT_SCAN_APPROACH_DZ_M,
+    get_active_tool_name,
+    poses_calib_tool_frame,
+    slot_scan_approach_pose,
+)
+from rm75_control.force.compensation import excitation as ex
+
+
+def load_yaml(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def resolve_scan_pose_d(
+    slot: str,
+    robot,
+    *,
+    approach_dz_m: float,
+    use_force_id_pose: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (q_deg, scan_pose_D, force_id_pose_base) for slot in poses.yaml."""
+    fid = load_force_id_config(CONFIG_ID)
+    poses_data = ex.load_poses_yaml(fid.poses_yaml)
+    calib_tool = poses_calib_tool_frame(poses_data)
+    active = get_active_tool_name(robot) if robot is not None else ""
+    if active and calib_tool and active != calib_tool:
+        print(
+            f"  slot {slot!r}: teach frame {calib_tool!r}, active tool {active!r}",
+            flush=True,
+        )
+
+    q_deg, _fk_pose, rec = load_slot(fid, slot, robot, calib_tool=calib_tool)
+    pose_id = np.asarray(rec["pose_base"], dtype=float)
+
+    if use_force_id_pose:
+        pose_d = _fk_pose.copy()
+        print(
+            f"  scan target: force-ID FK pose (legacy) pose={np.round(pose_d, 4)}",
+            flush=True,
+        )
+    else:
+        pose_d = slot_scan_approach_pose(robot, pose_id, approach_dz_m=approach_dz_m)
+        print(
+            f"  force-ID slot {slot!r} Arm_Tip teach: pose={np.round(pose_id, 4)}",
+            flush=True,
+        )
+        print(
+            f"  scan pose D (+{approach_dz_m * 1000:.0f} mm tool-Z): "
+            f"pose={np.round(pose_d, 4)}",
+            flush=True,
+        )
+    return q_deg, pose_d, pose_id
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", type=Path, default=Path("configs/joint_admittance.yaml"))
+    ap.add_argument("--slot", type=str, default="d", help="poses.yaml slot (default: d)")
+    ap.add_argument(
+        "--approach-dz-mm",
+        type=float,
+        default=DEFAULT_SCAN_APPROACH_DZ_M * 1000.0,
+        help="scan D = Arm_Tip teach pose + this offset along tool +Z (mm); default 220",
+    )
+    ap.add_argument(
+        "--use-force-id-pose",
+        action="store_true",
+        help="legacy: track FK(q_deg) tip pose instead of teach+220mm standoff",
+    )
+    ap.add_argument("--solver", choices=["clik", "qp"], default=None)
+    ap.add_argument("--move-duration", type=float, default=8.0, help="phase 1 smoothstep duration (s)")
+    ap.add_argument("--move-kp", type=float, default=1.5, help="phase 1 Cartesian tracking gain (1/s)")
+    ap.add_argument("--y-pp-cm", type=float, default=6.0, help="tool-Y sin peak-to-peak amplitude (cm)")
+    ap.add_argument("--max-vel-cm-s", type=float, default=2.0, help="tool-Y sin peak velocity (cm/s)")
+    ap.add_argument("--period-s", type=float, default=None, help="override sin period (s); default from max-vel")
+    ap.add_argument("--desired-z", type=float, default=None, help="tool-Z force setpoint (N); default from config")
+    ap.add_argument("--scan-duration", type=float, default=30.0, help="phase 2 duration (s); 0 = skip phase 2")
+    ap.add_argument("--enable-force", action="store_true", default=None, help="force-enable phase 2 (default: config startup.enable_force)")
+    ap.add_argument("--dry-run", action="store_true", help="build everything, do not connect")
+    args = ap.parse_args()
+
+    raw = load_yaml(args.config)
+    if args.solver:
+        raw.setdefault("inner", {})["solver"] = args.solver
+    startup = raw.get("startup", {})
+    dt = float(raw.get("timing", {}).get("dt_ms", 10.0)) / 1000.0
+
+    kin = RobotKinematics()
+    inner_cfg = build_joint_ik_config(raw)
+    inner = JointIkController(kin, inner_cfg)
+    print(
+        f"Inner loop: solver={inner_cfg.solver} control_frame={inner_cfg.control_frame} "
+        f"dt={dt * 1000:.0f}ms v_scale={inner_cfg.v_scale}",
+        flush=True,
+    )
+
+    amplitude_m = float(args.y_pp_cm) * 0.01 / 2.0
+    max_vel_m_s = float(args.max_vel_cm_s) * 0.01
+    desired_z = args.desired_z if args.desired_z is not None else float(raw.get("force", {}).get("desired_z_n", 0.0))
+    enable_force = args.enable_force if args.enable_force is not None else bool(startup.get("enable_force", False))
+
+    if args.dry_run:
+        print("dry-run: controllers built OK, not connecting.", flush=True)
+        return 0
+
+    robot_cfg = raw.get("robot", {})
+    with RobotSession(ip=robot_cfg.get("ip"), port=robot_cfg.get("port"), config=args.config) as sess:
+        q_d_deg, pose_d, _pose_id = resolve_scan_pose_d(
+            args.slot,
+            sess.robot,
+            approach_dz_m=float(args.approach_dz_mm) * 0.001,
+            use_force_id_pose=bool(args.use_force_id_pose),
+        )
+
+        # --- Phase 1: Cartesian move current -> pose D (pure tracking, no force) ---
+        move_ref = CartesianMoveReference(pose_d, args.move_duration, euler_order=inner_cfg.euler_order)
+        move_outer = CartesianTrackOuterLoop(
+            move_ref,
+            CartesianTrackConfig(
+                k_task=np.full(6, args.move_kp),
+                euler_order=inner_cfg.euler_order,
+                control_frame=inner_cfg.control_frame,  # MUST match the inner loop
+            ),
+        )
+        phase1 = Phase(
+            outer=move_outer,
+            label=f"move -> {args.slot}",
+            duration_s=None,
+            max_duration_s=args.move_duration + 5.0,
+            wait_until=lambda pose: arrived(pose, pose_d, tol_mm=2.0, tol_deg=1.0, euler_order=inner_cfg.euler_order),
+        )
+
+        phases = [phase1]
+
+        force_observer = None
+        if args.scan_duration > 0.0:
+            # --- Phase 2: hold D, tool-Y sin sweep (force-position hybrid via OUR inner loop) ---
+            outer_ctrl = AdmittanceController(dt, AdmittanceConfig.from_dict(raw))
+            desired_force = np.zeros(6)
+            desired_force[2] = desired_z
+            sin_ref = SinToolYReference(
+                amplitude_m,
+                period_s=args.period_s,
+                max_vel_m_s=None if args.period_s is not None else max_vel_m_s,
+                soft_start=True,
+                ramp_s=2.0,
+                euler_order=inner_cfg.euler_order,
+            )
+            scan_outer = AdmittanceOuterLoop(outer_ctrl, sin_ref, desired_force=desired_force)
+
+            if enable_force:
+                from rm75_control.control.hybrid_motion.observer import CompensatedForceObserver
+
+                force_observer = CompensatedForceObserver.from_yaml(raw)
+                print("  force observer: enabled (requires calibrated phi)", flush=True)
+            else:
+                print("  force observer: DISABLED (--enable-force not set) - Fz feedback is zero", flush=True)
+
+            phase2 = Phase(
+                outer=scan_outer,
+                label="sin_tool_y @ D",
+                duration_s=args.scan_duration,
+                force_observer=force_observer,
+            )
+            phases.append(phase2)
+            print(
+                f"Phase 2: tool-Y sin amp={args.y_pp_cm:.1f}cm p-p, v_peak={args.max_vel_cm_s:.1f}cm/s, "
+                f"desired_z={desired_z:.1f}N, duration={args.scan_duration:.1f}s",
+                flush=True,
+            )
+
+        t_last_print = [0.0]
+
+        def on_step(label: str, t_phase: float, step, pose, f_ext) -> None:
+            now = time.perf_counter()
+            if now - t_last_print[0] >= 1.0:
+                t_last_print[0] = now
+                print(
+                    f"  [{label}] t={t_phase:5.1f}s  cart_err={step.cart_err_mm:5.2f}mm  "
+                    f"Fz={f_ext[2]:+5.2f}N  manip={step.manip:.3f}",
+                    flush=True,
+                )
+
+        run_joint_admittance_phases(
+            sess,
+            phases,
+            inner,
+            q_start_deg=None,  # start wherever the arm currently is
+            dt=dt,
+            follow=bool(startup.get("follow", True)),
+            move_speed=int(startup.get("move_speed", 20)),
+            realtime=bool(startup.get("realtime", False)),
+            watchdog_timeout_s=float(startup.get("watchdog_timeout_s", 0.1)),
+            on_step=on_step,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+## FILE: `tests/test_joint_ik_offline.py`
+
+```py
+"""Offline closed-loop validation of the joint-space inner loop (no robot).
+
+Under perfect joint tracking, JointIkController.q_cmd *is* the simulated robot
+state, so repeatedly calling ``update(twist)`` closes the loop.  We assert:
+
+* zero drift when the twist is zero,
+* faithful Cartesian tracking of the integrated reference after settling,
+* nullspace motion does NOT move the TCP (redundancy resolution is orthogonal),
+* velocity / position limits are always respected.
+
+Run as pytest, or ``python tests/test_joint_ik_offline.py`` for a printed report.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from rm75_control.control.joint_admittance.clik import ClikConfig
+from rm75_control.control.joint_admittance.loop import JointIkConfig, JointIkController
+from rm75_control.control.joint_admittance.model import RobotKinematics, deg2rad
+from rm75_control.control.joint_admittance.tasks.nullspace_task import NullspaceTaskConfig
+
+Q_HOME_DEG = np.array([5.0, -30.0, 10.0, 60.0, -5.0, 45.0, 0.0])
+
+
+def _make(control_frame: str = "base", k_center: float = 0.0, **cfg_kw) -> JointIkController:
+    kin = RobotKinematics()
+    cfg = JointIkConfig(
+        control_frame=control_frame,
+        clik=ClikConfig(k_task=np.full(6, 5.0)),
+        nullspace=NullspaceTaskConfig(k_center=k_center, k_limit=0.0),
+        v_scale=0.9,
+        a_max=50.0,
+        **cfg_kw,
+    )
+    ctrl = JointIkController(kin, cfg)
+    ctrl.reset(deg2rad(Q_HOME_DEG))
+    return ctrl
+
+
+def test_zero_drift_on_hold():
+    ctrl = _make(k_center=0.0)
+    pose0 = ctrl.kin.fk_pose(ctrl.q_cmd)
+    for _ in range(300):
+        ctrl.update(np.zeros(6))
+    pose1 = ctrl.kin.fk_pose(ctrl.q_cmd)
+    assert np.linalg.norm(pose1[:3] - pose0[:3]) < 1e-5
+
+
+def test_tracks_reference_after_settle():
+    ctrl = _make()
+    dt = ctrl.cfg.dt
+    twist = np.array([0.01, 0.0, -0.005, 0.0, 0.0, 0.0])  # base frame
+    for _ in range(100):        # 1 s of motion
+        ctrl.update(twist)
+    for _ in range(200):        # 2 s hold to settle (2nd-order smoother group delay)
+        ctrl.update(np.zeros(6))
+    x_ref = ctrl.clik.x_ref
+    x_cur = ctrl.kin.fk_pose(ctrl.q_cmd)
+    assert np.linalg.norm(x_ref[:3] - x_cur[:3]) * 1000.0 < 1.0  # < 1 mm
+
+
+def test_nullspace_preserves_tcp():
+    """A 6-DOF task on a 7-DOF arm leaves a 1-D nullspace: the centering task can
+    only move joints along that single direction, but it must NEVER perturb the
+    TCP.  Validate: TCP fixed, joints actually move, centering cost non-increasing.
+    """
+    from scipy.spatial.transform import Rotation as Rsc
+
+    ctrl = _make(k_center=1.5)
+    q_mid = 0.5 * (ctrl.kin.q_lower + ctrl.kin.q_upper)
+    q_start = ctrl.q_cmd.copy()
+    pose0 = ctrl.kin.fk_pose(ctrl.q_cmd)
+    dist0 = np.linalg.norm(q_start - q_mid)
+    max_pos_err_mm = 0.0
+    max_rot_err_deg = 0.0
+    for _ in range(400):
+        ctrl.update(np.zeros(6))
+        pose = ctrl.kin.fk_pose(ctrl.q_cmd)
+        max_pos_err_mm = max(max_pos_err_mm, np.linalg.norm(pose[:3] - pose0[:3]) * 1000.0)
+        r0 = Rsc.from_euler("xyz", pose0[3:6]).as_matrix()
+        r1 = Rsc.from_euler("xyz", pose[3:6]).as_matrix()
+        d_deg = np.degrees(np.linalg.norm(Rsc.from_matrix(r1 @ r0.T).as_rotvec()))
+        max_rot_err_deg = max(max_rot_err_deg, d_deg)
+    dist1 = np.linalg.norm(ctrl.q_cmd - q_mid)
+    joint_motion = np.linalg.norm(ctrl.q_cmd - q_start)
+    # TCP stayed put (nullspace projection is orthogonal to the task) ...
+    assert max_pos_err_mm < 1.0, max_pos_err_mm
+    assert max_rot_err_deg < 0.1, max_rot_err_deg
+    # ... joints actually moved (nullspace is live) ...
+    assert joint_motion > 1e-3, joint_motion
+    # ... and centering never made things worse.
+    assert dist1 <= dist0 + 1e-6, (dist0, dist1)
+
+
+def test_velocity_and_position_limits():
+    ctrl = _make(k_center=0.0)
+    dt = ctrl.cfg.dt
+    dq_max = ctrl.kin.v_max * ctrl.cfg.v_scale * dt
+    q_prev = ctrl.q_cmd.copy()
+    for _ in range(500):
+        ctrl.update(np.array([1.0, 1.0, 1.0, 3.0, 3.0, 3.0]))  # absurdly large twist
+        dq = ctrl.q_cmd - q_prev
+        assert np.all(np.abs(dq) <= dq_max + 1e-9), "velocity limit violated"
+        assert np.all(ctrl.q_cmd >= ctrl.kin.q_lower - 1e-9)
+        assert np.all(ctrl.q_cmd <= ctrl.kin.q_upper + 1e-9)
+        q_prev = ctrl.q_cmd.copy()
+
+
+def test_smoothing_filter_stable_at_high_cutoff():
+    """Regression guard: SecondOrderLowPass must stay stable (bounded, decaying
+    error under a constant-velocity ramp) at ANY cutoff_hz for a fixed dt.
+
+    An earlier explicit-Euler discretization of the 2nd-order ODE was only
+    conditionally stable and blew up (>100mm error) above ~17 Hz at dt=0.01s.
+    The cascaded-first-order implementation must never do that.
+    """
+    for cutoff in (5.0, 15.0, 30.0, 60.0, 100.0, 250.0):
+        ctrl = _make(k_center=0.0, smooth_cutoff_hz=cutoff)
+        for _ in range(500):
+            s = ctrl.update(np.array([0.02, 0.0, 0.0, 0.0, 0.0, 0.1]))
+        assert s.cart_err_mm < 100.0, (cutoff, s.cart_err_mm)  # bounded lag, not exploding
+        assert np.all(np.isfinite(ctrl.q_cmd))
+
+
+def test_cartesian_track_outer_loop_tool_frame_converges():
+    """Regression guard: CartesianTrackOuterLoop(control_frame="tool") MUST return a
+    twist expressed in tool-axis coordinates, matching JointIkConfig(control_frame=
+    "tool")'s _twist_to_base(), which does R @ twist. A base-frame twist here gets
+    double-rotated by the inner loop and DIVERGES instead of converging - this is
+    exactly the bug seen on-robot (cart_err growing to 100s of mm instead of settling).
+    Use a non-trivial start orientation so a frame mismatch actually shows up.
+    """
+    from rm75_control.control.joint_admittance.loop import CartesianTrackConfig, CartesianTrackOuterLoop
+    from rm75_control.control.joint_admittance.reference import CartesianMoveReference
+
+    ctrl = _make(control_frame="tool", k_center=0.0)
+    dt = ctrl.cfg.dt
+
+    # Rotate q1/q4/q6 off zero so the TCP orientation is far from identity - a
+    # frame mixup is invisible at R=I but explosive away from it.
+    q_start = deg2rad(np.array([20.0, -30.0, 10.0, 70.0, 15.0, 50.0, -10.0]))
+    ctrl.reset(q_start)
+    pose0 = ctrl.kin.fk_pose(ctrl.q_cmd)
+    pose_target = pose0.copy()
+    pose_target[0] += 0.05
+    pose_target[1] -= 0.03
+    pose_target[2] += 0.02
+
+    move_ref = CartesianMoveReference(pose_target, duration_s=3.0)
+    move_outer = CartesianTrackOuterLoop(move_ref, CartesianTrackConfig(control_frame="tool"))
+    move_outer.set_origin(pose0)
+
+    t_s = 0.0
+    err_mm = []
+    for _ in range(700):  # 3s move + 4s settle
+        cur = ctrl.kin.fk_pose(ctrl.q_cmd)
+        twist = move_outer.sample(t_s, cur, np.zeros(6))
+        ctrl.update(twist, dt)
+        err_mm.append(np.linalg.norm(ctrl.kin.fk_pose(ctrl.q_cmd)[:3] - pose_target[:3]) * 1000.0)
+        t_s += dt
+
+    # must CONVERGE (not diverge): final error small, and well below the initial error.
+    assert err_mm[-1] < 2.5, err_mm[-1]
+    assert err_mm[-1] < err_mm[0], (err_mm[0], err_mm[-1])
+
+
+def test_cartesian_move_then_sin_reference_offline():
+    """End-to-end offline check for the D-then-sin_tool_y bring-up test: a
+    CartesianMoveReference driven through CartesianTrackOuterLoop must land the
+    TCP on the target pose, and handing off to a SinToolYReference at that pose
+    must not cause any discontinuity in q_cmd (no MoveJ/MoveV switch needed).
+    """
+    from rm75_control.control.joint_admittance.loop import CartesianTrackOuterLoop
+    from rm75_control.control.joint_admittance.reference import (
+        CartesianMoveReference,
+        SinToolYReference,
+    )
+
+    ctrl = _make(k_center=0.0)
+    dt = ctrl.cfg.dt
+    pose0 = ctrl.kin.fk_pose(ctrl.q_cmd)
+    pose_target = pose0.copy()
+    pose_target[0] += 0.05
+    pose_target[2] += 0.03
+    pose_target[5] += np.radians(5.0)
+
+    move_ref = CartesianMoveReference(pose_target, duration_s=3.0)
+    move_outer = CartesianTrackOuterLoop(move_ref)
+    move_outer.set_origin(pose0)
+
+    t_s = 0.0
+    for _ in range(700):  # 3s move + 4s settle
+        twist = move_outer.sample(t_s, ctrl.kin.fk_pose(ctrl.q_cmd), np.zeros(6))
+        ctrl.update(twist, dt)
+        t_s += dt
+
+    pose_arrived = ctrl.kin.fk_pose(ctrl.q_cmd)
+    assert np.linalg.norm(pose_arrived[:3] - pose_target[:3]) * 1000.0 < 2.5
+
+    sin_ref = SinToolYReference(amplitude_m=0.01, period_s=4.0, soft_start=True, ramp_s=1.0)
+    sin_outer = CartesianTrackOuterLoop(sin_ref)
+    sin_outer.set_origin(pose_arrived)
+
+    t_s = 0.0
+    y_positions = []
+    first_tick_dq = None
+    for _ in range(400):  # 4s = 1 sin period
+        q_prev = ctrl.q_cmd.copy()
+        twist = sin_outer.sample(t_s, ctrl.kin.fk_pose(ctrl.q_cmd), np.zeros(6))
+        ctrl.update(twist, dt)
+        if first_tick_dq is None:
+            first_tick_dq = np.linalg.norm(ctrl.q_cmd - q_prev)
+        y_positions.append(ctrl.kin.fk_pose(ctrl.q_cmd)[1])
+        t_s += dt
+
+    # no discontinuity at the phase boundary: the handoff tick's joint step must
+    # be in line with a normal control tick, not a MoveJ-style snap.
+    assert first_tick_dq < 0.02, first_tick_dq
+
+    # the sweep must actually move the TCP along Y once ramped up
+    y_positions = np.asarray(y_positions)
+    assert (y_positions.max() - y_positions.min()) > 0.005
+
+
+def _report() -> None:
+    print("Running offline joint-IK validation report...\n")
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"  PASS  {name}")
+            except AssertionError as e:
+                print(f"  FAIL  {name}: {e}")
+
+    # quantitative summary for the tracking case
+    ctrl = _make()
+    twist = np.array([0.02, 0.0, 0.0, 0.0, 0.0, 0.1])
+    jit = []
+    for _ in range(200):
+        s = ctrl.update(twist)
+        jit.append(s.cart_err_mm)
+    print(
+        f"\n  ramp+rotate: final cart_err={jit[-1]:.3f} mm, "
+        f"sigma_min={s.sigma_min:.4f}, manip={s.manip:.5f}, lam={s.lam:.5f}"
+    )
+
+
+if __name__ == "__main__":
+    _report()
+```
+
+## FILE: `rm75_control/assets/robots/rm75_6f/RM75-6F.urdf`
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<!-- RM75-6F kinematics-only URDF for rm75_control.
+     Derived from the vendor SolidWorks export
+     (Among_US/assets/robots/rm75_6f/vendor/.../RM75-6F.urdf).
+     Changes vs vendor:
+       * All <visual>/<collision> mesh geometry stripped (package:// deps removed);
+         Pinocchio kinematics only needs links + joints + inertials.
+       * Inertials retained for future dynamics / QP effort limits.
+       * Added fixed 'tcp' link: link_7 -> tcp, +0.220 m along link_7 +Z, no rotation.
+     Joint limits copied verbatim from vendor; verify j7 (+-6.28) against the
+     official RM75 manual before trusting it in hard QP constraints.
+     joint_7 origin y: vendor -0.1725 m -> -0.1612 m (-11.3 mm) to match Realman
+     controller flange FK (see validation.py / MD/JOINT_ADMITTANCE.md). -->
+<robot
+  name="RM75-6F">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0.00049987 5.2709E-05 0.060019" rpy="0 0 0" />
+      <mass value="1.862" />
+      <inertia ixx="0.0017232" ixy="-3.1058E-06" ixz="-3.7924E-05"
+               iyy="0.0017051" iyz="1.3691E-06" izz="0.00090158" />
+    </inertial>
+  </link>
+  <link name="link_1">
+    <inertial>
+      <origin xyz="0.000241 -0.013273 -0.00995" rpy="0 0 0" />
+      <mass value="1.574" />
+      <inertia ixx="0.002487573" ixy="0.000009663" ixz="-0.000007909"
+               iyy="0.002321038" iyz="0.000179393" izz="0.001450554" />
+    </inertial>
+  </link>
+  <joint name="joint_1" type="revolute">
+    <origin xyz="0 0 0.2405" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="link_1" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.106" upper="3.106" effort="60" velocity="3.14" />
+  </joint>
+  <link name="link_2">
+    <inertial>
+      <origin xyz="-0.000357 -0.106789 0.005329" rpy="0 0 0" />
+      <mass value="1.217" />
+      <inertia ixx="0.003494121" ixy="0.000002921" ixz="-0.000005613"
+               iyy="0.000892721" iyz="-0.000583884" izz="0.003444080" />
+    </inertial>
+  </link>
+  <joint name="joint_2" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5708 0 0" />
+    <parent link="link_1" />
+    <child link="link_2" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.2689" upper="2.2689" effort="60" velocity="3.14" />
+  </joint>
+  <link name="link_3">
+    <inertial>
+      <origin xyz="0.000003 -0.01398 -0.011324" rpy="0 0 0" />
+      <mass value="1.11" />
+      <inertia ixx="0.001836663" ixy="0.000002259" ixz="-0.000004216"
+               iyy="0.001498875" iyz="0.000037167" izz="0.001062545" />
+    </inertial>
+  </link>
+  <joint name="joint_3" type="revolute">
+    <origin xyz="0 -0.256 0" rpy="1.5708 0 0" />
+    <parent link="link_2" />
+    <child link="link_3" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.106" upper="3.106" effort="30" velocity="3.14" />
+  </joint>
+  <link name="link_4">
+    <inertial>
+      <origin xyz="-0.000005 -0.084658 0.004747" rpy="0 0 0" />
+      <mass value="0.685" />
+      <inertia ixx="0.001282444" ixy="-0.000000551" ixz="-0.000000630"
+               iyy="0.000373013" iyz="-0.000232084" izz="0.001256177" />
+    </inertial>
+  </link>
+  <joint name="joint_4" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5708 0 0" />
+    <parent link="link_3" />
+    <child link="link_4" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.356" upper="2.356" effort="30" velocity="3.14" />
+  </joint>
+  <link name="link_5">
+    <inertial>
+      <origin xyz="0.000078 -0.012937 -0.008781" rpy="0 0 0" />
+      <mass value="0.619" />
+      <inertia ixx="0.000627336" ixy="0.000001636" ixz="-0.000001345"
+               iyy="0.000542455" iyz="0.000034970" izz="0.000370291" />
+    </inertial>
+  </link>
+  <joint name="joint_5" type="revolute">
+    <origin xyz="0 -0.21 0" rpy="1.5708 0 0" />
+    <parent link="link_4" />
+    <child link="link_5" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.106" upper="3.106" effort="10" velocity="3.14" />
+  </joint>
+  <link name="link_6">
+    <inertial>
+      <origin xyz="-0.000014 -0.078524 0.002819" rpy="0 0 0" />
+      <mass value="0.602" />
+      <inertia ixx="0.000780774" ixy="-0.000000121" ixz="-0.000000469"
+               iyy="0.000289973" iyz="-0.000120513" izz="0.000763955" />
+    </inertial>
+  </link>
+  <joint name="joint_6" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5708 0 0" />
+    <parent link="link_5" />
+    <child link="link_6" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.234" upper="2.234" effort="10" velocity="3.14" />
+  </joint>
+  <link name="link_7">
+    <inertial>
+      <origin xyz="0.001094 -0.000077 -0.010119" rpy="0 0 0" />
+      <mass value="0.144" />
+      <inertia ixx="0.000044123" ixy="-0.000000064" ixz="0.0000003"
+               iyy="0.000035078" iyz="-0.000000029" izz="0.000065445" />
+    </inertial>
+  </link>
+  <joint name="joint_7" type="revolute">
+    <!-- Vendor SolidWorks URDF uses y=-0.1725 m. Realman controller flange FK sits
+         ~11.3 mm closer (less negative y in link_6 frame). FK validation: vendor
+         gave constant +11.3 mm pos error; moving to -0.1838 doubled it to ~22.6 mm
+         (wrong direction); -0.1612 is the corrected value. -->
+    <origin xyz="0 -0.1612 0" rpy="1.5708 0 0" />
+    <parent link="link_6" />
+    <child link="link_7" />
+    <axis xyz="0 0 1" />
+    <limit lower="-6.28" upper="6.28" effort="10" velocity="3.14" />
+  </joint>
+  <!-- Tool control point: pure frame, no mesh. +0.220 m along link_7 +Z. -->
+  <link name="tcp" />
+  <joint name="link_7_to_tcp" type="fixed">
+    <origin xyz="0 0 0.220" rpy="0 0 0" />
+    <parent link="link_7" />
+    <child link="tcp" />
+  </joint>
+</robot>
+```

@@ -14,6 +14,11 @@ from rm75_control.control.hybrid_motion.reference import MotionReference, Motion
 from rm75_control.force.compensation.collection import load_slot
 from rm75_control.force.compensation.id_config import load_config
 from rm75_control.force.compensation.paths import CONFIG_ID
+from rm75_control.force.compensation.tool_pose import (
+    get_active_tool_name,
+    poses_calib_tool_frame,
+)
+from rm75_control.force.compensation import excitation as ex
 
 
 def tool_frame_delta_pose(
@@ -28,6 +33,36 @@ def tool_frame_delta_pose(
     r_mat = Rsc.from_euler(euler_order, pose[3:6], degrees=False).as_matrix()
     pose[:3] = pose[:3] + r_mat @ np.array([dx, dy, dz], dtype=float)
     return pose
+
+
+def anchor_slot_transfer_poses(
+    actual: np.ndarray,
+    yaml_from: np.ndarray,
+    yaml_to: np.ndarray,
+    *,
+    euler_order: str = "xyz",
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Apply slot d→a delta (translation + rotation) from the live TCP.
+
+    ``poses.yaml`` pose_base often disagrees with rm_movej(q_deg) FK. Raw yaml
+    endpoints make pose_d ~220 mm away at scan ON → pitch snap, speed fault, lost
+    contact. The relative d→a smoothstep (pos + Slerp rot) is unchanged.
+    """
+    actual = np.asarray(actual, dtype=float)
+    y0 = np.asarray(yaml_from, dtype=float)
+    y1 = np.asarray(yaml_to, dtype=float)
+
+    pose_from = actual.copy()
+    pose_to = actual.copy()
+    pose_to[:3] = actual[:3] + (y1[:3] - y0[:3])
+
+    r0 = Rsc.from_euler(euler_order, y0[3:6], degrees=False)
+    r1 = Rsc.from_euler(euler_order, y1[3:6], degrees=False)
+    r_act = Rsc.from_euler(euler_order, actual[3:6], degrees=False)
+    r_to = (r1 * r0.inv()) * r_act
+    pose_to[3:6] = r_to.as_euler(euler_order, degrees=False)
+    return pose_from, pose_to
 
 
 def tool_offset_pose(robot, ref_pose: list[float], dx: float, dy: float, dz: float) -> list[float]:
@@ -173,18 +208,49 @@ class BuiltinTrajectorySource:
         self.amplitude_m = amp_m
         self._pose_from: np.ndarray | None = None
         self._pose_to: np.ndarray | None = None
+        self._yaml_pose_from: np.ndarray | None = None
+        self._yaml_pose_to: np.ndarray | None = None
+        self._yaml_tcp_drift_mm: float = 0.0
         if cfg.kind == "slot_transfer_sin_tool_y":
             self._load_slot_poses()
+            self._anchor_transfer(self.pose0)
 
     def _load_slot_poses(self) -> None:
         fid = load_config(CONFIG_ID)
-        _, pose_from, rec_from = load_slot(fid, self.cfg.from_slot)
-        _, pose_to, rec_to = load_slot(fid, self.cfg.to_slot)
-        self._pose_from = np.asarray(pose_from, dtype=float)
-        self._pose_to = np.asarray(pose_to, dtype=float)
+        poses_data = ex.load_poses_yaml(fid.poses_yaml)
+        calib_tool = poses_calib_tool_frame(poses_data)
+        active = get_active_tool_name(self.robot) if self.robot is not None else ""
+        if active and calib_tool and active != calib_tool:
+            print(
+                f"  slot d→a TCP: FK(q_deg) in active tool {active!r} "
+                f"(poses.yaml recorded in {calib_tool!r})",
+                flush=True,
+            )
+        _, pose_from, rec_from = load_slot(
+            fid, self.cfg.from_slot, self.robot, calib_tool=calib_tool,
+        )
+        _, pose_to, rec_to = load_slot(
+            fid, self.cfg.to_slot, self.robot, calib_tool=calib_tool,
+        )
+        self._yaml_pose_from = np.asarray(pose_from, dtype=float)
+        self._yaml_pose_to = np.asarray(pose_to, dtype=float)
         self._slot_labels = (
             str(rec_from.get("label", self.cfg.from_slot)),
             str(rec_to.get("label", self.cfg.to_slot)),
+        )
+
+    def _anchor_transfer(self, actual: np.ndarray) -> None:
+        if self._yaml_pose_from is None or self._yaml_pose_to is None:
+            return
+        actual = np.asarray(actual, dtype=float)
+        self._pose_from, self._pose_to = anchor_slot_transfer_poses(
+            actual,
+            self._yaml_pose_from,
+            self._yaml_pose_to,
+            euler_order=self.cfg.euler_order,
+        )
+        self._yaml_tcp_drift_mm = float(
+            np.linalg.norm((actual[:3] - self._yaml_pose_from[:3]) * 1000.0)
         )
 
     @property
@@ -193,6 +259,8 @@ class BuiltinTrajectorySource:
 
     def set_origin(self, pose0: np.ndarray) -> None:
         self.pose0 = np.asarray(pose0, dtype=float).copy()
+        if self.cfg.kind == "slot_transfer_sin_tool_y":
+            self._anchor_transfer(self.pose0)
 
     def sample(self, t_s: float) -> MotionReference:
         kind = self.cfg.kind
